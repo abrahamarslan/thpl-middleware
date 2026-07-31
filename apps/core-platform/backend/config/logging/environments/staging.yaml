@@ -1,0 +1,9 @@
+# ==============================================================================
+# Logging profile — STAGING
+# ==============================================================================
+# Production-like JSON output, but DEBUG-level to aid pre-release diagnosis.
+# ==============================================================================
+
+level: DEBUG
+format: json
+include_caller: false

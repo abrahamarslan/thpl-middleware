@@ -1,0 +1,42 @@
+# ==============================================================================
+# Grafana datasources — metrics (Prometheus), logs (Loki), traces (Tempo)
+# Cross-linking: logs <-> traces via trace_id; traces -> logs by service.
+# ==============================================================================
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        # JSON app logs carry trace_id when OTel is enabled — link to Tempo
+        - name: trace_id
+          datasourceUid: tempo
+          matcherRegex: '"trace_id":"(\w+)"'
+          url: "$${__value.raw}"
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: true
+      serviceMap:
+        datasourceUid: prometheus

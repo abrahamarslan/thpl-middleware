@@ -1,0 +1,54 @@
+# ==============================================================================
+# Traefik static configuration
+# ==============================================================================
+
+api:
+  dashboard: true
+
+ping: {}
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+  metrics:
+    address: ":8082"
+
+providers:
+  docker:
+    exposedByDefault: false
+    network: app-frontend
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+log:
+  level: INFO
+  format: json          # stdout -> Alloy -> Loki
+
+accessLog:
+  format: json          # stdout -> Alloy -> Loki
+  fields:
+    headers:
+      names:
+        X-Request-Id: keep
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+
+# Production: ACME DNS-01 through acme-dns (see docker-compose.prod.yml).
+# Unused in development (mkcert file certs from dynamic/tls.yml are used).
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: info@infilaw.org
+      storage: /letsencrypt/acme.json
+      dnsChallenge:
+        provider: acme-dns

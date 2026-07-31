@@ -1,0 +1,16 @@
+# ==============================================================================
+# Logging profile — PRODUCTION
+# ==============================================================================
+# Lean, structured JSON for Loki. INFO baseline; no caller info (cost).
+# Raise a specific namespace temporarily via its modules/*.yaml or LOG_LEVEL.
+# ==============================================================================
+
+level: INFO
+format: json
+include_caller: false
+
+loggers:
+  sqlalchemy.engine:
+    level: WARNING
+  httpx:
+    level: WARNING

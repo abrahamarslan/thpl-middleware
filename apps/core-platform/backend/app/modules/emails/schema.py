@@ -1,0 +1,74 @@
+"""Transport schemas for the emails module."""
+
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+from app.modules.documents.schema import DocumentOut
+
+
+class EmailAttachmentMeta(BaseModel):
+    """Reference an existing Document to attach (single source of file truth)."""
+
+    document_id: UUID
+    is_inline: bool = False
+    content_id: str | None = Field(None, description='Inline CID, e.g. "cid:logo"')
+
+
+class EmailCreate(BaseModel):
+    to: list[EmailStr]
+    cc: list[EmailStr] = []
+    bcc: list[EmailStr] = []
+
+    subject: str
+    body_html: str | None = None
+    body_text: str | None = None
+
+    email_from: str | None = None       # defaults to RESEND_DEFAULT_FROM
+    reply_to: str | None = None
+
+    emailable_id: str | None = None
+    emailable_type: str | None = None
+    campaign_id: str | None = None
+
+    attachments: list[EmailAttachmentMeta] = []
+    scheduled_at: datetime | None = None
+    metadata_: dict | None = None
+
+
+class EmailEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    event_type: str | None = None
+    event_at: datetime | None = None
+    url: str | None = None
+    ip_address: str | None = None
+    provider_event_id: str | None = None
+
+
+class EmailOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    uuid: UUID
+    email_to: list
+    email_cc: list | None = None
+    email_bcc: list | None = None
+    email_from: str
+    reply_to: str | None = None
+    subject: str | None = None
+    status: str | None = None
+    status_message: str | None = None
+    error_message: str | None = None
+    attempts: int | None = None
+    provider_message_id: str | None = None
+    open_count: int | None = None
+    click_count: int | None = None
+    scheduled_at: datetime | None = None
+    sent_at: datetime | None = None
+    delivered_at: datetime | None = None
+    created_at: datetime
+    documents: list[DocumentOut] = []   # loaded via HasDocumentsMixin
+    events: list[EmailEventOut] = []

@@ -1,0 +1,6 @@
+# ==============================================================================
+# Module logging — Files (S3 documents, OCR, processing lifecycle)
+# ==============================================================================
+logger: app.files
+enabled: true
+level: INFO

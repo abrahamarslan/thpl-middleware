@@ -1,0 +1,10 @@
+# ==============================================================================
+# Module logging — Users & authentication
+# ==============================================================================
+# Governs 'app.users' (service/login/registration) and 'app.security'
+# (JWT + Authentik OIDC validation).
+# ==============================================================================
+
+logger: app.users
+enabled: true
+level: INFO

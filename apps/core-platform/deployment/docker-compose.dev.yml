@@ -1,0 +1,125 @@
+# ==============================================================================
+# Development overrides
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Adds: host ports for direct service access, hot-reload backend (bind mount),
+# Vite dev server frontend, MailHog. NEVER use this file in production —
+# it publishes internal services to the host.
+# ==============================================================================
+
+services:
+
+  backend:
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --no-access-log
+    environment:
+      ENVIRONMENT: development   # selects config/logging/environments/development.yaml (DEBUG + console)
+      DEBUG: "true"
+    volumes:
+      - ../backend:/app
+      - backend_media:/app/media
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+  celery-worker:
+    command: >
+      celery -A app.tasks.celery_app worker
+      -Q default,integrations,documents -c 2 -l DEBUG
+    environment:
+      ENVIRONMENT: development
+      DEBUG: "true"
+    volumes:
+      - ../backend:/app
+      - backend_media:/app/media
+
+  celery-beat:
+    volumes:
+      - ../backend:/app
+
+  flower:
+    volumes:
+      - ../backend:/app
+
+  search-indexer:
+    volumes:
+      - ../backend:/app
+
+  frontend:
+    build:
+      target: development
+    command: ["sh", "-c", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+    volumes:
+      - ${FRONTEND_PATH:-../frontend}:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "${FRONTEND_DEV_PORT:-5174}:5173"
+    labels:
+      traefik.http.services.frontend.loadbalancer.server.port: "5173"
+
+  # --- Direct host access for local tooling (psql, redis-cli, kcat, ...) ---
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+  clickhouse:
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_TCP_PORT:-9001}:9000"
+
+  meilisearch:
+    ports:
+      - "${MEILISEARCH_PORT:-7700}:7700"
+
+  kafka:
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-19092}:19092"
+    environment:
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+  kafbat-ui:
+    ports:
+      - "${KAFKA_UI_PORT:-8088}:8080"
+
+  debezium:
+    ports:
+      - "${DEBEZIUM_PORT:-8083}:8083"
+
+  prometheus:
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  loki:
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+
+  grafana:
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+
+  soketi:
+    ports:
+      - "${SOKETI_PORT:-6001}:6001"
+
+  authentik-server:
+    ports:
+      - "${AUTHENTIK_PORT:-9010}:9000"
+
+  # --- Dev mail catcher (Authentik email defaults point here) ---
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: mailhog
+    restart: unless-stopped
+    ports:
+      - "${MAILHOG_UI_PORT:-8025}:8025"
+    networks:
+      - app-auth
+
+volumes:
+  frontend_node_modules:
+    name: app_frontend_node_modules

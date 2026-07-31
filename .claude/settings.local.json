@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(grep -oE \"[A-Z_]+: \\\\\\\\\\\\$\\\\{[A-Z_]+:-\\\\}\" docker-compose.yml)",
+      "Bash(cd /d/Projects/th-middleware/apps/core-platform/backend && grep -n \"settings = get_settings\\(\\)\\\\|return Settings\\(\\)\\\\|_blank_env_to_none\\\\|field_validator\" app/core/conf.py)",
+      "Bash(docker compose *)",
+      "Bash(bash -n healthcheck/test-kafka.sh)",
+      "WebSearch",
+      "WebFetch(domain:issues.apache.org)",
+      "Bash(find \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\a2\\\\projects\\\\th-middleware\\\\apps\\\\core-platform\\\\backend\\\\app\" -type f -name \"*.py\")",
+      "WebFetch(domain:docs.goauthentik.io)",
+      "Bash(cd \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\a2\\\\projects\\\\th-middleware\\\\apps\\\\core-platform\\\\backend\")",
+      "Read(///wsl.localhost/Ubuntu/wsl.localhost/Ubuntu/home/a2/projects/th-middleware/apps/core-platform/**)",
+      "PowerShell(wsl -d Ubuntu -- bash -lc \"cd ~/projects/th-middleware/apps/core-platform/backend; python3 --version; ls -d .venv venv 2>/dev/null; which pytest; pip3 --version 2>/dev/null | head -1\")",
+      "PowerShell(wsl -d Ubuntu -- bash -lc \"cd ~/projects/th-middleware/apps/core-platform/backend; python3 -m venv .venv 2>&1 | head -5; .venv/bin/pip install -q --upgrade pip 2>&1 | tail -2; .venv/bin/pip install -q -r requirements.txt -r requirements-dev.txt 2>&1 | tail -5; .venv/bin/python -c 'import fastapi, sqlalchemy, celery, pytest; print\\(\\\\\"DEPS_OK\\\\\"\\)'\")",
+      "PowerShell(wsl -d Ubuntu -- bash -lc \"cd /home/a2/projects/th-middleware/apps/core-platform/backend && .venv/bin/python -m pytest tests/test_authentik_sync.py -x -q -p no:cacheprovider 2>&1 | grep -A 30 'FAILED\\\\|Error\\\\|error' | head -50\")",
+      "Bash(docker exec *)",
+      "Bash(echo \"exit=$?\")"
+    ]
+  }
+}

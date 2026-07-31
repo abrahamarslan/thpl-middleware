@@ -1,0 +1,23 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "${POSTGRES_USER}",
+  "database.password": "${POSTGRES_PASSWORD}",
+  "database.dbname": "${POSTGRES_DB}",
+  "topic.prefix": "zoho-mirror",
+  "plugin.name": "pgoutput",
+  "slot.name": "zoho_mirror",
+  "publication.autocreate.mode": "filtered",
+  "table.include.list": "public.zoho_contacts,public.zoho_items,public.zoho_organizations,public.zoho_sync_stats,public.zoho_queue_logs",
+  "snapshot.mode": "initial",
+  "tombstones.on.delete": "false",
+  "decimal.handling.mode": "double",
+  "time.precision.mode": "adaptive_time_microseconds",
+  "heartbeat.interval.ms": "30000",
+  "transforms": "unwrap",
+  "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+  "transforms.unwrap.drop.tombstones": "true",
+  "transforms.unwrap.delete.handling.mode": "rewrite",
+  "transforms.unwrap.add.fields": "op,source.ts_ms"
+}

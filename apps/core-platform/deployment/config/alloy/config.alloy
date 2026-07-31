@@ -1,0 +1,135 @@
+// =============================================================================
+// Grafana Alloy — telemetry collector
+//
+// Pipelines:
+//   1. Docker container logs -> labels (service, container) -> Loki
+//   2. OTLP traces from backend / celery workers -> Tempo
+//   3. Built-in exporters (postgres, redis, unix) -> remote_write -> Prometheus
+// =============================================================================
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ── 1. Container logs -> Loki ────────────────────────────────────────────────
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.containers.output
+  forward_to    = [loki.process.containers.receiver]
+  refresh_interval = "10s"
+}
+
+loki.process "containers" {
+  stage.json {
+    expressions = {
+      level  = "level",
+      logger = "logger",
+    }
+    drop_malformed = false
+  }
+
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+// ── 2. OTLP traces -> Tempo ──────────────────────────────────────────────────
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+    tls {
+      insecure = true
+    }
+  }
+}
+
+// ── 3. Built-in exporters -> Prometheus (remote_write) ───────────────────────
+
+prometheus.exporter.postgres "default" {
+  data_source_names = [env("ALLOY_POSTGRES_DSN")]
+}
+
+prometheus.exporter.redis "default" {
+  redis_addr     = env("ALLOY_REDIS_ADDR")
+  redis_password = env("ALLOY_REDIS_PASSWORD")
+}
+
+prometheus.exporter.unix "default" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/host/root"
+}
+
+prometheus.scrape "integrations" {
+  targets = concat(
+    prometheus.exporter.postgres.default.targets,
+    prometheus.exporter.redis.default.targets,
+    prometheus.exporter.unix.default.targets,
+  )
+
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}

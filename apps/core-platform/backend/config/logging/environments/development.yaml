@@ -1,0 +1,15 @@
+# ==============================================================================
+# Logging profile — DEVELOPMENT
+# ==============================================================================
+# Human-friendly, verbose, with caller info for fast local debugging.
+# ==============================================================================
+
+level: DEBUG
+format: console     # colourised, single-line, human-readable
+include_caller: true
+
+loggers:
+  sqlalchemy.engine:
+    level: INFO     # show SQL in dev (also gate with DB_ECHO=true)
+  httpx:
+    level: INFO

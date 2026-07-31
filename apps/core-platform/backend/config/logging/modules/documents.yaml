@@ -1,0 +1,9 @@
+# ==============================================================================
+# Module logging — Documents (Gotenberg PDF generation)
+# ==============================================================================
+# Governs 'app.documents' and the 'app.tasks.documents' worker task logger.
+# ==============================================================================
+
+logger: app.documents
+enabled: true
+level: INFO

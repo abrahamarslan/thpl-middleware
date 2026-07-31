@@ -1,0 +1,55 @@
+# ==============================================================================
+# Application-level logging configuration (base for ALL environments)
+# ==============================================================================
+# Precedence (lowest -> highest):
+#   this file  ->  environments/<ENVIRONMENT>.yaml  ->  modules/*.yaml
+#                  ->  env vars (LOG_ENABLED / LOG_LEVEL / LOG_FORMAT)
+#
+# The active ENVIRONMENT (development | staging | production) selects the
+# profile under environments/. Tune third-party loggers here; tune YOUR
+# application namespaces (app.*) in modules/.
+# ==============================================================================
+
+# Master switch. false = silence ALL logging (use the env override LOG_ENABLED
+# to flip it without editing this file).
+enabled: true
+
+# Root level + output format. Environment profiles override these.
+level: INFO
+format: json          # json (machine/Loki) | console (human, colourised)
+
+utc: true
+include_caller: false # add filename:lineno:func — verbose; on in dev only
+
+# Values masked anywhere in a log event (defence in depth). Extend as needed.
+redact_keys:
+  - password
+  - passwd
+  - secret
+  - token
+  - access_token
+  - refresh_token
+  - authorization
+  - api_key
+  - client_secret
+  - cookie
+  - set-cookie
+
+# Third-party / framework loggers. Application namespaces live in modules/.
+loggers:
+  # Our RequestContextMiddleware emits the structured access log, so silence
+  # uvicorn's own unstructured one.
+  uvicorn.access:
+    enabled: false
+  uvicorn.error:
+    level: INFO
+  # SQL echo is controlled by DB_ECHO; keep the engine logger quiet otherwise.
+  sqlalchemy.engine:
+    level: WARNING
+  # Noisy at INFO during normal operation.
+  httpx:
+    level: WARNING
+  aiokafka:
+    level: WARNING
+  celery:
+    level: INFO

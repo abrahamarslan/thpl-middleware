@@ -1,0 +1,54 @@
+# ==============================================================================
+# Production overrides
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Enables ACME DNS-01 certificates via acme-dns and hardens restart policy.
+# Prerequisites:
+#   1. ./manage.sh register-acmedns  (once) — register with acme-dns
+#   2. CNAME _acme-challenge.<domain> -> <fulldomain from registration>
+#   3. Save registration JSON to ./config/traefik/acmedns/acmedns.json
+# ==============================================================================
+
+services:
+
+  traefik:
+    environment:
+      ACME_DNS_API_BASE: http://acmedns
+      ACME_DNS_STORAGE_PATH: /acmedns/acmedns.json
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./config/traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./config/traefik/certs:/etc/traefik/certs:ro
+      - ./config/traefik/acmedns:/acmedns
+      - traefik_certs:/letsencrypt
+
+  # Use the Let's Encrypt resolver instead of mkcert file certs
+  backend:
+    labels:
+      traefik.http.routers.api.tls.certresolver: letsencrypt
+    restart: always
+
+  frontend:
+    labels:
+      traefik.http.routers.frontend.tls.certresolver: letsencrypt
+    restart: always
+
+  soketi:
+    labels:
+      traefik.http.routers.soketi.tls.certresolver: letsencrypt
+
+  authentik-server:
+    labels:
+      traefik.http.routers.authentik.tls.certresolver: letsencrypt
+
+  grafana:
+    labels:
+      traefik.http.routers.grafana.tls.certresolver: letsencrypt
+
+  flower:
+    labels:
+      traefik.http.routers.flower.tls.certresolver: letsencrypt
+
+# NOTE: acme-dns is behind the "production" profile in the base file.
+# manage.sh prod commands pass --profile production automatically.

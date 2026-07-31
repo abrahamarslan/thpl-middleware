@@ -1,0 +1,75 @@
+# ==============================================================================
+# Runtime requirements — core-platform backend (Python 3.12)
+# ==============================================================================
+# NOTE: For fully reproducible builds, compile a lock file:
+#   uv pip compile requirements.txt -o requirements.lock
+# and install from the lock file in the Dockerfile.
+# ==============================================================================
+
+# --- Web framework ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+python-multipart>=0.0.18
+orjson>=3.10
+
+# --- Database (async-first; psycopg2 removed — asyncpg is the only driver) ---
+sqlalchemy>=2.0.36,<2.1
+asyncpg>=0.30
+alembic>=1.14
+geoalchemy2>=0.16          # PostGIS — delivery routes, beats, geofencing
+
+# --- Redis (cache, Celery broker, distributed locks) ---
+redis[hiredis]>=5.2,<6
+
+# --- Auth & security (python-jose/passlib are unmaintained — replaced) ---
+PyJWT[crypto]>=2.10
+bcrypt>=4.2
+
+# --- HTTP client (single client; aiohttp removed) ---
+httpx>=0.28
+
+# --- Settings & validation ---
+pydantic>=2.10,<3
+pydantic-settings>=2.7
+email-validator>=2.2
+PyYAML>=6.0          # layered logging config (config/logging/*.yaml)
+
+# --- Async tasks (Celery Beat replaces APScheduler — one scheduler only) ---
+celery[redis]>=5.4,<6
+flower>=2.0
+
+# --- Kafka (FastStream wraps aiokafka — declarative consumers, Pydantic
+#     validation, TestKafkaBroker; confluent-kafka removed) ---
+faststream[kafka]>=0.7.1,<0.8
+
+# --- Search (Meilisearch — CDC indexer + ScoutBuilder queries) ---
+meilisearch-python-sdk>=4.0
+
+# --- Resilience & rate limiting ---
+tenacity>=9.0
+slowapi>=0.1.9
+
+# --- Logging (structlog only — loguru/python-json-logger removed) ---
+structlog>=24.4
+
+# --- Observability: Prometheus metrics + OpenTelemetry traces ---
+prometheus-fastapi-instrumentator>=7.0
+opentelemetry-sdk>=1.29
+opentelemetry-exporter-otlp-proto-http>=1.29
+opentelemetry-instrumentation-fastapi>=0.50b0
+opentelemetry-instrumentation-httpx>=0.50b0
+opentelemetry-instrumentation-sqlalchemy>=0.50b0
+opentelemetry-instrumentation-redis>=0.50b0
+opentelemetry-instrumentation-celery>=0.50b0
+
+# --- Templating (invoice/HTML templates for Gotenberg PDF rendering) ---
+Jinja2>=3.1.5
+
+# --- Imaging ---
+Pillow>=11.0
+
+# --- Geospatial (WKT/WKB conversion for PostGIS user locations, routes) ---
+shapely>=2.0
+
+# --- Utilities ---
+pydash>=8.0

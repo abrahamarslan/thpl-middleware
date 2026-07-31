@@ -1,0 +1,11 @@
+# ==============================================================================
+# Module logging — Celery background tasks
+# ==============================================================================
+# Governs 'app.tasks.*' (zoho sync, pdf generation, maintenance). The access
+# log + request_id binding do not apply to workers, so task logs are the
+# primary signal for async work — keep them at INFO.
+# ==============================================================================
+
+logger: app.tasks
+enabled: true
+level: INFO

@@ -1,0 +1,10 @@
+# ==============================================================================
+# Module logging — Security (JWT + Authentik OIDC)
+# ==============================================================================
+# Governs 'app.security.*'. Auth failures are security-relevant: keep at INFO
+# even in production so denied logins / token problems are always captured.
+# ==============================================================================
+
+logger: app.security
+enabled: true
+level: INFO

@@ -1,0 +1,27 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# TLS certificates (mkcert dev certs)
+config/traefik/certs/*
+!config/traefik/certs/.gitkeep
+
+# acme-dns registration credentials
+config/traefik/acmedns/
+
+# Logs
+logs/
+*.log
+
+# Backups
+backups/*
+!backups/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

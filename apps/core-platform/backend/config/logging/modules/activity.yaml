@@ -1,0 +1,8 @@
+# ==============================================================================
+# Module logging — Activity recorder
+# ==============================================================================
+# This governs OPERATIONAL logs from the recorder (e.g. activity_record_failed),
+# NOT the audit trail itself (that is persisted to the activity_logs table).
+logger: app.activity
+enabled: true
+level: INFO

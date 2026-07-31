@@ -1,0 +1,14 @@
+# ==============================================================================
+# Module logging — Zoho integration
+# ==============================================================================
+# Governs the 'app.zoho' namespace and ALL children (app.zoho.client,
+# app.zoho.token, app.zoho.ratelimit, app.zoho.circuit, app.zoho.service, ...).
+#
+# Flip `enabled: false` to silence the whole integration's logs, or set
+# `level` to override the environment's root level for Zoho only — e.g. keep
+# the app at INFO in production but turn Zoho to DEBUG to chase a token issue.
+# ==============================================================================
+
+logger: app.zoho
+enabled: true
+level: INFO

@@ -1,0 +1,65 @@
+# ==============================================================================
+# Prometheus scrape configuration
+# ==============================================================================
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    stack: core-platform
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8082"]
+
+  # FastAPI — request rate/latency/status per handler
+  - job_name: backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["backend:8000"]
+
+  # Celery task throughput, runtime, failures (via celery-exporter)
+  - job_name: celery
+    static_configs:
+      - targets: ["celery-exporter:9808"]
+
+  # Postgres & Redis metrics are now pushed by Alloy via remote_write.
+  # Their standalone exporter containers have been removed.
+
+  - job_name: soketi
+    fallback_scrape_protocol: "PrometheusText0.0.4"
+    static_configs:
+      - targets: ["soketi:9601"]
+
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  - job_name: clickhouse
+    static_configs:
+      - targets: ["clickhouse:9363"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  - job_name: alloy
+    static_configs:
+      - targets: ["alloy:12345"]
+
+  - job_name: grafana
+    metrics_path: /grafana/metrics
+    static_configs:
+      - targets: ["grafana:3000"]
+
+  - job_name: authentik
+    static_configs:
+      - targets: ["authentik-server:9300"]
