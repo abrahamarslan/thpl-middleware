@@ -11,7 +11,7 @@ Built on the pseudo 3-tier architecture from [fastapi-best-architecture](https:/
 | data access    | `crud`    | `app/modules/<m>/crud.py`      |
 | model          | `model`   | `app/modules/<m>/model.py`     |
 
-See `app/modules/zoho/` for a complete example of all five layers.
+See `app/modules/zoho/` for a complete example of all five layers. 
 
 ## Repository layout
 
