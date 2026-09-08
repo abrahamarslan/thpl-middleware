@@ -45,7 +45,13 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response.headers["x-request-id"] = request_id
 
         # Skip noise: health probes hit every few seconds
-        if request.url.path not in ("/health", "/ready", "/metrics"):
+        if request.url.path not in (
+            "/health",
+            "/ready",
+            "/metrics",
+            f"{settings.API_PREFIX}/health",
+            f"{settings.API_PREFIX}/ready",
+        ):
             access_logger.info(
                 "request",
                 method=request.method,

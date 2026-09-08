@@ -84,16 +84,23 @@ def register_app() -> FastAPI:
 
     register_exception_handlers(app)
 
-    # Routes: probes at root (no auth, no prefix), business API under /api
+    # Routes: probes at root (container healthcheck) and /api (Traefik ingress)
     from app.modules.system.api import system_router
 
     app.include_router(system_router)
+    app.include_router(system_router, prefix=settings.API_PREFIX)
     app.include_router(api_router, prefix=settings.API_PREFIX)
 
     # Prometheus /metrics — scraped over the internal network only
     Instrumentator(
         should_group_status_codes=False,
-        excluded_handlers=["/health", "/ready", "/metrics"],
+        excluded_handlers=[
+            "/health",
+            "/ready",
+            "/metrics",
+            f"{settings.API_PREFIX}/health",
+            f"{settings.API_PREFIX}/ready",
+        ],
     ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
     # OpenTelemetry traces -> Alloy -> Tempo

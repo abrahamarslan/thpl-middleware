@@ -107,7 +107,13 @@ dev_compose() {
 }
 
 prod_compose() {
-    docker compose -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" --profile production "$@"
+    # Only activate the 'production' profile if acme-dns is explicitly requested.
+    # HTTP-01 challenges (default) do not require the acmedns container on port 53.
+    if [ "${ACMEDNS_ENABLED:-false}" = "true" ]; then
+        docker compose -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" --profile production "$@"
+    else
+        docker compose -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" "$@"
+    fi
 }
 
 COMMAND="${1:-help}"

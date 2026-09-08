@@ -17,6 +17,10 @@ def test_probe_routes_registered():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
 
+    api_response = client.get("/api/health")
+    assert api_response.status_code == 200
+    assert api_response.json()["status"] == "ok"
+
 
 def test_module_routers_registered():
     paths = _openapi_paths()

@@ -48,7 +48,7 @@ metrics:
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: info@infilaw.org
+      email: tech@tarrinahealth.com
       storage: /letsencrypt/acme.json
       dnsChallenge:
         provider: acme-dns
