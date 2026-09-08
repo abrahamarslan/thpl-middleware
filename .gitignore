@@ -1,8 +1,4 @@
 # Secrets — never commit environment files
-.env
-.env.*
-!.env.example
-
 # Python
 __pycache__/
 *.py[cod]
