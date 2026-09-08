@@ -6,7 +6,7 @@ Build a FastAPI-native, enterprise-grade architecture that adheres strictly to t
 ## Architecture Decisions (Based on your feedback)
 
 1. **Security / Route Protection**: 
-   The endpoints `/initiate`, `/callback`, and `/revoke` will all be protected by the internal `CurrentUser` dependency (JWT). This ensures that only authorized internal users/admins can initiate the connection to Zoho or revoke it.
+   The endpoints `/initiate` and `/revoke` are protected by the internal `CurrentUser` dependency (JWT). This ensures that only authorized internal users/admins can initiate the connection to Zoho or revoke it. The `/callback` endpoint is **NOT** JWT-protected: Zoho redirects the browser straight back to it, and a browser cannot attach an `Authorization` header on a top-level navigation. Instead, `/callback` provenance is verified via the one-time CSRF `state` value stored in Redis. (Controlled by `ZOHO_AUTH_REQUIRE_USER` for initiate/revoke and `ZOHO_CALLBACK_REQUIRE_USER`, default `False`, for callback.)
 
 2. **Persistent Storage (Configurable)**: 
    Redis will be the primary, fast cache for the access and refresh tokens. We will add a configurable option (`ZOHO_TOKEN_PERSISTENCE_ENABLED`) in `conf.py`. If enabled, the service will also save the refresh token to a persistent storage medium (the `SettingValue` table, tied to the `zoho_refresh_token` definition in the Hierarchical System Settings module) as a fallback in case Redis is flushed.
@@ -31,9 +31,9 @@ Build a FastAPI-native, enterprise-grade architecture that adheres strictly to t
   - `revoke_token()`: Reads the current token from Redis, calls Zoho's `/oauth/v2/token/revoke`, and purges local Redis caches.
 
 #### `app/modules/zoho/auth/api.py`
-- **All routes protected by `Depends(get_current_user)`**.
+- `/initiate` and `/revoke` protected by `Depends(get_current_user)` (subject to `ZOHO_AUTH_REQUIRE_USER`).
 - `GET /initiate`: Calls service to get URL, returns `RedirectResponse`.
-- `GET /callback`: Handles the redirect back from Zoho, extracts `code` and `state`, calls the service. Returns a JSON `ResponseModel` or a `RedirectResponse` back to the frontend based on the `return_url`.
+- `GET /callback`: NOT protected by JWT (browser redirect — cannot attach a token). Extracts `code` and `state`, validates `state` in Redis, calls the service. Returns a JSON `ResponseModel` or a `RedirectResponse` back to the frontend based on the `return_url`.
 - `POST /revoke`: Calls service to revoke the token.
 
 ### 2. Core Modifications

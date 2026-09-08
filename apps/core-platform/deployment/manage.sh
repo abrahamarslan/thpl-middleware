@@ -67,6 +67,12 @@ DEBEZIUM (CDC)
   register-debezium  Register/update the zoho-mirror Postgres connector
   debezium-status    Show connector list + status
 
+ENV SYNC (backend/.env  <->  deployment/.env)
+  sync-env [args]    Sync shared env vars between the two .env files.
+                     Default: dry-run report (source = backend/.env). Use
+                     --apply to write, --from docker to invert the source,
+                     --diff/--json for other views. See scripts/sync-env.sh.
+
 AUTHENTIK (IAM user sync)
   authentik-backfill Link/create Authentik users for local users missing a link
                      (runs synchronously inside the backend container)
@@ -266,6 +272,13 @@ case "$COMMAND" in
     authentik-backfill)
         echo -e "${CYAN}Backfilling Authentik users (link or create)...${NC}"
         compose exec backend python -c "from app.tasks.authentik import backfill; print(backfill())"
+        ;;
+
+    # -- Env sync ---------------------------------------------------------------
+    sync-env)
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        shift
+        bash "$SCRIPT_DIR/scripts/sync-env.sh" "$@"
         ;;
 
     # -- Healthcheck ------------------------------------------------------------

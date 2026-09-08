@@ -12,9 +12,9 @@ from prometheus_fastapi_instrumentator import routing as _pfi_routing
 _original_get_route_name = _pfi_routing.get_route_name
 
 
-def _safe_get_route_name(request):
+def _safe_get_route_name(request, **kwargs):
     try:
-        return _original_get_route_name(request)
+        return _original_get_route_name(request, **kwargs)
     except AttributeError:
         return request.url.path
 

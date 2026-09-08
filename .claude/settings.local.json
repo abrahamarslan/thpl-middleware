@@ -16,7 +16,8 @@
       "PowerShell(wsl -d Ubuntu -- bash -lc \"cd ~/projects/th-middleware/apps/core-platform/backend; python3 -m venv .venv 2>&1 | head -5; .venv/bin/pip install -q --upgrade pip 2>&1 | tail -2; .venv/bin/pip install -q -r requirements.txt -r requirements-dev.txt 2>&1 | tail -5; .venv/bin/python -c 'import fastapi, sqlalchemy, celery, pytest; print\\(\\\\\"DEPS_OK\\\\\"\\)'\")",
       "PowerShell(wsl -d Ubuntu -- bash -lc \"cd /home/a2/projects/th-middleware/apps/core-platform/backend && .venv/bin/python -m pytest tests/test_authentik_sync.py -x -q -p no:cacheprovider 2>&1 | grep -A 30 'FAILED\\\\|Error\\\\|error' | head -50\")",
       "Bash(docker exec *)",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "Read(///wsl.localhost/Ubuntu/home/a2/projects/th-middleware/docs/zoho-docs-md/**)"
     ]
   }
 }

@@ -71,6 +71,17 @@ x-backend-env: &backend-env
   ZOHO_ACCOUNTS_URL: ${ZOHO_ACCOUNTS_URL:-https://accounts.zoho.in}
   ZOHO_API_BASE_URL: ${ZOHO_API_BASE_URL:-https://www.zohoapis.in/books/v3}
   ZOHO_ORGANIZATION_ID: ${ZOHO_ORGANIZATION_ID}
+  # Zoho OAuth flow (must match the Zoho Connected App registration exactly)
+  ZOHO_OAUTH_URL: ${ZOHO_OAUTH_URL:-https://accounts.zoho.in/oauth/v2/auth}
+  ZOHO_ACCESS_TOKEN_URL: ${ZOHO_ACCESS_TOKEN_URL:-https://accounts.zoho.in/oauth/v2/token}
+  ZOHO_REDIRECT_URL: ${ZOHO_REDIRECT_URL:-}
+  ZOHO_SCOPE: ${ZOHO_SCOPE:-ZohoBooks.fullaccess.all}
+  ZOHO_ACCESS_TYPE: ${ZOHO_ACCESS_TYPE:-offline}
+  ZOHO_PROMPT: ${ZOHO_PROMPT:-Consent}
+  # /initiate + /revoke require a JWT (default True). Set false in dev so the
+  # consent screen opens directly in the browser. /callback is always JWT-free.
+  ZOHO_AUTH_REQUIRE_USER: ${ZOHO_AUTH_REQUIRE_USER:-true}
+  ZOHO_CALLBACK_REQUIRE_USER: ${ZOHO_CALLBACK_REQUIRE_USER:-false}
   # Email (Resend)
   RESEND_API_KEY: ${RESEND_API_KEY:-}
   RESEND_DEFAULT_FROM: ${RESEND_DEFAULT_FROM:-Core Platform <noreply@example.com>}

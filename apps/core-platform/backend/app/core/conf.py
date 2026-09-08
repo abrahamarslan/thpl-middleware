@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     ZOHO_WEBHOOK_KEY_INCOMING: str = ""
     ZOHO_TOKEN_PERSISTENCE_ENABLED: bool = False
     ZOHO_AUTH_REQUIRE_USER: bool = True
+    # /callback is hit by a browser redirect from Zoho, which cannot attach an
+    # Authorization header. It must therefore be JWT-free by default; provenance
+    # is verified via the one-time CSRF `state` stored in Redis instead. Flip
+    # this on only if /callback is reached from a client that can send a token.
+    ZOHO_CALLBACK_REQUIRE_USER: bool = False
 
     # --- Zoho Sync Engine (fleet-wide defaults; modules override per-module —
     #     see app/modules/zoho/sync/config.py) ---
