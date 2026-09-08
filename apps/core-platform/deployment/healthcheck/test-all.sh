@@ -101,7 +101,7 @@ run_test "Grafana"                  "$SCRIPT_DIR/test-grafana.sh"
 run_test "Observability pipeline"   "$SCRIPT_DIR/test-observability.sh"
 
 # Utilities
-run_test "Gotenberg (PDF)"          "$SCRIPT_DIR/test-gotenberg.sh"
+run_test "Typst (PDF)"              "$SCRIPT_DIR/test-typst.sh"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 TOTAL=$((PASSED + FAILED + SKIPPED))

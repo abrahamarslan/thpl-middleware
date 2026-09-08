@@ -39,7 +39,7 @@ class ConflictError(AppError):
 
 
 class UpstreamError(AppError):
-    """A dependency (Zoho, Gotenberg, ...) failed. 502 keeps blame upstream.
+    """A dependency (Zoho, Typst, ...) failed. 502 keeps blame upstream.
 
     Zoho-specific errors live in app.modules.zoho.core.exceptions and
     subclass this, so global handlers cover them automatically.

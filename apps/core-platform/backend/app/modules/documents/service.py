@@ -1,19 +1,30 @@
-"""PDF generation via Gotenberg (service layer).
+"""PDF generation via Typst (service layer).
 
-Gotenberg is reachable ONLY on the app-pdf Docker network — no host port,
-no Traefik route. The backend and Celery workers are the only containers
-attached to that network, which is what enforces "only my application can
-use Gotenberg".
+In-process rendering with typst-py (https://pypi.org/project/typst/):
+no sidecar service, no Docker network, no HTTP hop. The Celery worker
+compiles Typst markup to PDF bytes and stores the file in the shared
+media volume.
 
 Sync implementation because PDF rendering belongs in Celery workers
 (documents queue) — it is slow, CPU-heavy and must not block API workers.
+
+Data injection: prefer ``sys_inputs`` over string interpolation. Pass JSON
+strings and decode them inside Typst::
+
+    sys_inputs = {"invoice": json.dumps(invoice_dict)}
+
+    #let invoice = json(bytes(sys.inputs.invoice))
+
+Templates live next to the caller (or under
+``app/modules/documents/templates/*.typ``); for multi-file projects pass a
+``dict[str, bytes]`` with a ``"main.typ"`` entry — see typst-py docs.
 """
 
 import uuid
 from pathlib import Path
 
-import httpx
 import structlog
+import typst
 
 from app.common.exception.errors import UpstreamError
 from app.core.conf import settings
@@ -21,24 +32,41 @@ from app.core.conf import settings
 logger = structlog.get_logger("app.documents")
 
 
-def render_html_to_pdf(html: str, filename: str = "document.pdf") -> str:
-    """Render an HTML string to PDF via Gotenberg. Returns the stored file path."""
+def render_typst_to_pdf(
+    source: str | bytes | dict[str, bytes],
+    filename: str = "document.pdf",
+    sys_inputs: dict[str, str] | None = None,
+) -> str:
+    """Compile Typst markup to PDF. Returns the stored file path."""
     out_dir = Path(settings.MEDIA_DIR) / "pdf"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{uuid.uuid4().hex}-{filename}"
 
-    with httpx.Client(base_url=settings.GOTENBERG_URL, timeout=60.0) as client:
-        resp = client.post(
-            "/forms/chromium/convert/html",
-            files={"files": ("index.html", html.encode("utf-8"), "text/html")},
-        )
+    if isinstance(source, str):
+        typst_input: str | bytes | dict[str, bytes] = source.encode("utf-8")
+    else:
+        typst_input = source
 
-    if resp.status_code != 200:
-        logger.error("gotenberg_render_failed", status=resp.status_code, body=resp.text[:300])
+    kwargs: dict = {"format": "pdf"}
+    if settings.TYPST_FONT_PATHS:
+        kwargs["font_paths"] = settings.TYPST_FONT_PATHS
+    if settings.TYPST_PDF_STANDARDS:
+        kwargs["pdf_standards"] = settings.TYPST_PDF_STANDARDS
+    if sys_inputs:
+        kwargs["sys_inputs"] = sys_inputs
+
+    try:
+        pdf_bytes = typst.compile(typst_input, **kwargs)
+    except Exception as exc:  # typst.TypstError + input validation
+        logger.error("typst_render_failed", error=str(exc)[:300])
+        raise UpstreamError("PDF rendering failed") from exc
+
+    if not isinstance(pdf_bytes, (bytes, bytearray)):
+        logger.error("typst_render_unexpected", type=type(pdf_bytes).__name__)
         raise UpstreamError("PDF rendering failed")
 
-    out_path.write_bytes(resp.content)
-    logger.info("pdf_rendered", path=str(out_path), size_bytes=len(resp.content))
+    out_path.write_bytes(bytes(pdf_bytes))
+    logger.info("pdf_rendered", path=str(out_path), size_bytes=len(pdf_bytes))
     return str(out_path)
 
 

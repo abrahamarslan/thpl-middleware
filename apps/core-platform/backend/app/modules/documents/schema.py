@@ -7,11 +7,20 @@ from pydantic import BaseModel, ConfigDict, computed_field
 from app.modules.tags.schema import TagOut
 
 
-# ── PDF rendering (Gotenberg flow) ──────────────────────────────────────────
+# ── PDF rendering (Typst flow) ──────────────────────────────────────────────
 
 class RenderRequest(BaseModel):
-    html: str
+    """Compile Typst markup to PDF (async via Celery).
+
+    Prefer ``sys_inputs`` over interpolating data into ``source``::
+
+        source = '#let invoice = json(bytes(sys.inputs.invoice))\n#invoice.number'
+        sys_inputs = {"invoice": '{"number": "INV-1"}'}
+    """
+
+    source: str
     filename: str = "document.pdf"
+    sys_inputs: dict[str, str] | None = None
 
 
 class TaskSubmitted(BaseModel):

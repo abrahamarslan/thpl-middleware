@@ -41,6 +41,18 @@ class Settings(BaseSettings):
             return None
         return v
 
+    # Typst list options arrive as JSON arrays (like CORS_ORIGINS); compose
+    # passes `${VAR:-}` → "" when unset. Normalise blank to [] so pydantic
+    # does not try to JSON-parse an empty string.
+    @field_validator("TYPST_FONT_PATHS", "TYPST_PDF_STANDARDS", mode="before")
+    @classmethod
+    def _blank_env_to_empty_list(cls, v: object) -> object:
+        if v is None:
+            return []
+        if isinstance(v, str) and v.strip() == "":
+            return []
+        return v
+
     # --- CORS ---
     CORS_ORIGINS: list[str] = []
     CORS_CREDENTIALS: bool = True
@@ -172,8 +184,13 @@ class Settings(BaseSettings):
     AWS_REGION: str = ""
     MEDIA_S3_BUCKET: str = ""
 
-    # --- Gotenberg (internal-only network, never exposed to host) ---
-    GOTENBERG_URL: str = "http://gotenberg:3000"
+    # --- Document rendering (Typst, in-process via typst-py — no service) ---
+    # Slim images ship almost no fonts: bundle brand fonts and point
+    # TYPST_FONT_PATHS at them (e.g. ["app/assets/fonts"]). Empty = system fonts.
+    TYPST_FONT_PATHS: list[str] = []
+    # Named PDF targets understood by typst-py, e.g. ["a-2b"] for archival
+    # invoicing. Empty = default PDF output.
+    TYPST_PDF_STANDARDS: list[str] = []
     MEDIA_DIR: str = "/app/media"
 
     # --- Observability ---

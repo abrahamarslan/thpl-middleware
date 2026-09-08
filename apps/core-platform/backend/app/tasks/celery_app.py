@@ -9,7 +9,7 @@ Topology (all defined in docker-compose):
 Queues:
   default       — misc app tasks
   integrations  — Zoho syncs (rate-limit-sensitive, retried with backoff)
-  documents     — Gotenberg PDF rendering (slow, CPU-bound)
+  documents     — Typst PDF rendering (slow, CPU-bound)
 
 Scaling rule: one worker container per queue class once load grows, e.g.
   celery -A app.tasks.celery_app worker -Q documents -c 2

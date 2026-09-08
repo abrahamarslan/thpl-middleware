@@ -9,13 +9,12 @@
 #   - Base file publishes ONLY Traefik (80/443). Every other service is
 #     reachable solely on internal Docker networks. Dev-only host ports live
 #     in docker-compose.dev.yml.
-#   - Gotenberg sits alone on app-pdf; only backend + celery-worker join it.
+#   - PDF rendering is in-process (typst-py) — no sidecar, no extra network.
 #
 # Networks:
 #   app-frontend    Traefik <-> publicly routed services
 #   app-backend     backend/workers <-> data stores & internal services
 #   app-auth        Authentik <-> postgres/redis only
-#   app-pdf         Gotenberg <-> backend & celery-worker ONLY
 #   app-monitoring  Prometheus/Loki/Tempo/Alloy/Grafana + scrape targets
 # ==============================================================================
 
@@ -86,8 +85,9 @@ x-backend-env: &backend-env
   RESEND_API_KEY: ${RESEND_API_KEY:-}
   RESEND_DEFAULT_FROM: ${RESEND_DEFAULT_FROM:-Core Platform <noreply@example.com>}
   RESEND_WEBHOOK_SECRET: ${RESEND_WEBHOOK_SECRET:-}
-  # Gotenberg — internal-only network
-  GOTENBERG_URL: http://gotenberg:3000
+  # Typst (in-process via typst-py; font/package dirs are baked into the image)
+  TYPST_FONT_PATHS: ${TYPST_FONT_PATHS:-}
+  TYPST_PDF_STANDARDS: ${TYPST_PDF_STANDARDS:-}
   MEDIA_DIR: /app/media
   # Rate limiting
   RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
@@ -338,7 +338,6 @@ services:
     networks:
       - app-frontend
       - app-backend
-      - app-pdf
       - app-monitoring
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
@@ -361,7 +360,7 @@ services:
   # ============================================================================
   #  ASYNC — Celery Worker (queues: default, integrations, documents)
   # ============================================================================
-  # Used for: Zoho catalog/contact syncs, PDF generation via Gotenberg,
+  # Used for: Zoho catalog/contact syncs, PDF generation via Typst,
   # order push-to-Zoho, route optimisation jobs (OR-Tools), media cleanup.
   # ============================================================================
   celery-worker:
@@ -390,7 +389,6 @@ services:
         condition: service_healthy
     networks:
       - app-backend
-      - app-pdf
       - app-monitoring
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 | grep -q pong"]
@@ -975,29 +973,6 @@ services:
         limits: { memory: 512M, cpus: "0.50" }
 
   # ============================================================================
-  #  UTILITIES — Gotenberg PDF Generation (LOCKED DOWN)
-  # ============================================================================
-  # No host port. No Traefik route. Only on app-pdf, which only backend and
-  # celery-worker join — nothing else on the host or stack can reach it.
-  # ============================================================================
-  gotenberg:
-    image: gotenberg/gotenberg:8
-    container_name: gotenberg
-    restart: unless-stopped
-    environment:
-      TZ: ${TZ:-UTC}
-    command:
-      - "gotenberg"
-      - "--api-timeout=60s"
-      - "--chromium-auto-start=true"
-      - "--libreoffice-auto-start=true"
-    networks:
-      - app-pdf
-    deploy:
-      resources:
-        limits: { memory: 2G, cpus: "1.00" }
-
-  # ============================================================================
   #  UTILITIES — Volume backup (non-DB stateful volumes, every 2 days)
   # ============================================================================
   # PostgreSQL is NOT backed up here — copying live DB files is unsafe.
@@ -1088,7 +1063,5 @@ networks:
     name: app-backend
   app-auth:
     name: app-auth
-  app-pdf:
-    name: app-pdf
   app-monitoring:
     name: app-monitoring

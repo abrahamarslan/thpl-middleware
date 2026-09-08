@@ -1,5 +1,5 @@
 # ==============================================================================
-# Module logging — Documents (Gotenberg PDF generation)
+# Module logging — Documents (Typst PDF generation)
 # ==============================================================================
 # Governs 'app.documents' and the 'app.tasks.documents' worker task logger.
 # ==============================================================================

@@ -62,8 +62,12 @@ opentelemetry-instrumentation-sqlalchemy>=0.50b0
 opentelemetry-instrumentation-redis>=0.50b0
 opentelemetry-instrumentation-celery>=0.50b0
 
-# --- Templating (invoice/HTML templates for Gotenberg PDF rendering) ---
+# --- Templating (Jinja2 renders .typ sources; typst-py compiles them to PDF) ---
 Jinja2>=3.1.5
+
+# --- Document rendering (Typst replaces Gotenberg; in-process, no service) ---
+# https://pypi.org/project/typst/ | https://github.com/messense/typst-py
+typst==0.15.0
 
 # --- Imaging ---
 Pillow>=11.0

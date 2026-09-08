@@ -19,7 +19,11 @@ router = APIRouter()
 async def render_pdf(_: CurrentUser, body: RenderRequest):
     result = celery_app.send_task(
         "app.tasks.documents.generate_pdf",
-        kwargs={"html": body.html, "filename": body.filename},
+        kwargs={
+            "source": body.source,
+            "filename": body.filename,
+            "sys_inputs": body.sys_inputs,
+        },
         queue="documents",
     )
     return ResponseModel(data=TaskSubmitted(task_id=result.id))

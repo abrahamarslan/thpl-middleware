@@ -1,6 +1,6 @@
 """Documents model — polymorphic attachments (docs/modules-to-implement/document.md).
 
-Coexists with the render endpoints in this module (Gotenberg PDF flow) and
+Coexists with the render endpoints in this module (Typst PDF flow) and
 with app/modules/files (the legacy S3/OCR file table): ``documents`` is the
 ATTACHABLE entity — any record (Email, ZohoOrganization, User, ...) gets a
 ``documents`` list via HasDocumentsMixin.

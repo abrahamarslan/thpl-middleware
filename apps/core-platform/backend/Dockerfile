@@ -21,7 +21,7 @@ RUN /opt/venv/bin/pip install -r requirements.txt
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM python:${PYTHON_VERSION}-slim
 
-# curl is used by container healthchecks and the gotenberg healthcheck script
+# curl is used by container healthchecks
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
