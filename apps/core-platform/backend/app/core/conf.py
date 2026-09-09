@@ -4,10 +4,12 @@ Every tunable lives here, loaded from environment variables (12-factor).
 Docker injects env vars via docker-compose; local dev falls back to .env.
 """
 
+import json
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -41,16 +43,25 @@ class Settings(BaseSettings):
             return None
         return v
 
-    # Typst list options arrive as JSON arrays (like CORS_ORIGINS); compose
-    # passes `${VAR:-}` → "" when unset. Normalise blank to [] so pydantic
-    # does not try to JSON-parse an empty string.
+    # Typst list options arrive as JSON arrays; compose passes `${VAR:-}` → ""
+    # when unset. These fields are annotated `NoDecode` so pydantic-settings
+    # hands us the raw env string instead of JSON-parsing it at the source —
+    # source-level decoding runs before validators and blows up on "". We do
+    # the parsing here: blank → [], a JSON array string → the list, otherwise
+    # a comma-separated fallback.
     @field_validator("TYPST_FONT_PATHS", "TYPST_PDF_STANDARDS", mode="before")
     @classmethod
     def _blank_env_to_empty_list(cls, v: object) -> object:
         if v is None:
             return []
-        if isinstance(v, str) and v.strip() == "":
-            return []
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return []
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError:
+                return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
     # --- CORS ---
@@ -187,10 +198,10 @@ class Settings(BaseSettings):
     # --- Document rendering (Typst, in-process via typst-py — no service) ---
     # Slim images ship almost no fonts: bundle brand fonts and point
     # TYPST_FONT_PATHS at them (e.g. ["app/assets/fonts"]). Empty = system fonts.
-    TYPST_FONT_PATHS: list[str] = []
+    TYPST_FONT_PATHS: Annotated[list[str], NoDecode] = []
     # Named PDF targets understood by typst-py, e.g. ["a-2b"] for archival
     # invoicing. Empty = default PDF output.
-    TYPST_PDF_STANDARDS: list[str] = []
+    TYPST_PDF_STANDARDS: Annotated[list[str], NoDecode] = []
     MEDIA_DIR: str = "/app/media"
 
     # --- Observability ---
