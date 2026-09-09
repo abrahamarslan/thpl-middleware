@@ -81,6 +81,8 @@ x-backend-env: &backend-env
   # consent screen opens directly in the browser. /callback is always JWT-free.
   ZOHO_AUTH_REQUIRE_USER: ${ZOHO_AUTH_REQUIRE_USER:-true}
   ZOHO_CALLBACK_REQUIRE_USER: ${ZOHO_CALLBACK_REQUIRE_USER:-false}
+  # HMAC key for inbound Zoho webhooks (empty = signature check skipped, dev only)
+  ZOHO_WEBHOOK_KEY_INCOMING: ${ZOHO_WEBHOOK_KEY_INCOMING:-}
   # Email (Resend)
   RESEND_API_KEY: ${RESEND_API_KEY:-}
   RESEND_DEFAULT_FROM: ${RESEND_DEFAULT_FROM:-Core Platform <noreply@example.com>}
@@ -622,8 +624,11 @@ services:
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
       AUTHENTIK_EMAIL__HOST: ${AUTHENTIK_EMAIL_HOST:-mailhog}
       AUTHENTIK_EMAIL__PORT: "${AUTHENTIK_EMAIL_PORT:-1025}"
+      AUTHENTIK_EMAIL__USERNAME: ${AUTHENTIK_EMAIL_USERNAME:-}
+      AUTHENTIK_EMAIL__PASSWORD: ${AUTHENTIK_EMAIL_PASSWORD:-}
       AUTHENTIK_EMAIL__USE_TLS: "${AUTHENTIK_EMAIL_USE_TLS:-false}"
-      AUTHENTIK_EMAIL__FROM: "authentik@${APP_DOMAIN:-app.local}"
+      AUTHENTIK_EMAIL__USE_SSL: "${AUTHENTIK_EMAIL_USE_SSL:-false}"
+      AUTHENTIK_EMAIL__FROM: ${AUTHENTIK_EMAIL_FROM:-authentik@${APP_DOMAIN:-app.local}}
     volumes:
       - authentik_media:/media
       - authentik_templates:/templates
@@ -666,8 +671,11 @@ services:
       AUTHENTIK_REDIS__PASSWORD: ${REDIS_PASSWORD}
       AUTHENTIK_EMAIL__HOST: ${AUTHENTIK_EMAIL_HOST:-mailhog}
       AUTHENTIK_EMAIL__PORT: "${AUTHENTIK_EMAIL_PORT:-1025}"
+      AUTHENTIK_EMAIL__USERNAME: ${AUTHENTIK_EMAIL_USERNAME:-}
+      AUTHENTIK_EMAIL__PASSWORD: ${AUTHENTIK_EMAIL_PASSWORD:-}
       AUTHENTIK_EMAIL__USE_TLS: "${AUTHENTIK_EMAIL_USE_TLS:-false}"
-      AUTHENTIK_EMAIL__FROM: "authentik@${APP_DOMAIN:-app.local}"
+      AUTHENTIK_EMAIL__USE_SSL: "${AUTHENTIK_EMAIL_USE_SSL:-false}"
+      AUTHENTIK_EMAIL__FROM: ${AUTHENTIK_EMAIL_FROM:-authentik@${APP_DOMAIN:-app.local}}
     volumes:
       - authentik_media:/media
       - authentik_templates:/templates
@@ -722,11 +730,16 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      # kafka-broker-api-versions.sh is a full JVM and kafka-run-class.sh honours
+      # the container's KAFKA_HEAP_OPTS — so without the override below every probe
+      # spawns a second 1G-heap JVM next to the broker, exceeds the cgroup memory
+      # limit, and the probe JVM is OOM-killed → the container never goes healthy
+      # even though the broker is fine. Clamp the probe heap; give the JVM time.
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS='-Xmx128m -Xms64m' /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 40s
+      timeout: 20s
+      retries: 12
+      start_period: 90s
     networks:
       - app-backend
     deploy:

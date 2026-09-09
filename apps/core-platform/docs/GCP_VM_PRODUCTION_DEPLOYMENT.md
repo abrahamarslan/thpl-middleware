@@ -34,7 +34,7 @@ The stack runs 18 containerized services. The configured Docker container memory
 | Service | Container Name | Memory Limit | CPU Limit | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | **ClickHouse** | `clickhouse` | 4 GB | 2.0 | High-throughput analytics ingestion |
-| **Kafka (KRaft)** | `kafka` | 2 GB | 2.0 | CDC stream broker |
+| **Kafka (KRaft)** | `kafka` | 3 GB | 2.0 | CDC stream broker (base 2 GB; prod override raises to 3 GB for broker heap + page cache) |
 | **PostgreSQL** | `postgres` | 2 GB | 2.0 | PostGIS + 12 extensions + WAL replication |
 | **Debezium** | `debezium` | 1.5 GB | 1.0 | Kafka Connect CDC for zoho-mirror tables |
 | **Authentik Server** | `authentik-server` | 1 GB | 1.0 | IAM, OIDC core server |
@@ -96,97 +96,78 @@ traefik.dlp.tarrinahealth.com. 300  IN  A  <VM_STATIC_IP>
 ## 3. Traefik & TLS Configuration
 
 ### Production TLS Strategy: ACME HTTP-01 Challenge
-In development, the stack uses `mkcert` self-signed local certs via `config/traefik/dynamic/tls.yml`.  
-In staging/initial production docs, an `acme-dns` container was referenced. **In production, we use pure ACME HTTP-01**.
+- **Development** uses `mkcert` file certs via `config/traefik/dynamic/tls.yml.disabled` and the base `config/traefik/traefik.yml`.
+- **Production** uses **pure ACME HTTP-01**. The production override swaps in dedicated config files so you never hand-edit the dev ones.
 
 #### Why HTTP-01:
-1. Eliminates the need to run `acme-dns` on port 53 (which conflicts with Ubuntu's `systemd-resolved`).
-2. Eliminates external CNAME delegation setup.
-3. Automatically completes validation through Traefik on port 80.
+1. No `acme-dns` container on port 53 (conflicts with Ubuntu's `systemd-resolved`).
+2. No external CNAME delegation.
+3. Validation completes automatically through Traefik on port 80.
 
-### Configuration File Adjustments on VM
+### How the production override wires TLS (nothing to hand-edit)
 
-#### 1. Update `config/traefik/traefik.yml`
-Configure the `letsencrypt` certResolver to use `httpChallenge` on entryPoint `web`:
+`docker-compose.prod.yml` mounts **production-only** files over the container paths:
+
+| Container path | Dev (base) | Production (`docker-compose.prod.yml`) |
+| :--- | :--- | :--- |
+| `/etc/traefik/traefik.yml` | `config/traefik/traefik.yml` (mkcert / placeholder acme-dns) | **`config/traefik/traefik.prod.yml`** — HTTP-01 on entryPoint `web` |
+| `/etc/traefik/dynamic/` | `config/traefik/dynamic/` (shared "changeme" basic-auth) | **`config/traefik/dynamic-prod/`** — real basic-auth hash |
+| ACME email | — | `${ACME_EMAIL}` from `.env.prod`, injected as `TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL` |
+
+Every public router already carries `tls.certresolver=letsencrypt` in the prod override (api, frontend, flower, grafana, soketi, authentik, dashboard). ACME state persists in the `traefik_certs` named volume (`/letsencrypt/acme.json`).
+
+> [!WARNING]
+> The **base** `config/traefik/traefik.yml` defines a `dnsChallenge` (acme-dns) resolver only — it has **no `httpChallenge`**. If you deploy with the base file alone (forgot `-f docker-compose.prod.yml`), or on the `--profile production` path without registering acme-dns, **no certificates are ever issued and HTTPS silently fails**. Always deploy with `./manage.sh prod` (or both `-f` files).
+
+`config/traefik/traefik.prod.yml` (already in the repo — shown for reference):
 
 ```yaml
-# apps/core-platform/deployment/config/traefik/traefik.yml
-api:
-  dashboard: true
-
-ping: {}
-
+# apps/core-platform/deployment/config/traefik/traefik.prod.yml
 entryPoints:
   web:
     address: ":80"
     http:
       redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
+        entryPoint: { to: websecure, scheme: https }
   websecure:
     address: ":443"
   metrics:
     address: ":8082"
 
-providers:
-  docker:
-    exposedByDefault: false
-    network: app-frontend
-  file:
-    directory: /etc/traefik/dynamic
-    watch: true
-
-log:
-  level: INFO
-  format: json
-
-accessLog:
-  format: json
-  fields:
-    headers:
-      names:
-        X-Request-Id: keep
-
-metrics:
-  prometheus:
-    entryPoint: metrics
-
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: devops@tarrinahealth.com     # Replace with valid operational email
+      email: tech@tarrinahealth.com          # overridden by ${ACME_EMAIL} at runtime
       storage: /letsencrypt/acme.json
       httpChallenge:
         entryPoint: web
 ```
 
 > [!IMPORTANT]
-> Traefik automatically intercepts `/.well-known/acme-challenge/` requests on port 80 **before** applying the HTTPS redirect. Never block port 80 at the GCP firewall level.
+> Traefik intercepts `/.well-known/acme-challenge/` on port 80 **before** the HTTPS redirect. Never block port 80 at the GCP firewall.
 
-#### 2. Disable Development `tls.yml`
-The file `config/traefik/dynamic/tls.yml` references `mkcert` certificates (`/etc/traefik/certs/local.pem`) which do not exist on the production VM.
-Disable it so Traefik does not log file load errors:
-```bash
-mv config/traefik/dynamic/tls.yml config/traefik/dynamic/tls.yml.disabled
-```
+### The only manual TLS step: rotate the dashboard / Flower password
 
-#### 3. Update Basic Auth in `config/traefik/dynamic/middlewares.yml`
-Generate a fresh, strong password hash for the Traefik dashboard and Flower:
+`config/traefik/dynamic-prod/middlewares.yml` ships with a working bcrypt hash, but rotate it before go-live:
+
 ```bash
-# Generate apr1 hash:
-htpasswd -nbB admin 'YOUR_SECURE_PASSWORD'
-# Output format: admin:$2y$05$... or admin:$apr1$...
+cd ~/th-middleware/apps/core-platform/deployment
+docker run --rm httpd:2.4-alpine htpasswd -nbB admin 'YOUR_SECURE_PASSWORD'
+# -> admin:$2y$05$....  paste into config/traefik/dynamic-prod/middlewares.yml
 ```
-Replace the placeholder user hash in `config/traefik/dynamic/middlewares.yml`:
 ```yaml
+# config/traefik/dynamic-prod/middlewares.yml
 http:
   middlewares:
     dashboard-auth:
       basicAuth:
         users:
-          - "admin:<GENERATED_HTPASSWD_HASH>"
+          - "admin:<GENERATED_BCRYPT_HASH>"     # $ chars are fine here — file provider does not interpolate
 ```
+Record the plaintext in `.env.prod` as a comment, then `./manage.sh prod` (or `docker compose ... up -d traefik`).
+
+> [!NOTE]
+> Do **not** `mv` or edit `config/traefik/dynamic/tls.yml.disabled` or `config/traefik/traefik.yml` on the VM — production does not mount them.
 
 ---
 
@@ -375,53 +356,81 @@ gh auth login --hostname github.com -p https -w
 git clone https://github.com/abrahamarslan/thpl-middleware.git ~/th-middleware
 cd ~/th-middleware/apps/core-platform/deployment
 
-# Initialize local production environment file
-cp .env.example .env
-chmod 600 .env
+# Initialize the production environment file.
+# The stack reads a file named .env.prod (see manage.sh `prod`). Symlink .env
+# to it so bare `docker compose ...` and `docker compose exec` also pick it up.
+cp .env.example .env.prod
+chmod 600 .env.prod
+ln -sf .env.prod .env
 ```
 
+> [!IMPORTANT]
+> `.env.prod` is git-ignored (`.env.*`). Never commit it. `manage.sh prod`
+> passes `--env-file .env.prod` automatically; the `.env` symlink covers the
+> other `manage.sh` commands (`migrate`, `logs`, `shell-*`).
+
 ### 4.2 Generate Cryptographic Secrets
-Run the following generator to generate high-entropy tokens:
+Generate **hex-only** tokens — hex has no shell/compose metacharacters (`$ & " ' <space>`), so nothing has to be quoted or `$$`-escaped in `.env.prod`.
 
 ```bash
 cat << 'EOF' > generate_secrets.sh
 #!/usr/bin/env bash
-echo "=== Production Cryptographic Keys ==="
-for k in POSTGRES_PASSWORD REDIS_PASSWORD CLICKHOUSE_PASSWORD MEILISEARCH_KEY \
-         JWT_SECRET_KEY SOKETI_APP_KEY SOKETI_APP_SECRET AUTHENTIK_DB_PASSWORD \
-         AUTHENTIK_SERVICE_TOKEN KAFKA_UI_PASSWORD GRAFANA_ADMIN_PASSWORD; do
+echo "=== Production Cryptographic Keys (paste into .env.prod) ==="
+for k in POSTGRES_PASSWORD REDIS_PASSWORD CLICKHOUSE_PASSWORD AUTHENTIK_DB_PASSWORD \
+         AUTHENTIK_BOOTSTRAP_PASSWORD KAFKA_UI_PASSWORD GRAFANA_ADMIN_PASSWORD; do
+    echo "$k=$(openssl rand -hex 24)"
+done
+for k in MEILISEARCH_KEY JWT_SECRET_KEY SOKETI_APP_SECRET AUTHENTIK_BOOTSTRAP_TOKEN; do
     echo "$k=$(openssl rand -hex 32)"
 done
-echo "AUTHENTIK_SECRET_KEY=$(openssl rand -base64 48 | tr -d '\n')"
+echo "SOKETI_APP_ID=$(openssl rand -hex 8)"
+echo "SOKETI_APP_KEY=$(openssl rand -hex 16)"
+echo "AUTHENTIK_SECRET_KEY=$(openssl rand -hex 48)"
+echo
+echo "# Traefik dashboard / Flower basic-auth:"
+DASH_PW=$(openssl rand -hex 12)
+echo "#   plaintext: $DASH_PW"
+docker run --rm httpd:2.4-alpine htpasswd -nbB admin "$DASH_PW" 2>/dev/null \
+  | sed 's/^/#   hash:      /'
 EOF
 bash generate_secrets.sh
 rm generate_secrets.sh
 ```
 
-### 4.3 Configure Production `.env`
-Edit `.env` (`nano .env`) and set the production variables:
+> [!NOTE]
+> `AUTHENTIK_SERVICE_TOKEN` is **not** a random string — it is a service-account
+> API token you create later in the Authentik admin UI (Directory → Tokens).
+> Leave it blank with `AUTHENTIK_SYNC_ENABLED=false` until then.
+>
+> If you rotate a secret to a value that contains a literal `$`, single-quote it
+> in `.env.prod` (`FOO='a$b'`) or double the dollar (`FOO=a$$b`) — otherwise
+> `docker compose` treats `$b` as a variable and warns
+> *"The \"b\" variable is not set"*.
+
+### 4.3 Configure Production `.env.prod`
+Edit `.env.prod` (`nano .env.prod`). A pre-filled reference copy lives at
+`deployment/.env.prod` in the repo — diff against it. Set at minimum:
 
 ```ini
 # ==============================================================================
-# CORE PLATFORM PRODUCTION CONFIGURATION
+# CORE PLATFORM PRODUCTION CONFIGURATION  (.env.prod)
 # ==============================================================================
 ENVIRONMENT=production
 DEBUG=false
-TZ=UTC
+TZ=Asia/Kolkata
 
 APP_DOMAIN=dlp.tarrinahealth.com
 VITE_API_URL=/api
 API_PREFIX=/api
 
-# Traefik Ports
 TRAEFIK_HTTP_PORT=80
 TRAEFIK_HTTPS_PORT=443
 
-# Security & CORS (Must strictly match the domain)
+# Security & CORS (must strictly match the domain)
 CORS_ORIGINS=["https://dlp.tarrinahealth.com"]
 CORS_CREDENTIALS=true
 
-# Database Credentials (paste from secret generation)
+# Database credentials (paste from 4.2 — hex, no quoting needed)
 POSTGRES_DB=app_db
 POSTGRES_USER=app
 POSTGRES_PASSWORD=<GENERATED_POSTGRES_PASSWORD>
@@ -431,28 +440,47 @@ CLICKHOUSE_USER=app
 CLICKHOUSE_PASSWORD=<GENERATED_CLICKHOUSE_PASSWORD>
 MEILISEARCH_KEY=<GENERATED_MEILISEARCH_KEY>
 
-# JWT Authentication
+# JWT
 JWT_SECRET_KEY=<GENERATED_JWT_SECRET_KEY>
 JWT_ALGORITHM=HS256
 JWT_EXPIRATION_HOURS=24
 JWT_REFRESH_EXPIRATION_DAYS=30
 
-# WebSockets (Soketi)
-SOKETI_APP_ID=app
+# WebSockets (Soketi)  — wss://ws.dlp.tarrinahealth.com
+SOKETI_APP_ID=<GENERATED_SOKETI_APP_ID>
 SOKETI_APP_KEY=<GENERATED_SOKETI_APP_KEY>
 SOKETI_APP_SECRET=<GENERATED_SOKETI_APP_SECRET>
+
+# Kafka
+KAFKA_CLUSTER_ID=5L6g3nShT-eMCtK--X86sw
+SEARCH_CDC_TOPICS=zoho-mirror.public.zoho_organizations
 
 # Authentik IAM
 AUTHENTIK_SECRET_KEY=<GENERATED_AUTHENTIK_SECRET_KEY>
 AUTHENTIK_DB_NAME=authentik
 AUTHENTIK_DB_USER=authentik
 AUTHENTIK_DB_PASSWORD=<GENERATED_AUTHENTIK_DB_PASSWORD>
-AUTHENTIK_SERVICE_TOKEN=<GENERATED_AUTHENTIK_SERVICE_TOKEN>
 AUTHENTIK_LOG_LEVEL=info
-AUTHENTIK_EMAIL_HOST=smtp.sendgrid.net   # Real transactional SMTP
+# First-run admin (akadmin), created once on first migration:
+AUTHENTIK_BOOTSTRAP_EMAIL=admin@tarrinahealth.com
+AUTHENTIK_BOOTSTRAP_PASSWORD=<GENERATED_AUTHENTIK_BOOTSTRAP_PASSWORD>
+AUTHENTIK_BOOTSTRAP_TOKEN=<GENERATED_AUTHENTIK_BOOTSTRAP_TOKEN>
+# OUTBOUND user sync — token is created in the Authentik UI later:
+AUTHENTIK_SYNC_ENABLED=false
+AUTHENTIK_SERVICE_TOKEN=
+# OIDC login — configure the provider/app in Authentik, then flip to true:
+AUTHENTIK_OIDC_ENABLED=false
+AUTHENTIK_OIDC_ISSUER=https://auth.dlp.tarrinahealth.com/application/o/core-platform/
+AUTHENTIK_OIDC_CLIENT_ID=
+AUTHENTIK_OIDC_JWKS_URL=http://authentik-server:9000/application/o/core-platform/jwks/
+# Authentik outbound SMTP (authenticated):
+AUTHENTIK_EMAIL_HOST=smtp.resend.com
 AUTHENTIK_EMAIL_PORT=587
+AUTHENTIK_EMAIL_USERNAME=resend
+AUTHENTIK_EMAIL_PASSWORD=<SMTP_PASSWORD_OR_API_KEY>
 AUTHENTIK_EMAIL_USE_TLS=true
-AUTHENTIK_EMAIL_FROM=auth@dlp.tarrinahealth.com
+AUTHENTIK_EMAIL_USE_SSL=false
+AUTHENTIK_EMAIL_FROM=Tarrina Health <noreply@tarrinahealth.com>
 
 # Monitoring & Kafka UI
 KAFKA_UI_USERNAME=admin
@@ -461,11 +489,17 @@ GRAFANA_ADMIN_USER=admin
 GRAFANA_ADMIN_PASSWORD=<GENERATED_GRAFANA_ADMIN_PASSWORD>
 
 # Production TLS (ACME HTTP-01)
-ACME_EMAIL=devops@tarrinahealth.com
+ACME_EMAIL=tech@tarrinahealth.com
 
-# Zoho Integration (India Data Center: accounts.zoho.in)
+# Runtime tuning
+WORKERS=4
+CELERY_CONCURRENCY=4
+RATE_LIMIT_PER_MINUTE=120
+
+# Zoho Integration (India DC: accounts.zoho.in)
 ZOHO_CLIENT_ID=<ZOHO_PROD_CLIENT_ID>
 ZOHO_CLIENT_SECRET=<ROTATED_ZOHO_CLIENT_SECRET>
+ZOHO_REFRESH_TOKEN=
 ZOHO_REDIRECT_URL=https://dlp.tarrinahealth.com/api/zoho/auth/callback
 ZOHO_ACCOUNTS_URL=https://accounts.zoho.in
 ZOHO_API_BASE_URL=https://www.zohoapis.in/books/v3
@@ -473,13 +507,22 @@ ZOHO_ORGANIZATION_ID=<YOUR_ZOHO_ORG_ID>
 ZOHO_REGION=in
 ZOHO_BOOKS_API_URL=https://www.zohoapis.in/books/v3
 ZOHO_INVENTORY_API_URL=https://www.zohoapis.in/inventory/v1
-ZOHO_AUTH_REQUIRE_USER=false          # Set false during initial bootstrap
-ZOHO_CALLBACK_REQUIRE_USER=false      # Zoho callback cannot send JWT Authorization header
+ZOHO_AUTH_REQUIRE_USER=true           # keep JWT-gated in real production
+ZOHO_CALLBACK_REQUIRE_USER=false      # Zoho callback cannot send a JWT header
+ZOHO_WEBHOOK_KEY_INCOMING=<HMAC_KEY_FROM_ZOHO_WEBHOOK_CONFIG>
 
 # Transactional Email (Resend)
 RESEND_API_KEY=<YOUR_RESEND_API_KEY>
-RESEND_DEFAULT_FROM=DLP <noreply@tarrinahealth.com>
+RESEND_DEFAULT_FROM=Tarrina Health <noreply@tarrinahealth.com>
+RESEND_WEBHOOK_SECRET=
+
+FRONTEND_PATH=../frontend
 ```
+
+> [!TIP]
+> Sanity-check the fully-interpolated result before launching:
+> `./manage.sh prod-config 2>&1 | grep -iE 'variable is not set|error'` should be silent.
+> (Equivalent: `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml config -q`.)
 
 ---
 
@@ -495,8 +538,8 @@ Zoho is strictly partitioned by geographical datacenter.
      ```
      https://dlp.tarrinahealth.com/api/zoho/auth/callback
      ```
-3. Rotate Client Secret immediately if the prior secret was ever placed in source control.
-4. Update `ZOHO_CLIENT_ID` and `ZOHO_CLIENT_SECRET` in `deployment/.env`.
+3. Rotate Client Secret immediately if the prior secret was ever placed in source control. **The secret carried in the repo's dev `.env` is compromised — rotate it.**
+4. Update `ZOHO_CLIENT_ID` and `ZOHO_CLIENT_SECRET` in `deployment/.env.prod`.
 
 ---
 
@@ -504,20 +547,27 @@ Zoho is strictly partitioned by geographical datacenter.
 
 ### Important Pre-flight Warnings
 > [!CAUTION]
-> 1. **Do NOT run `docker-compose.dev.yml` in production.** It publishes raw database ports (5432, 6379, etc.) to the host and disables authentication mechanisms.
-> 2. **Do NOT pass `--profile production`.** That profile starts `acmedns` which binds to port 53 and crashes against Ubuntu's resolver.
-> 3. **Database credentials are immutable after first launch.** Docker volumes (`postgres_data`, `redis_data`, `clickhouse_data`) initialize user passwords on initial container run. Changing passwords in `.env` afterwards will break service connections unless volumes are reset.
+> 1. **Always deploy with both compose files** (`./manage.sh prod`, which is `-f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod`). The base file alone has no `httpChallenge` resolver — HTTPS will silently never get a certificate.
+> 2. **Do NOT run `docker-compose.dev.yml` in production.** It publishes raw database ports (5432, 6379, etc.) to the host.
+> 3. **Do NOT pass `--profile production`** (i.e. leave `ACMEDNS_ENABLED` unset). That profile starts `acmedns` on port 53 and clashes with Ubuntu's `systemd-resolved`. It is only for DNS-01 wildcard certs.
+> 4. **Database credentials are immutable after first launch.** `postgres_data`, `redis_data`, `clickhouse_data` bake in the password on first run. Changing it in `.env.prod` later breaks connections unless you `down -v` those volumes.
 
 ### 9.1 Pre-flight Validation
-Check that Compose parses the base and production files without errors:
 ```bash
 cd ~/th-middleware/apps/core-platform/deployment
-docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
+# Parses base + prod with .env.prod; must be silent.
+./manage.sh prod-config -q
+./manage.sh prod-config | grep -iE 'variable is not set' || echo "env OK"
 ```
 
 ### 9.2 Launch the Production Stack
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+./manage.sh prod-build          # build backend / frontend / postgres images
+./manage.sh prod                # up -d with base + prod overrides + .env.prod
+
+# Equivalent raw command:
+#   docker compose --env-file .env.prod \
+#     -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
 
 ### 9.3 Wait for Core Data Infrastructure
@@ -533,8 +583,12 @@ echo "PostgreSQL is accepting connections."
 ### 9.4 Execute Database Migrations
 Run Alembic migrations inside the baked backend container:
 ```bash
-docker compose exec backend alembic upgrade head
+./manage.sh prod-migrate        # = docker compose --env-file .env.prod exec backend alembic upgrade head
 ```
+> [!NOTE]
+> If this fails with `ModuleNotFoundError: No module named 'app.modules.media'`,
+> your checkout predates the `.gitignore` fix that stopped `media/` from hiding
+> the `app/modules/media/` package — `git pull` and rebuild the backend image.
 
 ### 9.5 Register Debezium CDC Connector
 Debezium takes ~45 seconds to boot its embedded Kafka Connect REST API on port 8083. Wait for the API before registering:
@@ -585,14 +639,16 @@ curl -fsS https://auth.dlp.tarrinahealth.com/-/health/live/
 ### 10.2 Web Browser Verification & Initial Admin Setups
 
 1. **Frontend App:** Open `https://dlp.tarrinahealth.com/`
-2. **Authentik Admin Initialization:**
-   - Navigate to: `https://auth.dlp.tarrinahealth.com/if/flow/initial-setup/`
-   - Default administrative username is `akadmin`.
-   - Set a strong master administrative password.
+2. **Authentik Admin:**
+   - The `akadmin` user is already created from `AUTHENTIK_BOOTSTRAP_EMAIL` /
+     `AUTHENTIK_BOOTSTRAP_PASSWORD` in `.env.prod` — log in at
+     `https://auth.dlp.tarrinahealth.com/`.
+   - If those were left blank, run the setup flow instead:
+     `https://auth.dlp.tarrinahealth.com/if/flow/initial-setup/`.
 3. **Traefik Dashboard:**
-   - Navigate to: `https://traefik.dlp.tarrinahealth.com/dashboard/` *(Notice the trailing slash)*
-   - Login with your `admin` username and the basic-auth password configured in `middlewares.yml`.
-   - Verify green status on all routers and ACME TLS certificate status.
+   - Navigate to: `https://traefik.dlp.tarrinahealth.com/dashboard/` *(trailing slash required)*
+   - Login `admin` / the password recorded in `.env.prod` (hash in `config/traefik/dynamic-prod/middlewares.yml`).
+   - Verify green routers and a valid ACME certificate on each.
 4. **Celery Flower Dashboard:**
    - Navigate to: `https://dlp.tarrinahealth.com/flower`
    - Verify Celery worker `celery@core-platform-worker` is online with queues `default`, `integrations`, `documents`.
@@ -713,14 +769,16 @@ git pull origin main
 
 cd apps/core-platform/deployment
 
-# 1. Rebuild application images (Docker BuildKit caches unchanged layers)
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build backend celery-worker frontend
+# 1. Rebuild application images (BuildKit caches unchanged layers)
+./manage.sh prod-build backend
+./manage.sh prod-build frontend
 
-# 2. Rolling update of backend & frontend without terminating databases
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-deps backend celery-worker celery-beat frontend
+# 2. Rolling update of app services without terminating databases
+docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml \
+  up -d --no-deps backend celery-worker celery-beat search-indexer frontend
 
 # 3. Apply any newly added database migrations
-docker compose exec backend alembic upgrade head
+./manage.sh prod-migrate
 ```
 
 ### 12.2 Systemd Managed Auto-Restart on VM Reboot
@@ -737,15 +795,19 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/a2/th-middleware/apps/core-platform/deployment
-ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml stop
+# Adjust the path to the cloning user's home (e.g. /home/abraham_arsalan_...).
+WorkingDirectory=/home/<VM_USER>/th-middleware/apps/core-platform/deployment
+ExecStart=/usr/bin/docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d
+ExecStop=/usr/bin/docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml stop
 TimeoutStartSec=0
 TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target
 ```
+> [!NOTE]
+> `restart: unless-stopped` / `always` on the containers already survives daemon
+> restarts and `live-restore`. This unit only covers a full VM reboot.
 
 Enable the service:
 ```bash
@@ -761,14 +823,23 @@ sudo systemctl enable dlp-platform.service
 - **Cause:** FastAPI registered `system_router` only at `/health`, but Traefik only routes requests with `PathPrefix(/api)` to the backend container.
 - **Resolution:** In `backend/app/core/registrar.py`, `system_router` must be mounted at both `/` and `settings.API_PREFIX`. *(This has been fixed in the codebase).*
 
-### Issue 2: Let's Encrypt Certificate Pending or Untrusted Warning
-- **Cause 1:** Traefik dashboard router did not declare `traefik.http.routers.dashboard.tls.certresolver: letsencrypt`.
-- **Cause 2:** Port 80 is blocked by GCP firewall, preventing Let's Encrypt HTTP-01 challenge completion.
-- **Cause 3:** DNS A records do not match the public IP.
-- **Check ACME Logs:**
+### Issue 2: HTTPS broken / Let's Encrypt certificate never issued ("your connection is not private", self-signed `TRAEFIK DEFAULT CERT`)
+- **Cause 1 (most common):** the stack was started **without** `docker-compose.prod.yml`. The base `config/traefik/traefik.yml` only defines a `dnsChallenge` (acme-dns) resolver — with no acme-dns running, ACME never completes. The prod override mounts `config/traefik/traefik.prod.yml` (HTTP-01) over it. Fix: redeploy with `./manage.sh prod`.
+- **Cause 2:** you hand-edited `config/traefik/traefik.yml` or `config/traefik/dynamic/middlewares.yml` on the VM — production does not mount those. Edit `config/traefik/traefik.prod.yml` / `config/traefik/dynamic-prod/middlewares.yml` instead.
+- **Cause 3:** port 80 blocked at the GCP firewall — the HTTP-01 challenge needs it even though browsers are redirected to 443.
+- **Cause 4:** DNS A records for `dlp` / `auth.dlp` / `ws.dlp` / `traefik.dlp` don't all resolve to the VM's static IP. Traefik requests one cert per SAN; a missing record fails that host only.
+- **Cause 5:** hit the Let's Encrypt rate limit while debugging (5 failures/hostname/hour). Wait, or set `caServer: https://acme-staging-v02.api.letsencrypt.org/directory` in `traefik.prod.yml` temporarily.
+- **Verify the running config and ACME state:**
   ```bash
-  docker compose logs traefik | grep -i acme
+  docker exec traefik cat /etc/traefik/traefik.yml | grep -A3 Challenge   # must show httpChallenge
+  docker compose logs traefik | grep -iE 'acme|certificate|challenge'
+  docker exec traefik cat /letsencrypt/acme.json | jq '.letsencrypt.Certificates[].domain'
+  curl -I http://dlp.tarrinahealth.com/.well-known/acme-challenge/test     # 404 from traefik = reachable
   ```
+
+### Issue 2b: `WARN[0000] The "XXXX" variable is not set. Defaulting to a blank string.`
+- **Cause:** a value in `.env` / `.env.prod` contains a literal `$` that `docker compose` reads as a variable reference (e.g. `PASSWORD=ab$RJ8MlPJ&` → compose expands `$RJ8MlPJ`).
+- **Resolution:** single-quote the value (`PASSWORD='ab$RJ8MlPJ&'`) or double the dollar (`ab$$RJ8MlPJ&`). The generated hex secrets in §4.2 avoid this entirely.
 
 ### Issue 3: Debezium Connector Shows `FAILED` State
 - **Cause:** Debezium attempted snapshotting before Alembic created PostgreSQL mirror tables, or logical replication slot was interrupted.
@@ -785,4 +856,16 @@ sudo systemctl enable dlp-platform.service
   ```bash
   sudo dmesg -T | grep -i oom
   ```
-- **Resolution:** Verify the 8 GB swapfile is active with `free -h`. Adjust concurrency in `.env`: reduce `CELERY_CONCURRENCY=2` and `WORKERS=2` if necessary.
+- **Resolution:** Verify the 8 GB swapfile is active with `free -h`. Adjust concurrency in `.env.prod`: reduce `CELERY_CONCURRENCY=2` and `WORKERS=2` if necessary.
+
+### Issue 5: `dependency failed to start: container kafka is unhealthy` (but the broker logs say "Kafka Server started")
+- **Cause:** the healthcheck runs `kafka-broker-api-versions.sh`, a full JVM that inherits the broker's `KAFKA_HEAP_OPTS=-Xmx1G` — so each probe tries to start a second 1 GB-heap JVM inside the same cgroup and is OOM-killed. The broker itself is fine.
+- **Resolution:** already fixed in `docker-compose.yml` — the healthcheck command now prefixes `KAFKA_HEAP_OPTS='-Xmx128m -Xms64m'` and uses `timeout: 20s / retries: 12 / start_period: 90s`. If you see this on an old checkout, `git pull`. Confirm health with:
+  ```bash
+  docker inspect --format '{{.State.Health.Status}}' kafka
+  docker exec kafka bash -c "KAFKA_HEAP_OPTS='-Xmx128m' /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092" | head -1
+  ```
+
+### Issue 6: Frontend loads but every API call is CORS-blocked
+- **Cause:** `CORS_ORIGINS` in `.env.prod` doesn't exactly match the browser origin (scheme + host, no trailing slash), or is empty. It is a JSON array.
+- **Resolution:** `CORS_ORIGINS=["https://dlp.tarrinahealth.com"]`, then recreate the backend: `docker compose --env-file .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d backend`.

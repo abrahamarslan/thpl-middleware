@@ -15,7 +15,9 @@ node_modules/
 dist/
 
 # Generated
-media/
+# NOTE: anchored to the runtime upload dir only — a bare `media/` also matches
+# the `app/modules/media/` source package and silently drops it from commits.
+/apps/core-platform/backend/media/
 logs/
 *.log
 backups/*

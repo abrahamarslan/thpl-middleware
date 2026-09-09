@@ -1,0 +1,35 @@
+# ==============================================================================
+# Traefik dynamic configuration — middlewares (PRODUCTION)
+# ==============================================================================
+# Mounted at /etc/traefik/dynamic by docker-compose.prod.yml (replaces the dev
+# ../dynamic dir). Kept separate from dev so the dashboard/Flower password here
+# is a real secret, not the shared "changeme".
+#
+# Rotate the basic-auth hash:
+#   docker run --rm httpd:2.4-alpine htpasswd -nbB admin 'NEW_PASSWORD'
+# then paste the result below and `docker compose ... up -d traefik`.
+# ==============================================================================
+
+http:
+  middlewares:
+    security-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: same-origin
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        customResponseHeaders:
+          Server: ""
+          X-Powered-By: ""
+
+    gzip:
+      compress: {}
+
+    # Protects the Traefik dashboard AND Flower.
+    # Current password: see DASHBOARD_BASIC_AUTH_PASSWORD in .env.prod
+    dashboard-auth:
+      basicAuth:
+        users:
+          - "admin:$2y$05$YX.0rBMy9mJOuey6s/fiTOQ7BzoO2qFXwcAZW5NttMDLVR2h6z91u"

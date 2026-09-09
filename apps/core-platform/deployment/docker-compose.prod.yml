@@ -1,58 +1,119 @@
 # ==============================================================================
 # Production overrides
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#   docker compose --env-file .env.prod \
+#     -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
-# Enables ACME DNS-01 certificates via acme-dns and hardens restart policy.
+#   …or just:  ./manage.sh prod   (auto-loads .env.prod when present)
+# ==============================================================================
+# What this layer adds on top of docker-compose.yml:
+#   - Traefik: production static config (Let's Encrypt HTTP-01) + real
+#     dashboard/Flower basic-auth (config/traefik/dynamic-prod/).
+#   - Every public router gets tls.certresolver=letsencrypt.
+#   - restart: always on the long-running services.
+#   - Kafka UI is bound to VM loopback only (SSH-tunnel to reach it).
+#   - Authentik first-run admin is bootstrapped from .env.prod.
+#
+# Domain: everything is driven by APP_DOMAIN in .env.prod
+#   (dlp.tarrinahealth.com, auth.dlp.…, ws.dlp.…, traefik.dlp.…).
+#
 # Prerequisites:
-#   1. ./manage.sh register-acmedns  (once) — register with acme-dns
-#   2. CNAME _acme-challenge.<domain> -> <fulldomain from registration>
-#   3. Save registration JSON to ./config/traefik/acmedns/acmedns.json
+#   1. DNS A records for all four hosts -> this VM's public IP.
+#   2. Inbound 80 + 443 open to the internet (80 is required for the ACME
+#      HTTP-01 challenge even though browsers are redirected to 443).
+#   3. cp .env.example .env.prod  and fill it in  (see that file's header).
 # ==============================================================================
 
 services:
 
+  # --- Reverse proxy: production TLS + hardened dashboard auth ----------------
   traefik:
-    labels:
-      traefik.http.routers.dashboard.tls.certresolver: letsencrypt
+    restart: always
+    environment:
+      TZ: ${TZ:-UTC}
+      DOCKER_API_VERSION: "1.45"
+      DOCKER_HOST: "unix:///var/run/docker.sock"
+      # Wins over the email baked into traefik.prod.yml.
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL: ${ACME_EMAIL:-tech@tarrinahealth.com}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./config/traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./config/traefik/traefik.prod.yml:/etc/traefik/traefik.yml:ro
+      - ./config/traefik/dynamic-prod:/etc/traefik/dynamic:ro
       - traefik_certs:/letsencrypt
+    labels:
+      traefik.http.routers.dashboard.tls.certresolver: letsencrypt
 
-  # Use the Let's Encrypt resolver instead of mkcert file certs
+  # --- Application ----------------------------------------------------------
   backend:
+    restart: always
     labels:
       traefik.http.routers.api.tls.certresolver: letsencrypt
+
+  celery-worker:
+    restart: always
+
+  celery-beat:
+    restart: always
+
+  search-indexer:
     restart: always
 
   frontend:
+    restart: always
     labels:
       traefik.http.routers.frontend.tls.certresolver: letsencrypt
-    restart: always
-
-  soketi:
-    labels:
-      traefik.http.routers.soketi.tls.certresolver: letsencrypt
-
-  authentik-server:
-    labels:
-      traefik.http.routers.authentik.tls.certresolver: letsencrypt
-
-  grafana:
-    labels:
-      traefik.http.routers.grafana.tls.certresolver: letsencrypt
 
   flower:
+    restart: always
     labels:
       traefik.http.routers.flower.tls.certresolver: letsencrypt
 
-  # Kafka UI — bound to VM loopback only. Access via SSH port-forwarding:
-  # gcloud compute ssh dlp-prod --zone=<ZONE> --tunnel-through-iap -- -L 8088:localhost:8088
+  soketi:
+    restart: always
+    labels:
+      traefik.http.routers.soketi.tls.certresolver: letsencrypt
+
+  # --- IAM: bootstrap the first admin (akadmin) from the environment --------
+  authentik-server:
+    restart: always
+    environment:
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@tarrinahealth.com}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+    labels:
+      traefik.http.routers.authentik.tls.certresolver: letsencrypt
+
+  authentik-worker:
+    restart: always
+    environment:
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@tarrinahealth.com}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+
+  # --- Observability -------------------------------------------------------
+  grafana:
+    restart: always
+    labels:
+      traefik.http.routers.grafana.tls.certresolver: letsencrypt
+
+  # --- Event streaming ---------------------------------------------------
+  kafka:
+    restart: always
+    # A little more headroom than the dev default for a real broker + page cache.
+    deploy:
+      resources:
+        limits: { memory: 3G, cpus: "2.00" }
+
+  # Kafka UI — VM loopback only. Reach it with an SSH tunnel:
+  #   gcloud compute ssh dlp-prod --tunnel-through-iap -- -L 8088:localhost:8088
   kafbat-ui:
+    restart: always
     ports:
       - "127.0.0.1:8088:8080"
+
+  debezium:
     restart: always
 
-# NOTE: acme-dns is behind the "production" profile in the base file.
-# If using HTTP-01 challenge, do NOT pass --profile production.
+# NOTE: acme-dns (DNS-01) is only needed for wildcard certs and lives behind the
+# "production" profile in the base file. HTTP-01 (the default here) does not use
+# it. To switch: uncomment dnsChallenge in traefik.prod.yml and run the stack
+# with ACMEDNS_ENABLED=true so manage.sh adds `--profile production`.

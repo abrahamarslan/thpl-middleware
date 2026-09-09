@@ -11,6 +11,7 @@ set -euo pipefail
 COMPOSE_FILE="docker-compose.yml"
 DEV_COMPOSE_FILE="docker-compose.dev.yml"
 PROD_COMPOSE_FILE="docker-compose.prod.yml"
+PROD_ENV_FILE=".env.prod"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -32,11 +33,14 @@ BASE
   logs [service]     Tail logs (all or specific service)
   build [service]    Rebuild image(s)
 
-PRODUCTION  (ACME TLS via acme-dns CNAME delegation)
+PRODUCTION  (Let's Encrypt HTTP-01; reads .env.prod)
   prod               docker compose up with production overrides
   prod-stop          Stop production services
   prod-logs          Tail production logs
-  register-acmedns   Register a domain with the acme-dns server
+  prod-migrate       alembic upgrade head (production env)
+  prod-build [svc]   Build image(s) with the production env
+  prod-config        Render the fully-interpolated production compose config
+  register-acmedns   Register a domain with the acme-dns server (DNS-01 only)
 
 DEVELOPMENT  (adds pgAdmin, Redis Commander, MailHog, Vite HMR)
   dev                docker compose up with dev overrides
@@ -107,12 +111,19 @@ dev_compose() {
 }
 
 prod_compose() {
+    # Interpolate from .env.prod (not the dev .env) when it exists.
+    local env_args=()
+    if [ -f "$PROD_ENV_FILE" ]; then
+        env_args=(--env-file "$PROD_ENV_FILE")
+    else
+        echo -e "${YELLOW}Warning: $PROD_ENV_FILE not found — using .env. Copy .env.example -> .env.prod.${NC}" >&2
+    fi
     # Only activate the 'production' profile if acme-dns is explicitly requested.
     # HTTP-01 challenges (default) do not require the acmedns container on port 53.
     if [ "${ACMEDNS_ENABLED:-false}" = "true" ]; then
-        docker compose -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" --profile production "$@"
+        docker compose "${env_args[@]}" -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" --profile production "$@"
     else
-        docker compose -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" "$@"
+        docker compose "${env_args[@]}" -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" "$@"
     fi
 }
 
@@ -164,6 +175,17 @@ case "$COMMAND" in
         ;;
     prod-logs)
         prod_compose logs -f --tail=100
+        ;;
+    prod-migrate)
+        echo -e "${CYAN}Running alembic upgrade head (production)...${NC}"
+        prod_compose exec backend alembic upgrade head
+        ;;
+    prod-build)
+        prod_compose build "${ARG1:+$ARG1}"
+        ;;
+    prod-config)
+        # Render the fully-interpolated production config (preflight check).
+        prod_compose config "${@:2}"
         ;;
 
     # -- acme-dns registration ---------------------------------------------------

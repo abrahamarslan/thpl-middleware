@@ -1,0 +1,74 @@
+# ==============================================================================
+# Traefik static configuration — PRODUCTION
+# ==============================================================================
+# Mounted over /etc/traefik/traefik.yml by docker-compose.prod.yml.
+#
+# TLS: Let's Encrypt via the HTTP-01 challenge (no acme-dns, no DNS API creds).
+# Requirements:
+#   - A/AAAA records for every routed host point at this VM's public IP:
+#       dlp.tarrinahealth.com
+#       auth.dlp.tarrinahealth.com
+#       ws.dlp.tarrinahealth.com
+#       traefik.dlp.tarrinahealth.com
+#   - Inbound 80 AND 443 open to the internet (80 is needed for the challenge
+#     even though it immediately redirects browsers to 443 — Traefik serves the
+#     /.well-known/acme-challenge/ path before the redirect).
+#
+# To use DNS-01 via acme-dns instead (needed only for wildcard certs), swap the
+# httpChallenge block below for the dnsChallenge block and start the stack with
+# ACMEDNS_ENABLED=true so manage.sh adds `--profile production`.
+# ==============================================================================
+
+api:
+  dashboard: true
+
+ping: {}
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+  metrics:
+    address: ":8082"
+
+providers:
+  docker:
+    exposedByDefault: false
+    network: app-frontend
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+log:
+  level: INFO
+  format: json          # stdout -> Alloy -> Loki
+
+accessLog:
+  format: json          # stdout -> Alloy -> Loki
+  fields:
+    headers:
+      names:
+        X-Request-Id: keep
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      # Overridable at runtime via TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL
+      # (docker-compose.prod.yml wires ${ACME_EMAIL} to it).
+      email: tech@tarrinahealth.com
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+      # --- DNS-01 alternative (wildcard certs); requires the acmedns service ---
+      # dnsChallenge:
+      #   provider: acme-dns
