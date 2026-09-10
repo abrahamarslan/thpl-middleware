@@ -21,6 +21,8 @@
 x-backend-env: &backend-env
   ENVIRONMENT: ${ENVIRONMENT:-production}
   DEBUG: ${DEBUG:-false}
+  # Swagger UI at ${API_PREFIX}/docs — off in production unless set true.
+  DOCS_ENABLED: ${DOCS_ENABLED:-false}
   # Logging: the ENVIRONMENT above selects config/logging/environments/<env>.yaml,
   # which drives level/format. These are OPTIONAL ops overrides — leave empty to
   # let the YAML profile decide; set them to force a value across the stack.

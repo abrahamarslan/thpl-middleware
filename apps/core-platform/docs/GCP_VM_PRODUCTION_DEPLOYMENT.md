@@ -114,7 +114,7 @@ traefik.dlp.tarrinahealth.com. 300  IN  A  <VM_STATIC_IP>
 | `/etc/traefik/dynamic/` | `config/traefik/dynamic/` (shared "changeme" basic-auth) | **`config/traefik/dynamic-prod/`** — real basic-auth hash |
 | ACME email | — | `${ACME_EMAIL}` from `.env`, injected as `TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL` |
 
-Every public router already carries `tls.certresolver=letsencrypt` in the prod override (api, frontend, flower, grafana, soketi, authentik, dashboard). ACME state persists in the `traefik_certs` named volume (`/letsencrypt/acme.json`).
+Every public router carries `tls.certresolver=letsencrypt` in the prod override (api, apidocs, frontend, flower, grafana, soketi, authentik, dashboard → 8). ACME state persists in the `traefik_certs` named volume (`/letsencrypt/acme.json`).
 
 The production override is pulled in **automatically**: `.env.prod.example` (which
 you copy to `.env`) sets `COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml`,
@@ -556,6 +556,9 @@ A healthy result: `acme.json` lists all four hostnames, and
 # 1. Verify Backend API Probe via Traefik HTTPS
 curl -fsS https://dlp.tarrinahealth.com/api/health
 # Output: {"status":"ok","service":"core-platform","version":"0.1.0"}
+# If this returns the SPA's index.html instead, the BACKEND container is
+# down/unhealthy — Traefik dropped its router and /api/* falls through to the
+# frontend catch-all. Check: docker compose ps ; docker compose logs backend
 
 # 2. Verify Backend Deep Readiness Probe (PostgreSQL & Redis check)
 curl -fsS https://dlp.tarrinahealth.com/api/ready
@@ -564,9 +567,11 @@ curl -fsS https://dlp.tarrinahealth.com/api/ready
 # 3. Verify Frontend Static SPA Serving
 curl -sI https://dlp.tarrinahealth.com/ | grep -E 'HTTP|content-type'
 
-# 4. Verify /api/docs is disabled (404 expected in production)
+# 4. /api/docs — 404 by default in production (DOCS_ENABLED unset).
+#    Set DOCS_ENABLED=true in .env to expose Swagger UI; it is then served
+#    behind HTTP basic-auth (dashboard-auth creds). 401 without creds:
 curl -s -o /dev/null -w "%{http_code}\n" https://dlp.tarrinahealth.com/api/docs
-# Output: 404
+# Output: 404 (docs off)  |  401 (docs on, no creds)  |  200 (docs on, -u admin:<pw>)
 
 # 5. Verify Soketi WebSocket endpoint
 curl -sI https://ws.dlp.tarrinahealth.com/ | head -n 1
@@ -762,6 +767,34 @@ sudo systemctl enable dlp-platform.service
 ### Issue 1: `curl: (22) The requested URL returned error: 404` on `/api/health`
 - **Cause:** FastAPI registered `system_router` only at `/health`, but Traefik only routes requests with `PathPrefix(/api)` to the backend container.
 - **Resolution:** In `backend/app/core/registrar.py`, `system_router` must be mounted at both `/` and `settings.API_PREFIX`. *(This has been fixed in the codebase).*
+
+### Issue 1b: The frontend loads but says "backend unreachable"; `/api/health`, `/api/docs` etc. all return the SPA `index.html`
+- **Cause:** the `backend` container is not running or not healthy, so Traefik removes `Host(...) && PathPrefix(/api)` and every `/api/*` request falls through to the frontend catch-all router.
+- **Diagnose:**
+  ```bash
+  docker compose ps                       # backend "Up"? "Restarting"? "Exited"?
+  docker compose logs --tail=80 backend
+  ```
+- **Common root causes:**
+  - Image not rebuilt after a `git pull` — e.g. `ModuleNotFoundError: No module named 'app.modules.media'`. Fix: `docker compose build backend celery-worker && docker compose up -d backend celery-worker`.
+  - Migrations never ran → `relation "..." does not exist`. Fix: `docker compose exec backend alembic upgrade head`.
+  - `DATABASE_URL` / `REDIS_URL` wrong — check the values in `docker compose config`.
+
+### Issue 1c: `/api/docs` returns 404 (or 401) in production
+- **404** is the default — the schema exposes the whole API surface, so it is off unless `DOCS_ENABLED=true`.
+- To turn it on: set `DOCS_ENABLED=true` in `.env`, then `docker compose up -d backend`.
+- It is then served **behind HTTP basic-auth** (the `dashboard-auth` credentials from `config/traefik/dynamic-prod/middlewares.yml`). A bare browser hit prompts for username/password; `401` without them is expected.
+- Turn it back off (`DOCS_ENABLED=false`, `up -d backend`) when you're done.
+
+### Issue 1d: The apex cert is valid but `auth.dlp` / `ws.dlp` / `traefik.dlp` serve a self-signed cert
+- **Cause:** those containers (`authentik-server`, `soketi`, `traefik`) were created during an earlier base-only run and their routers have no `tls.certresolver` label; only containers recreated under the prod override got it.
+- **Resolution:** recreate everything under the prod override:
+  ```bash
+  docker compose config | grep -c certresolver     # expect >= 7 (>= 8 with apidocs)
+  docker compose up -d --force-recreate
+  docker compose logs -f traefik | grep -iE 'acme|certificate|obtain'
+  ```
+  Certs for each host are then requested on the first HTTPS hit (`./manage.sh prod-ssl` lists what `acme.json` holds).
 
 ### Issue 2: HTTPS broken / Let's Encrypt certificate never issued ("your connection is not private", self-signed `TRAEFIK DEFAULT CERT`)
 Run `./manage.sh prod-ssl` first — it checks every cause below at once.

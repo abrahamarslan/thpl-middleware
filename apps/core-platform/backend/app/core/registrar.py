@@ -57,14 +57,18 @@ async def lifespan(app: FastAPI):
 def register_app() -> FastAPI:
     configure_logging()
 
+    # Swagger UI + OpenAPI schema: on outside production, or wherever
+    # DOCS_ENABLED is explicitly set (protect the route — see
+    # docker-compose.prod.yml — and turn it back off when done).
+    docs_enabled = settings.ENVIRONMENT != "production" or settings.DOCS_ENABLED
+
     app = FastAPI(
         title=settings.APP_NAME,
         version=settings.VERSION,
         default_response_class=ORJSONResponse,
-        # API docs disabled outside development — schema is internal IP
-        docs_url=f"{settings.API_PREFIX}/docs" if settings.ENVIRONMENT != "production" else None,
+        docs_url=f"{settings.API_PREFIX}/docs" if docs_enabled else None,
         redoc_url=None,
-        openapi_url=f"{settings.API_PREFIX}/openapi.json" if settings.ENVIRONMENT != "production" else None,
+        openapi_url=f"{settings.API_PREFIX}/openapi.json" if docs_enabled else None,
         lifespan=lifespan,
     )
 

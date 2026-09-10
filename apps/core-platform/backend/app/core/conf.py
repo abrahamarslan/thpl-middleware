@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"  # development | staging | production
     DEBUG: bool = False
     API_PREFIX: str = "/api"
+    # Swagger UI / OpenAPI schema. Always on outside production; in production it
+    # is off unless this is set true (the schema exposes the whole API surface —
+    # keep the route behind auth and disable it again afterwards).
+    DOCS_ENABLED: bool = False
 
     # --- Logging (see app/core/logging/ + config/logging/*.yaml) ---
     # Directory holding logging.yaml + environments/ + modules/ (relative to

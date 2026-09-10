@@ -47,6 +47,16 @@ services:
     restart: always
     labels:
       traefik.http.routers.api.tls.certresolver: letsencrypt
+      # Swagger UI / OpenAPI schema — served by the backend only when
+      # DOCS_ENABLED=true, and always kept behind HTTP basic-auth here
+      # (same credentials as the Traefik dashboard / Flower).
+      traefik.http.routers.apidocs.rule: "Host(`${APP_DOMAIN}`) && (PathPrefix(`${API_PREFIX:-/api}/docs`) || Path(`${API_PREFIX:-/api}/openapi.json`))"
+      traefik.http.routers.apidocs.priority: "20"
+      traefik.http.routers.apidocs.entrypoints: websecure
+      traefik.http.routers.apidocs.tls: "true"
+      traefik.http.routers.apidocs.tls.certresolver: letsencrypt
+      traefik.http.routers.apidocs.service: api
+      traefik.http.routers.apidocs.middlewares: dashboard-auth@file,security-headers@file,gzip@file
 
   celery-worker:
     restart: always
