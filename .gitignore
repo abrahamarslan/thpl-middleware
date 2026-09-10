@@ -28,3 +28,5 @@ backups/*
 Thumbs.db
 .vscode/
 .idea/
+.env
+.env.prod

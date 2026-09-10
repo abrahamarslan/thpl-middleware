@@ -776,9 +776,10 @@ sudo systemctl enable dlp-platform.service
   docker compose logs --tail=80 backend
   ```
 - **Common root causes:**
-  - Image not rebuilt after a `git pull` — e.g. `ModuleNotFoundError: No module named 'app.modules.media'`. Fix: `docker compose build backend celery-worker && docker compose up -d backend celery-worker`.
+  - Image not rebuilt after a `git pull` — e.g. `ModuleNotFoundError: No module named 'app.modules.media'`, or `NameError: name 'settings' is not defined` in `app/middleware/context.py` (fixed after Sept 2026 — every request 500s, healthcheck fails, container shows `(unhealthy)`). Fix: `git pull && docker compose build backend celery-worker && docker compose up -d`.
   - Migrations never ran → `relation "..." does not exist`. Fix: `docker compose exec backend alembic upgrade head`.
   - `DATABASE_URL` / `REDIS_URL` wrong — check the values in `docker compose config`.
+- Note: `docker compose exec backend ...` succeeding proves only that the *container* is up, not that uvicorn is serving. Check `docker compose ps` for `(unhealthy)` and `curl -s localhost` from inside: `docker compose exec backend curl -s localhost:8000/health`.
 
 ### Issue 1c: `/api/docs` returns 404 (or 401) in production
 - **404** is the default — the schema exposes the whole API surface, so it is off unless `DOCS_ENABLED=true`.
