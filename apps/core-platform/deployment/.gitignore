@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.prod.example
 
 # TLS certificates (mkcert dev certs)
 config/traefik/certs/*

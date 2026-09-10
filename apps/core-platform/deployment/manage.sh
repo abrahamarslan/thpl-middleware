@@ -8,9 +8,11 @@
 
 set -euo pipefail
 
-COMPOSE_FILE="docker-compose.yml"
-DEV_COMPOSE_FILE="docker-compose.dev.yml"
-PROD_COMPOSE_FILE="docker-compose.prod.yml"
+# Internal names — deliberately NOT "COMPOSE_FILE", which is Compose's own env
+# var and may be set inside .env (some subcommands `source` .env).
+BASE_COMPOSE="docker-compose.yml"
+DEV_COMPOSE="docker-compose.dev.yml"
+PROD_COMPOSE="docker-compose.prod.yml"
 PROD_ENV_FILE=".env.prod"
 
 RED='\033[0;31m'
@@ -33,13 +35,14 @@ BASE
   logs [service]     Tail logs (all or specific service)
   build [service]    Rebuild image(s)
 
-PRODUCTION  (Let's Encrypt HTTP-01; reads .env.prod)
-  prod               docker compose up with production overrides
+PRODUCTION  (base + docker-compose.prod.yml; Let's Encrypt HTTP-01)
+  prod               Build + up -d with the production overrides
   prod-stop          Stop production services
-  prod-logs          Tail production logs
+  prod-logs [svc]    Tail production logs
   prod-migrate       alembic upgrade head (production env)
-  prod-build [svc]   Build image(s) with the production env
-  prod-config        Render the fully-interpolated production compose config
+  prod-build [svc]   Build image(s) with the production overrides
+  prod-config [svc]  Render the fully-interpolated production compose config
+  prod-ssl           Diagnose Let's Encrypt / TLS (DNS, :80, acme.json, live cert)
   register-acmedns   Register a domain with the acme-dns server (DNS-01 only)
 
 DEVELOPMENT  (adds pgAdmin, Redis Commander, MailHog, Vite HMR)
@@ -107,24 +110,30 @@ compose() {
 }
 
 dev_compose() {
-    docker compose -f "$COMPOSE_FILE" -f "$DEV_COMPOSE_FILE" "$@"
+    docker compose -f "$BASE_COMPOSE" -f "$DEV_COMPOSE" "$@"
 }
 
 prod_compose() {
-    # Interpolate from .env.prod (not the dev .env) when it exists.
+    # Production ALWAYS layers base + prod overrides. The prod override is what
+    # supplies the Let's Encrypt HTTP-01 resolver and the tls.certresolver
+    # labels — deploy without it and Traefik only serves a self-signed cert
+    # ("your connection is not private" / "site does not support HTTPS").
+    #
+    # Env file: prefer .env.prod, else the default .env. (On the VM the simplest
+    # setup is to name the prod env file `.env` — then bare `docker compose`
+    # commands also pick up COMPOSE_FILE and work without any -f flags.)
     local env_args=()
     if [ -f "$PROD_ENV_FILE" ]; then
         env_args=(--env-file "$PROD_ENV_FILE")
-    else
-        echo -e "${YELLOW}Warning: $PROD_ENV_FILE not found — using .env. Copy .env.example -> .env.prod.${NC}" >&2
+    elif [ ! -f ".env" ]; then
+        echo -e "${RED}No $PROD_ENV_FILE and no .env found. Run: cp .env.prod.example .env && nano .env${NC}" >&2
+        exit 1
     fi
-    # Only activate the 'production' profile if acme-dns is explicitly requested.
-    # HTTP-01 challenges (default) do not require the acmedns container on port 53.
-    if [ "${ACMEDNS_ENABLED:-false}" = "true" ]; then
-        docker compose "${env_args[@]}" -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" --profile production "$@"
-    else
-        docker compose "${env_args[@]}" -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" "$@"
-    fi
+    # Only activate the 'production' profile if acme-dns (DNS-01) is explicitly
+    # requested. HTTP-01 (the default) does not need the acmedns container.
+    local profile_args=()
+    [ "${ACMEDNS_ENABLED:-false}" = "true" ] && profile_args=(--profile production)
+    docker compose "${env_args[@]}" -f "$BASE_COMPOSE" -f "$PROD_COMPOSE" "${profile_args[@]}" "$@"
 }
 
 COMMAND="${1:-help}"
@@ -168,24 +177,63 @@ case "$COMMAND" in
 
     # -- Production (ACME) --------------------------------------------------------
     prod)
-        prod_compose up -d
+        prod_compose up -d --build --remove-orphans
+        echo ""
+        echo -e "${CYAN}Stack is up. TLS certificates are issued automatically by"
+        echo -e "Traefik on the first HTTPS request to each host — no manual step."
+        echo -e "Check progress:${NC}  ./manage.sh prod-ssl"
         ;;
     prod-stop)
         prod_compose stop
         ;;
     prod-logs)
-        prod_compose logs -f --tail=100
+        if [ -n "$ARG1" ]; then
+            prod_compose logs -f --tail=100 "$ARG1"
+        else
+            prod_compose logs -f --tail=100
+        fi
         ;;
     prod-migrate)
         echo -e "${CYAN}Running alembic upgrade head (production)...${NC}"
         prod_compose exec backend alembic upgrade head
         ;;
     prod-build)
-        prod_compose build "${ARG1:+$ARG1}"
+        if [ -n "$ARG1" ]; then
+            prod_compose build "$ARG1"
+        else
+            prod_compose build
+        fi
         ;;
     prod-config)
         # Render the fully-interpolated production config (preflight check).
-        prod_compose config "${@:2}"
+        if [ -n "$ARG1" ]; then prod_compose config "$ARG1"; else prod_compose config; fi
+        ;;
+    prod-ssl)
+        # Diagnose Let's Encrypt / TLS state for the production domain.
+        set +e +o pipefail   # diagnostic: never abort on a failing probe
+        ENVF=".env.prod"; [ -f "$ENVF" ] || ENVF=".env"
+        DOMAIN="$(grep -E '^APP_DOMAIN=' "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'\'' ')"
+        [ -n "$DOMAIN" ] || { echo -e "${RED}APP_DOMAIN not found in $ENVF${NC}"; exit 1; }
+        echo -e "${CYAN}Domain: $DOMAIN  (from $ENVF)${NC}"
+        echo -e "${CYAN}== DNS ==${NC}"
+        for h in "$DOMAIN" "auth.$DOMAIN" "ws.$DOMAIN" "traefik.$DOMAIN"; do
+            ip="$(getent hosts "$h" 2>/dev/null | awk '{print $1}' | head -1)"
+            printf '  %-34s %b\n' "$h" "${ip:-${RED}UNRESOLVED${NC}}"
+        done
+        echo -e "${CYAN}== Port 80 ACME challenge path (want HTTP 404 from Traefik) ==${NC}"
+        curl -s -o /dev/null -m 5 -w '  HTTP %{http_code} from %{remote_ip}\n' \
+            "http://$DOMAIN/.well-known/acme-challenge/probe" || echo "  unreachable on :80"
+        echo -e "${CYAN}== Issued certificates (acme.json) ==${NC}"
+        docker exec traefik cat /letsencrypt/acme.json 2>/dev/null \
+            | jq -r '.letsencrypt.Certificates[]? | "  " + (.domain.main) + (if .domain.sans then " " + (.domain.sans|join(",")) else "" end)' 2>/dev/null \
+            || echo "  none yet (or traefik not running / jq missing)"
+        echo -e "${CYAN}== Live certificate on :443 ==${NC}"
+        echo | openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" 2>/dev/null \
+            | openssl x509 -noout -issuer -subject -dates 2>/dev/null | sed 's/^/  /' \
+            || echo "  handshake failed"
+        echo -e "${CYAN}== Recent Traefik ACME log lines ==${NC}"
+        prod_compose logs --tail=200 traefik 2>/dev/null \
+            | grep -iE 'acme|certificate|challenge|unable|error' | tail -20 | sed 's/^/  /' || true
         ;;
 
     # -- acme-dns registration ---------------------------------------------------
