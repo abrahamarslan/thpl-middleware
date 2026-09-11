@@ -262,6 +262,12 @@ until docker exec debezium curl -sf http://localhost:8083/connectors >/dev/null 
 > exists, `snapshot.mode=initial` does **not** re-snapshot existing tables; it
 > just starts streaming the two newly-added tables. If you *want* a fresh
 > snapshot, delete and recreate the connector — but that is not required.
+>
+> The registration script now **waits up to 150 s** for the Connect REST API and
+> prints the Debezium logs if it never comes up, so it no longer returns
+> silently when the container is still booting. If it reports the API is
+> unreachable, check `docker compose ps debezium` / `docker compose logs
+> debezium` and re-run once it is `healthy`.
 
 Verify the new topics exist (via the loopback-bound Kafbat UI tunnel or):
 
@@ -308,7 +314,7 @@ docker compose logs --tail=50 celery-worker | grep -E 'email_sent|email_queued|e
 Request a reset from a real network and inspect the queued email row / logs:
 
 ```bash
-docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select source_ip, actor_id, request_id, template_name from emails order by id desc limit 5;"'
+docker compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select source_ip, actor_id, request_id, template_name from emails order by id desc limit 5;"'
 ```
 
 The staff-facing security email also shows city/country once GeoIP is loaded.
@@ -330,7 +336,7 @@ curl -fsS https://dlp.tarrinahealth.com/api/users/1/moderation -H "Authorization
 ### 8.5 Audit trail is being written
 
 ```bash
-docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select created_at, action, status, actor_id, subject_id, ip_address from activity_logs order by id desc limit 25;"'
+docker compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select created_at, action, status, actor_id, subject_id, ip_address from activity_logs order by id desc limit 25;"'
 ```
 
 Register / log in / log out / reset / throttle a test user and confirm the
@@ -451,7 +457,7 @@ class of error).
    `{"identifier":"you@x.com","password":"…"}`.
 2. **Account lookup:** confirm the row exists and by which identifier:
    ```bash
-   docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select id,email,username,phone,is_deactivated,deleted_at,length(password) as hash_len,left(password,4) as hash_prefix from users order by id desc limit 10;"'
+   docker compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select id,email,username,phone,is_deactivated,deleted_at,length(password) as hash_len,left(password,4) as hash_prefix from users order by id desc limit 10;"'
    ```
    - No row → the account was never created (or under a different email).
    - `hash_prefix` not `$2a$`/`$2b$`/`$2y$` → the stored value is not a bcrypt
@@ -471,17 +477,19 @@ Check, in order:
    (§12.2).
 2. **Was an `emails` row created, and what is its status?**
    ```bash
-   docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select id,status,error_message,provider_message_id,created_at,sent_at from emails order by id desc limit 5;"'
+   docker compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select id,status,error_message,provider_message_id,created_at,sent_at from emails order by id desc limit 5;"'
    ```
    - `pending` forever → the Celery worker never picked it up.
    - `failed` → read `error_message` (usually Resend rejected the request).
-3. **Worker has the Resend env and the new image.**
+3. **Worker has a *real* Resend key and the new image.**
    ```bash
    docker compose exec celery-worker printenv | grep -E 'RESEND_API_KEY|EMAIL_ENABLED|EMAIL_LOG_ONLY'
    docker compose logs --tail=100 celery-worker | grep -E 'email_|resend'
    ```
-   A blank `RESEND_API_KEY` in the worker means the container was not recreated
-   after you edited `.env`: `docker compose up -d --no-deps celery-worker`.
+   A blank key, or the placeholder `RESEND_API_KEY=re_xxxxxxxxxxxxxxxxxxxxxxxx`
+   copied from a template, makes **every** send fail with HTTP 401. It must be a
+   real key from the Resend dashboard (`re_…`). The worker won't pick up an edited
+   `.env` until it is recreated: `docker compose up -d --no-deps celery-worker`.
    (The backend now also logs `email_provider_misconfigured` when the key is
    empty.)
 4. **Resend side:** the API key is valid and the sending domain is **verified**,
@@ -490,6 +498,13 @@ Check, in order:
 5. **Fastest sanity check:** set `EMAIL_LOG_ONLY=true` and re-request — the row
    should flip to `sent` (marked logged, not delivered), proving the pipeline
    works and isolating the problem to Resend credentials.
+
+> **psql auth gotcha:** the `postgres` container authenticates the Unix socket
+> with **peer** auth and the `docker exec` OS user is `root`, so a bare
+> `psql -U app` fails with `Peer authentication failed`. Always connect over TCP
+> with the container's password, as above (`-h 127.0.0.1` +
+> `PGPASSWORD="$POSTGRES_PASS"`). `./manage.sh shell-postgres` and
+> `db-backup`/`db-restore` already do this after this release.
 
 ### 12.4 `manage.sh` fails with `.env: line N: syntax error` / `command not found`
 `manage.sh` (and `register-debezium`, `db-backup`, `prod-ssl`, …) **source**

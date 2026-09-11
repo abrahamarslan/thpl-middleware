@@ -36,6 +36,24 @@ fi
 
 : "${POSTGRES_USER:?POSTGRES_USER not set}" "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD not set}" "${POSTGRES_DB:?POSTGRES_DB not set}"
 
+# Kafka Connect takes ~45-90s to expose its REST API after boot. Wait for it
+# instead of aborting silently under `set -e` when the PUT fails.
+echo "Waiting for the Debezium REST API on :8083 ..."
+api_up=0
+for _ in $(seq 1 30); do
+    if docker exec debezium curl -sf http://localhost:8083/connectors >/dev/null 2>&1; then
+        api_up=1
+        break
+    fi
+    sleep 5
+done
+if [ "$api_up" -ne 1 ]; then
+    echo "ERROR: Debezium REST API not reachable on :8083 after 150s." >&2
+    echo "Last Debezium log lines:" >&2
+    docker compose logs --tail=30 debezium >&2 || true
+    exit 1
+fi
+
 # Substitute ${POSTGRES_*} placeholders in the template
 PAYLOAD=$(sed \
     -e "s|\${POSTGRES_USER}|$POSTGRES_USER|g" \
@@ -44,17 +62,26 @@ PAYLOAD=$(sed \
     "$CONFIG_FILE")
 
 echo "Registering connector '$NAME'..."
+set +e
 HTTP_CODE=$(echo "$PAYLOAD" | docker exec -i debezium curl -s -o /tmp/dbz-resp.json -w "%{http_code}" \
     -X PUT "http://localhost:8083/connectors/$NAME/config" \
     -H "Content-Type: application/json" \
     -d @-)
+CURL_RC=$?
+set -e
 
-docker exec debezium cat /tmp/dbz-resp.json | python3 -m json.tool 2>/dev/null || true
+docker exec debezium cat /tmp/dbz-resp.json 2>/dev/null | python3 -m json.tool 2>/dev/null \
+    || docker exec debezium cat /tmp/dbz-resp.json 2>/dev/null \
+    || true
 echo ""
 
+if [ "$CURL_RC" -ne 0 ]; then
+    echo "ERROR: curl to Debezium failed (rc=$CURL_RC)" >&2
+    exit 1
+fi
 if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
     echo "Connector '$NAME' registered (HTTP $HTTP_CODE)."
-    echo "Check status: docker exec debezium curl -s http://localhost:8083/connectors/$NAME/status"
+    echo "Check status: ./manage.sh debezium-status"
 else
     echo "ERROR: registration failed (HTTP $HTTP_CODE)" >&2
     exit 1

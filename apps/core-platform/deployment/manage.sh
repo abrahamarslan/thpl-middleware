@@ -323,9 +323,10 @@ case "$COMMAND" in
         compose exec frontend sh
         ;;
     shell-postgres)
-        # shellcheck disable=SC1091
-        [ -f .env ] && set -a && . .env && set +a
-        compose exec postgres psql -U "${POSTGRES_USER:-app}" -d "${POSTGRES_DB:-app_db}"
+        # Local socket uses peer auth (OS root != db user) -> connect over TCP
+        # with the password the container already holds. Do NOT source .env
+        # (a dirty .env would break this).
+        compose exec postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME"'
         ;;
 
     # -- Alembic ------------------------------------------------------------------
@@ -354,12 +355,10 @@ case "$COMMAND" in
         bash "$SCRIPT_DIR/scripts/reset-db.sh" ${ARG1:+"$ARG1"}
         ;;
     db-backup)
-        # shellcheck disable=SC1091
-        [ -f .env ] && set -a && . .env && set +a
         BACKUP_FILE="backups/backup_$(date +%Y-%m-%d_%H-%M-%S).sql"
         mkdir -p backups
         echo -e "${CYAN}Creating backup: $BACKUP_FILE${NC}"
-        compose exec -T postgres pg_dump -U "${POSTGRES_USER:-app}" "${POSTGRES_DB:-app_db}" > "$BACKUP_FILE"
+        compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" pg_dump -h 127.0.0.1 -U "$POSTGRES_USER" "$POSTGRES_DBNAME"' > "$BACKUP_FILE"
         echo -e "${GREEN}Backup created: $BACKUP_FILE${NC}"
         ;;
     db-restore)
@@ -367,10 +366,8 @@ case "$COMMAND" in
             echo -e "${RED}Usage: ./manage.sh db-restore <file>${NC}"
             exit 1
         fi
-        # shellcheck disable=SC1091
-        [ -f .env ] && set -a && . .env && set +a
         echo -e "${YELLOW}Restoring database from: $ARG1${NC}"
-        cat "$ARG1" | compose exec -T postgres psql -U "${POSTGRES_USER:-app}" -d "${POSTGRES_DB:-app_db}"
+        cat "$ARG1" | compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME"'
         echo -e "${GREEN}Database restored!${NC}"
         ;;
 
@@ -380,6 +377,11 @@ case "$COMMAND" in
         bash "$SCRIPT_DIR/scripts/register-debezium.sh" ${ARG1:+"$ARG1"}
         ;;
     debezium-status)
+        if ! docker exec debezium curl -sf http://localhost:8083/connectors >/dev/null 2>&1; then
+            echo -e "${RED}Debezium REST API not reachable on :8083 (container not ready yet?).${NC}" >&2
+            docker compose logs --tail=20 debezium 2>/dev/null || true
+            exit 1
+        fi
         docker exec debezium curl -s http://localhost:8083/connectors | python3 -m json.tool || true
         docker exec debezium curl -s "http://localhost:8083/connectors/${ARG1:-zoho-mirror}/status" | python3 -m json.tool || true
         ;;
