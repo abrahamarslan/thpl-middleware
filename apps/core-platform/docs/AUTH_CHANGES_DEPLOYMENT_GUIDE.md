@@ -308,8 +308,7 @@ docker compose logs --tail=50 celery-worker | grep -E 'email_sent|email_queued|e
 Request a reset from a real network and inspect the queued email row / logs:
 
 ```bash
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
-"select source_ip, actor_id, request_id, template_name from emails order by id desc limit 5;"
+docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select source_ip, actor_id, request_id, template_name from emails order by id desc limit 5;"'
 ```
 
 The staff-facing security email also shows city/country once GeoIP is loaded.
@@ -331,9 +330,7 @@ curl -fsS https://dlp.tarrinahealth.com/api/users/1/moderation -H "Authorization
 ### 8.5 Audit trail is being written
 
 ```bash
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
-"select created_at, action, status, actor_id, subject_id, ip_address
-   from activity_logs order by id desc limit 25;"
+docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select created_at, action, status, actor_id, subject_id, ip_address from activity_logs order by id desc limit 25;"'
 ```
 
 Register / log in / log out / reset / throttle a test user and confirm the
@@ -389,6 +386,7 @@ cd ~/th-middleware && git pull --ff-only origin main
 cd apps/core-platform/deployment
 
 # edit .env: GEOIP_*, EMAIL_*/RESEND_*, FRONTEND_URL, AUTHENTIK_SYNC_* (see §4)
+./manage.sh env-check                                # catch shell-hostile .env values
 docker compose config -q
 docker compose config 2>&1 | grep -i 'variable is not set' || true
 
@@ -453,10 +451,7 @@ class of error).
    `{"identifier":"you@x.com","password":"…"}`.
 2. **Account lookup:** confirm the row exists and by which identifier:
    ```bash
-   docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
-   "select id,email,username,phone,is_deactivated,deleted_at,
-           length(password) as hash_len, left(password,4) as hash_prefix
-      from users where lower(email)=lower('you@x.com') or username='you';"
+   docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select id,email,username,phone,is_deactivated,deleted_at,length(password) as hash_len,left(password,4) as hash_prefix from users order by id desc limit 10;"'
    ```
    - No row → the account was never created (or under a different email).
    - `hash_prefix` not `$2a$`/`$2b$`/`$2y$` → the stored value is not a bcrypt
@@ -476,9 +471,7 @@ Check, in order:
    (§12.2).
 2. **Was an `emails` row created, and what is its status?**
    ```bash
-   docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
-   "select id,status,error_message,provider_message_id,created_at,sent_at
-      from emails order by id desc limit 5;"
+   docker compose exec -T postgres bash -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME" -c "select id,status,error_message,provider_message_id,created_at,sent_at from emails order by id desc limit 5;"'
    ```
    - `pending` forever → the Celery worker never picked it up.
    - `failed` → read `error_message` (usually Resend rejected the request).
@@ -497,6 +490,41 @@ Check, in order:
 5. **Fastest sanity check:** set `EMAIL_LOG_ONLY=true` and re-request — the row
    should flip to `sent` (marked logged, not delivered), proving the pipeline
    works and isolating the problem to Resend credentials.
+
+### 12.4 `manage.sh` fails with `.env: line N: syntax error` / `command not found`
+`manage.sh` (and `register-debezium`, `db-backup`, `prod-ssl`, …) **source**
+`.env` with `set -a; . .env`. A value containing an unquoted space, `$`, `&`,
+`<`, `>` (or a non-printing char) is fine for `docker compose` but breaks the
+shell. Classic offenders:
+
+```env
+AUTHENTIK_ADMIN_PASSWORD=8Osc&YM$RJ8MlPJ&          # & splits commands, $ expands
+RESEND_DEFAULT_FROM=Tarrina Health <noreply@x.com> # < is a redirect
+EMAIL_COMPANY_ADDRESS=iHub, Navrangpura 380009     # spaces
+```
+
+Lint and fix:
+
+```bash
+cd ~/th-middleware/apps/core-platform/deployment
+./manage.sh env-check
+```
+
+Quote every flagged value (single quotes unless it contains one):
+
+```env
+# AUTHENTIK_ADMIN_PASSWORD is dev-only and unused in production — delete it.
+RESEND_DEFAULT_FROM="Tarrina Health <noreply@tarrinahealth.com>"
+EMAIL_COMPANY_ADDRESS="iHub, Gujarat Knowledge Consortium, Navrangpura — 380009, Ahmedabad, Gujarat, India"
+```
+
+> `register-debezium` was also hardened in this release to read the DB
+> credentials from the running `postgres` container instead of sourcing `.env`,
+> so it no longer depends on a clean `.env`. The other subcommands still do —
+> run `./manage.sh env-check` after any manual `.env` edit.
+
+The templates (`.env.prod.example`, `.env.example`) now ship these values
+quoted.
 
 ---
 

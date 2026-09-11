@@ -74,7 +74,8 @@ DEBEZIUM (CDC)
   register-debezium  Register/update the zoho-mirror Postgres connector
   debezium-status    Show connector list + status
 
-ENV SYNC (backend/.env  <->  deployment/.env)
+ENV
+  env-check          Lint deployment/.env for shell-unsafe values (manage.sh sources it)
   sync-env [args]    Sync shared env vars between the two .env files.
                      Default: dry-run report (source = backend/.env). Use
                      --apply to write, --from docker to invert the source,
@@ -134,6 +135,45 @@ prod_compose() {
     local profile_args=()
     [ "${ACMEDNS_ENABLED:-false}" = "true" ] && profile_args=(--profile production)
     docker compose "${env_args[@]}" -f "$BASE_COMPOSE" -f "$PROD_COMPOSE" "${profile_args[@]}" "$@"
+}
+
+# Lint deployment/.env for values that break `set -a; . .env` (which manage.sh
+# uses). Docker Compose tolerates spaces/$/&/<> in values; the shell does not.
+env_check() {
+    local envf=".env"
+    [ -f "$envf" ] || { echo -e "${RED}No $envf in $(pwd)${NC}" >&2; exit 1; }
+    echo -e "${CYAN}Linting $envf for shell-unsafe values...${NC}"
+    local bad=0 lineno=0 line key val esc
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        case "$line" in ''|\#*) continue ;; esac
+        case "$line" in
+            [A-Za-z_]*=*) ;;
+            *) echo -e "  line $lineno: ${YELLOW}not KEY=VALUE${NC}: $line"; bad=1; continue ;;
+        esac
+        key="${line%%=*}"; val="${line#*=}"
+        [ -z "$val" ] && continue
+        case "$val" in \"*\"|\'*\') continue ;; esac
+        if printf '%s' "$val" | grep -qE '[[:space:]#$&<>|()`*?!]'; then
+            if [[ "$val" == *"'"* ]]; then
+                esc="\"$(printf '%s' "$val" | sed 's/\$/$$/g')\""
+            else
+                esc="'$val'"
+            fi
+            echo -e "  line $lineno: ${YELLOW}$key${NC} has an unquoted shell-special value"
+            printf '      fix: %s=%s\n' "$key" "$esc"
+            bad=1
+        fi
+    done < "$envf"
+    if [ "$bad" -eq 0 ]; then
+        echo -e "${GREEN}OK: $envf is shell-safe.${NC}"
+    else
+        echo ""
+        echo -e "${YELLOW}Quote the flagged lines or remove unused keys (e.g."
+        echo -e "AUTHENTIK_ADMIN_PASSWORD). Docker Compose tolerates them; the"
+        echo -e "shell sourced by manage.sh does not.${NC}"
+        exit 1
+    fi
 }
 
 COMMAND="${1:-help}"
@@ -348,6 +388,11 @@ case "$COMMAND" in
     authentik-backfill)
         echo -e "${CYAN}Backfilling Authentik users (link or create)...${NC}"
         compose exec backend python -c "from app.tasks.authentik import backfill; print(backfill())"
+        ;;
+
+    # -- Env lint ---------------------------------------------------------------
+    env-check)
+        env_check
         ;;
 
     # -- Env sync ---------------------------------------------------------------
