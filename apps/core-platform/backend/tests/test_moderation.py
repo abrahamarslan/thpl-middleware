@@ -54,7 +54,7 @@ async def test_ban_blocks_login_and_destroys_challenges(db):
     assert moderation.is_banned(user)
     assert moderation.moderation_state(user)["state"] == "banned"
     with pytest.raises(ForbiddenError):
-        await service.login(db, LoginRequest(email_or_username=user.email, password=PASSWORD))
+        await service.login(db, LoginRequest(identifier=user.email, password=PASSWORD))
     assert await crud.get_reset_token(db, user.email) is None
 
 
@@ -65,7 +65,7 @@ async def test_unban_restores_login(db):
 
     assert not moderation.is_banned(user)
     _, tokens = await service.login(
-        db, LoginRequest(email_or_username=user.email, password=PASSWORD)
+        db, LoginRequest(identifier=user.email, password=PASSWORD)
     )
     assert tokens.access_token
 
@@ -76,7 +76,7 @@ async def test_temporary_ban_expires_on_its_own(db):
         db, user, reason="cool-off", until=datetime.now(UTC) - timedelta(minutes=1)
     )
     assert not moderation.is_banned(user)  # expired
-    await service.login(db, LoginRequest(email_or_username=user.email, password=PASSWORD))
+    await service.login(db, LoginRequest(identifier=user.email, password=PASSWORD))
 
 
 async def test_throttle_blocks_new_auth_but_keeps_existing_session(db):
@@ -86,7 +86,7 @@ async def test_throttle_blocks_new_auth_but_keeps_existing_session(db):
     assert moderation.moderation_state(user)["state"] == "throttled"
     # New authentication is refused with 429...
     with pytest.raises(RateLimitedError):
-        await service.login(db, LoginRequest(email_or_username=user.email, password=PASSWORD))
+        await service.login(db, LoginRequest(identifier=user.email, password=PASSWORD))
     # ...and OTP / reset requests too.
     with pytest.raises(RateLimitedError):
         await login_otp.request_login_otp(db, identifier=user.email)
@@ -101,7 +101,7 @@ async def test_unthrottle_restores_auth(db):
     await moderation.throttle_user(db, user, reason="rate")
     await moderation.unthrottle_user(db, user)
     _, tokens = await service.login(
-        db, LoginRequest(email_or_username=user.email, password=PASSWORD)
+        db, LoginRequest(identifier=user.email, password=PASSWORD)
     )
     assert tokens.access_token
 

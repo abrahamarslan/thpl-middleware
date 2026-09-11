@@ -101,10 +101,10 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
 async def login(
     db: AsyncSession, body: LoginRequest, *, client: ClientInfo | None = None
 ) -> tuple[User, TokenPair]:
-    user = await identifiers.resolve_user_by_identifier(db, body.email_or_username)
+    user = await identifiers.resolve_user_by_identifier(db, body.identifier)
     if user is None:
         await audit(
-            db, Event.LOGIN_FAILURE, actor_label=body.email_or_username, status="failure",
+            db, Event.LOGIN_FAILURE, actor_label=body.identifier, status="failure",
             description="unknown identifier", client=client, commit=True,
         )
         raise AuthError("Invalid credentials")
@@ -191,7 +191,15 @@ async def refresh_tokens(
             description="invalid refresh token", client=client, commit=True,
         )
         raise
-    user = await crud.get_by_id(db, int(payload["sub"]))
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError):
+        await audit(
+            db, Event.TOKEN_REFRESH_FAILURE, status="failure",
+            description="invalid subject", client=client, commit=True,
+        )
+        raise AuthError("Invalid refresh token") from None
+    user = await crud.get_by_id(db, user_id)
     if user is None or user.is_deactivated:
         await audit(
             db, Event.TOKEN_REFRESH_FAILURE, user=user, status="failure",

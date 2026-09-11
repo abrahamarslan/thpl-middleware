@@ -30,7 +30,7 @@ async def test_failed_login_persists_counter_and_audit(db):
         assert reg.status_code == 201, reg.text
 
         bad = await client.post(
-            "/api/auth/login", json={"email_or_username": email, "password": "wrong-pass"}
+            "/api/auth/login", json={"identifier": email, "password": "wrong-pass"}
         )
         assert bad.status_code == 401, bad.text
 

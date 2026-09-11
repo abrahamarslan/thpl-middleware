@@ -313,12 +313,25 @@ class RegisterRequest(BaseModel):
     name: str
     email: EmailStr
     password: PasswordStr
-    username: str | None = None
-    phone: str | None = None
+    username: str | None = Field(
+        default=None, max_length=50, description="Optional unique login handle (also usable to sign in)"
+    )
+    phone: str | None = Field(default=None, max_length=32, description="Optional phone (also usable to sign in)")
+
+    @field_validator("username", "phone", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v: object) -> object:
+        # Frontends often submit "" for untouched optional fields.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 class LoginRequest(BaseModel):
-    email_or_username: str
+    identifier: str = Field(
+        min_length=3, max_length=255,
+        description="Username, email address, or phone number of the account",
+    )
     password: str
     device_id: str | None = None
     device_type: str | None = None

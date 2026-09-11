@@ -66,10 +66,10 @@ async def test_code_reset_flow_service(db, mocker):
     assert verify_password("N3wSecurePass!", user.password)
 
     # New password logs in; the old one is rejected.
-    _, tokens = await service.login(db, LoginRequest(email_or_username=TECH, password="N3wSecurePass!"))
+    _, tokens = await service.login(db, LoginRequest(identifier=TECH, password="N3wSecurePass!"))
     assert tokens.access_token
     with pytest.raises(AuthError):
-        await service.login(db, LoginRequest(email_or_username=TECH, password=OLD_PASSWORD))
+        await service.login(db, LoginRequest(identifier=TECH, password=OLD_PASSWORD))
 
 
 async def test_link_reset_flow_service(db, mocker):
@@ -123,12 +123,12 @@ async def test_forgot_and_reset_via_http(db, mocker):
             assert reset.json()["data"]["reset"] is True
 
             old = await client.post(
-                "/api/auth/login", json={"email_or_username": TECH, "password": OLD_PASSWORD}
+                "/api/auth/login", json={"identifier": TECH, "password": OLD_PASSWORD}
             )
             assert old.status_code == 401
 
             new = await client.post(
-                "/api/auth/login", json={"email_or_username": TECH, "password": "N3wHttpPass!"}
+                "/api/auth/login", json={"identifier": TECH, "password": "N3wHttpPass!"}
             )
             assert new.status_code == 200, new.text
             assert new.json()["data"]["access_token"]

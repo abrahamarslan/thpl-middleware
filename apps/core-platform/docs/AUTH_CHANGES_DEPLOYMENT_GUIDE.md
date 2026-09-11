@@ -319,7 +319,7 @@ The staff-facing security email also shows city/country once GeoIP is loaded.
 ```bash
 TOKEN=$(curl -fsS -X POST https://dlp.tarrinahealth.com/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"email_or_username":"<admin>","password":"<pw>"}' | jq -r .data.access_token)
+  -d '{"identifier":"<admin>","password":"<pw>"}' | jq -r .data.access_token)
 
 curl -fsS -X POST https://dlp.tarrinahealth.com/api/users/1/throttle \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -427,3 +427,83 @@ docker compose logs --tail=50 backend celery-worker
 - **Audit logging** is dual-write (`activity_logs` + structured logs). The full
   design and event catalog are in
   [`AUTH_AUDIT_LOGGING_PLAN.md`](./AUTH_AUDIT_LOGGING_PLAN.md).
+
+---
+
+## 12. Troubleshooting this release
+
+### 12.1 `POST /api/auth/login` → 500 `internal_error`
+**Almost always: migrations were not applied.** The User model now selects the
+moderation columns (`is_banned`, `is_throttled`, `banned_until`, …); if the
+`users` table lacks them, every query that loads a user raises
+`asyncpg.UndefinedColumnError: column users.is_banned does not exist` → 500.
+
+```bash
+docker compose exec backend alembic current      # must be e5f6a7b8c9d0 (head)
+docker compose exec backend alembic upgrade head
+docker compose logs --tail=80 backend | grep -iE 'UndefinedColumn|does not exist'
+```
+
+Also confirm the image was actually rebuilt after `git pull` (an old image
+without the new schema paired with a new DB, or vice-versa, produces the same
+class of error).
+
+### 12.2 Login returns `401 Invalid credentials` with a correct password
+1. **Field renamed:** login now takes `identifier` (not `email_or_username`).
+   `{"identifier":"you@x.com","password":"…"}`.
+2. **Account lookup:** confirm the row exists and by which identifier:
+   ```bash
+   docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+   "select id,email,username,phone,is_deactivated,deleted_at,
+           length(password) as hash_len, left(password,4) as hash_prefix
+      from users where lower(email)=lower('you@x.com') or username='you';"
+   ```
+   - No row → the account was never created (or under a different email).
+   - `hash_prefix` not `$2a$`/`$2b$`/`$2y$` → the stored value is not a bcrypt
+     hash (e.g. an imported/legacy/empty value). A malformed hash now returns a
+     clean `401`, never a 500; the user should use **forgot-password** to set a
+     known password.
+3. **Lockout/throttle:** `select locked_at, failed_login_attempts, is_throttled
+   from users where email='you@x.com';` — a lockout returns 401 "Account locked",
+   a throttle returns 429.
+
+### 12.3 OTP / reset email never arrives (API says `{"sent": true}`)
+`sent: true` is deliberately uniform and does **not** prove an email was sent.
+Check, in order:
+
+1. **Did the account resolve?** Unknown/deactivated/banned identifiers return
+   `sent: true` and send nothing (anti-enumeration). Confirm the user row exists
+   (§12.2).
+2. **Was an `emails` row created, and what is its status?**
+   ```bash
+   docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+   "select id,status,error_message,provider_message_id,created_at,sent_at
+      from emails order by id desc limit 5;"
+   ```
+   - `pending` forever → the Celery worker never picked it up.
+   - `failed` → read `error_message` (usually Resend rejected the request).
+3. **Worker has the Resend env and the new image.**
+   ```bash
+   docker compose exec celery-worker printenv | grep -E 'RESEND_API_KEY|EMAIL_ENABLED|EMAIL_LOG_ONLY'
+   docker compose logs --tail=100 celery-worker | grep -E 'email_|resend'
+   ```
+   A blank `RESEND_API_KEY` in the worker means the container was not recreated
+   after you edited `.env`: `docker compose up -d --no-deps celery-worker`.
+   (The backend now also logs `email_provider_misconfigured` when the key is
+   empty.)
+4. **Resend side:** the API key is valid and the sending domain is **verified**,
+   and `RESEND_DEFAULT_FROM` uses that domain. If the domain is unverified,
+   Resend returns a 4xx and the row goes `failed`.
+5. **Fastest sanity check:** set `EMAIL_LOG_ONLY=true` and re-request — the row
+   should flip to `sent` (marked logged, not delivered), proving the pipeline
+   works and isolating the problem to Resend credentials.
+
+---
+
+## 13. API change for this release
+
+`POST /api/auth/login` now takes a single **`identifier`** field (username,
+email **or** phone) instead of `email_or_username`. Update any client/web app
+accordingly. Registration accepts optional `username` and `phone`; blank
+strings are treated as absent. `POST /api/auth/change-password` identifies the
+user from the bearer token (body is only `current_password`/`new_password`).

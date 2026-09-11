@@ -106,6 +106,12 @@ async def me(user: CurrentUser):
 
 @auth_router.post("/change-password", response_model=ResponseModel[dict])
 async def change_password(db: DBSession, user: CurrentUser, body: ChangePasswordRequest, client: ClientInfoDep):
+    """Change the **authenticated** user's password.
+
+    The account is identified by the bearer token (`Authorization: Bearer
+    <access_token>`, resolved to `CurrentUser`) — the body intentionally carries
+    only `current_password` + `new_password`.
+    """
     await service.change_password(
         db, user, current_password=body.current_password, new_password=body.new_password, client=client
     )

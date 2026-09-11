@@ -44,7 +44,7 @@ async def test_register_login_logout_are_audited(db, mocker):
     )
     assert "auth.register" in await _actions_for(db, user.id)
 
-    user, _ = await service.login(db, LoginRequest(email_or_username=email, password=PASSWORD))
+    user, _ = await service.login(db, LoginRequest(identifier=email, password=PASSWORD))
     actions = await _actions_for(db, user.id)
     assert "auth.login.success" in actions
     assert "auth.token.issued" in actions

@@ -53,7 +53,7 @@ hierarchy: `AuthError` → 401 `unauthorized`, `ForbiddenError` → 403
 | Method | Path | Auth | Body | Success |
 |---|---|---|---|---|
 | POST | `/api/auth/register` | public | `name, email, password, username?, phone?` | `201 UserOut` (also sends **welcome** email) |
-| POST | `/api/auth/login` | public | `email_or_username, password, device_id?, device_type?` | `TokenPair` |
+| POST | `/api/auth/login` | public | `identifier, password, device_id?, device_type?` | `TokenPair` |
 | POST | `/api/auth/login-otp/request` | public | `identifier` | `{sent, expires_at, debug_code?}` |
 | POST | `/api/auth/login-otp/verify` | public | `identifier, code, device_id?, device_type?` | `TokenPair` |
 | POST | `/api/auth/refresh` | public | `refresh_token` | `TokenPair` |
@@ -80,10 +80,11 @@ Moderation (JWT-protected, `/api/users/{id}/*`):
 | POST | `/api/users/{id}/throttle` | `{reason, until?}` | Soft restriction: new auth attempts 429 until `until` |
 | POST | `/api/users/{id}/unthrottle` | — | Lift the throttle |
 
-**Identifier vs `email_or_username`.** Reset and OTP endpoints take a single
-`identifier` (email, username **or** phone). Login keeps the historical
-`email_or_username` field name, but it too resolves through the same identifier
-logic — so phone login works without an API break.
+**Unified identifier.** Login, password reset and login OTP all take a single
+`identifier` field (email, username **or** phone number), resolved through the
+same shape-driven logic in `identifiers.py`. Registration accepts an optional
+`username` and `phone` (blank strings are normalised to `null`); any of the
+three becomes a valid login identifier.
 
 ---
 
@@ -93,7 +94,8 @@ logic — so phone login works without an API break.
 `POST /api/auth/register` → `service.register`:
 1. Reject duplicate email/username (`ConflictError`).
 2. Validate the password against the configured policy.
-3. Hash with bcrypt, create the `User` (`last_password_change_at = now`).
+3. Hash with bcrypt, create the `User` (`last_password_change_at = now`) with the
+   optional `username`/`phone` (blank → `null`) that can later be used to log in.
 4. Best-effort mirror into Authentik (retry enqueued on failure).
 5. Best-effort **welcome** email (never fails registration).
 
@@ -317,8 +319,12 @@ Integration tests skip cleanly without Postgres.
 - **Phone matching is exact** (raw or punctuation-stripped); a stored number
   with unusual formatting may not match. Normalizing phone storage at write
   time is the robust long-term fix.
-- **`LoginRequest` keeps `email_or_username`** for API compatibility even
-  though it now resolves phone too; only reset/OTP use `identifier` by name.
+- **Login uses `identifier`** (email \| username \| phone) — the old
+  `email_or_username` field is gone. Clients must send `identifier`.
+- **`change-password` identifies the user from the bearer token.** It is a
+  `CurrentUser` endpoint: the account is the authenticated principal, resolved
+  from `Authorization: Bearer <access_token>`. The body carries only
+  `current_password` + `new_password`; you cannot (and need not) name the user.
 - **Moderation endpoints require authentication only** (like the existing
   `/api/users` admin surface). A role/scope check (RBAC) is a deliberate
   follow-up — see §13.

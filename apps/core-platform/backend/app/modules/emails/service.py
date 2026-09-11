@@ -80,6 +80,15 @@ async def compose_and_queue_email(
 
     email = await crud.create_email(db, values)
 
+    # Loud operator signal when outbound delivery cannot possibly succeed.
+    if settings.EMAIL_ENABLED and not settings.EMAIL_LOG_ONLY:
+        if settings.EMAIL_PROVIDER == "resend" and not settings.RESEND_API_KEY:
+            logger.error(
+                "email_provider_misconfigured",
+                provider="resend",
+                detail="RESEND_API_KEY is empty; the queued email will fail delivery",
+            )
+
     # Attach existing documents; inline metadata (CID) rides on the document.
     if email_in.attachments:
         await attach_documents_to_entity(

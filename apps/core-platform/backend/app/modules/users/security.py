@@ -13,8 +13,11 @@ import hmac
 import secrets
 
 import bcrypt
+import structlog
 
 from app.core.conf import settings
+
+logger = structlog.get_logger("app.users.security")
 
 
 def hash_password(plain: str) -> str:
@@ -23,10 +26,15 @@ def hash_password(plain: str) -> str:
     ).decode("utf-8")
 
 
-def verify_password(plain: str, hashed: str) -> bool:
+def verify_password(plain: str, hashed: str | None) -> bool:
+    """Constant-ish bcrypt check. Never raises — a malformed/legacy stored hash
+    is treated as a failed login (401), not a 500."""
+    if not plain or not hashed:
+        return False
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-    except (ValueError, TypeError):
+    except Exception as e:  # noqa: BLE001 — invalid salt / unsupported hash format
+        logger.warning("password_verify_failed", reason=type(e).__name__)
         return False
 
 
