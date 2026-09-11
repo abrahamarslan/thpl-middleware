@@ -8,17 +8,18 @@ user CRUD lifecycle (list/get/create/update/soft-delete/restore/hard-delete).
 import secrets
 from datetime import UTC, datetime, timedelta
 
-import bcrypt
 import structlog
 from geoalchemy2 import WKTElement
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.client_info import ClientInfo
 from app.common.exception.errors import AuthError, ConflictError, ForbiddenError, NotFoundError
-from app.common.security.jwt import create_access_token, create_refresh_token, decode_token
+from app.common.security.jwt import decode_token
 from app.core.conf import settings
-from app.modules.users import authentik_sync, crud
+from app.modules.users import auth_emails, authentik_sync, crud, identifiers, moderation, password_reset
 from app.modules.users.authentik_sync import AUTHENTIK_SYNCED_FIELDS, SyncResult
 from app.modules.users.model import User
+from app.modules.users.password_policy import validate_password
 from app.modules.users.schema import (
     GEO_FIELDS,
     LoginRequest,
@@ -28,10 +29,12 @@ from app.modules.users.schema import (
     UserListFilters,
     UserUpdate,
 )
+from app.modules.users.security import hash_password, verify_password
+from app.modules.users.tokens import issue_token_pair
 
 logger = structlog.get_logger("app.users.service")
 
-_RESET_TOKEN_TTL_MINUTES = 30
+__all__ = ["hash_password", "verify_password"]  # re-exported for existing callers
 
 
 # ── Authentik sync enqueue helper ─────────────────────────────────────────────
@@ -48,19 +51,6 @@ def _enqueue_authentik(task_name: str, *args) -> None:
         logger.error("authentik_enqueue_failed", task=task_name, error=str(e))
 
 
-# ── Password hashing ──────────────────────────────────────────────────────────
-
-def hash_password(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-    except ValueError:
-        return False
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _geo_to_elements(values: dict) -> dict:
@@ -71,22 +61,14 @@ def _geo_to_elements(values: dict) -> dict:
     return values
 
 
-def _token_pair(user: User) -> TokenPair:
-    claims = {"email": user.email, "role_id": user.role_id, "user_type": user.user_type}
-    return TokenPair(
-        access_token=create_access_token(str(user.id), claims=claims),
-        refresh_token=create_refresh_token(str(user.id)),
-        expires_in=settings.JWT_EXPIRATION_HOURS * 3600,
-    )
-
-
 # ── Authentication ────────────────────────────────────────────────────────────
 
-async def register(db: AsyncSession, body: RegisterRequest) -> User:
+async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInfo | None = None) -> User:
     if await crud.get_by_email(db, body.email, include_deleted=True):
         raise ConflictError("A user with this email already exists")
     if body.username and await crud.get_by_username(db, body.username):
         raise ConflictError("This username is taken")
+    validate_password(body.password, email=body.email, name=body.name)
 
     user = await crud.create(db, {
         "name": body.name,
@@ -96,23 +78,29 @@ async def register(db: AsyncSession, body: RegisterRequest) -> User:
         "password": hash_password(body.password),
         "last_password_change_at": datetime.now(UTC),
     })
-    logger.info("user_registered", user_id=user.id)
+    logger.info("user_registered", user_id=user.id, ip=client.ip if client else None)
 
     # Mirror into Authentik (best-effort). Plaintext is only available here.
     result = await authentik_sync.sync_create(db, user, body.password)
     if result is SyncResult.FAILED:
         _enqueue_authentik("provision_user", user.id)
+
+    # Welcome email (best-effort — a mail hiccup must not fail registration).
+    try:
+        await auth_emails.send_welcome_email(db, user, client=client)
+    except Exception as e:  # noqa: BLE001
+        logger.error("welcome_email_failed", user_id=user.id, error=str(e))
     return user
 
 
-async def login(db: AsyncSession, body: LoginRequest) -> tuple[User, TokenPair]:
-    user = await crud.get_by_email(db, body.email_or_username) or await crud.get_by_username(
-        db, body.email_or_username
-    )
+async def login(
+    db: AsyncSession, body: LoginRequest, *, client: ClientInfo | None = None
+) -> tuple[User, TokenPair]:
+    user = await identifiers.resolve_user_by_identifier(db, body.email_or_username)
     if user is None:
         raise AuthError("Invalid credentials")
 
-    # Lockout window
+    # Lockout window (automatic, from failed password attempts)
     if user.locked_at is not None:
         unlock_at = user.locked_at + timedelta(minutes=settings.AUTH_LOCKOUT_MINUTES)
         if datetime.now(UTC) < unlock_at:
@@ -120,8 +108,8 @@ async def login(db: AsyncSession, body: LoginRequest) -> tuple[User, TokenPair]:
         user.locked_at = None
         user.failed_login_attempts = 0
 
-    if user.is_deactivated or user.deleted_at is not None:
-        raise ForbiddenError("Account is deactivated")
+    # Moderation: deactivated / banned / throttled.
+    moderation.ensure_can_authenticate(user)
 
     if not verify_password(body.password, user.password):
         user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
@@ -141,8 +129,14 @@ async def login(db: AsyncSession, body: LoginRequest) -> tuple[User, TokenPair]:
         user.device_type = body.device_type
     await db.flush()
 
-    logger.info("user_login", user_id=user.id, device_id=body.device_id)
-    return user, _token_pair(user)
+    logger.info(
+        "user_login",
+        user_id=user.id,
+        device_id=body.device_id,
+        ip=client.ip if client else None,
+        location=client.location if client else None,
+    )
+    return user, issue_token_pair(user)
 
 
 async def refresh_tokens(db: AsyncSession, refresh_token: str) -> TokenPair:
@@ -150,64 +144,73 @@ async def refresh_tokens(db: AsyncSession, refresh_token: str) -> TokenPair:
     user = await crud.get_by_id(db, int(payload["sub"]))
     if user is None or user.is_deactivated:
         raise AuthError("User no longer active")
-    return _token_pair(user)
+    return issue_token_pair(user)
 
 
-async def change_password(db: AsyncSession, user: User, *, current_password: str, new_password: str) -> None:
+async def change_password(
+    db: AsyncSession,
+    user: User,
+    *,
+    current_password: str,
+    new_password: str,
+    client: ClientInfo | None = None,
+) -> None:
     if not verify_password(current_password, user.password):
         raise AuthError("Current password is incorrect")
+    validate_password(new_password, email=user.email, name=user.name)
     user.password = hash_password(new_password)
     user.last_password_change_at = datetime.now(UTC)
     await db.flush()
-    logger.info("password_changed", user_id=user.id)
+    logger.info("password_changed", user_id=user.id, ip=client.ip if client else None)
 
     # Mirror the new password into Authentik (best-effort; plaintext in scope).
     await authentik_sync.sync_set_password(db, user, new_password)
+    # Security confirmation to the account holder.
+    try:
+        await auth_emails.send_password_changed_email(db, user, client=client)
+    except Exception as e:  # noqa: BLE001
+        logger.error("password_changed_email_failed", user_id=user.id, error=str(e))
 
 
-async def request_password_reset(db: AsyncSession, *, email: str, reset_type: str) -> dict:
-    """Create a reset token/code. Returns it only when DEBUG (no SMTP wired
-    yet) — in production, deliver via email and return nothing."""
-    user = await crud.get_by_email(db, email)
-    if user is None:
-        # Do not reveal account existence
-        return {"sent": True}
+async def request_password_reset(
+    db: AsyncSession,
+    *,
+    identifier: str,
+    reset_type: str,
+    client: ClientInfo | None = None,
+) -> dict:
+    """Create a reset code/link and deliver it by email.
 
-    token = secrets.token_urlsafe(48)
-    code = f"{secrets.randbelow(1_000_000):06d}" if reset_type == "code" else None
-    await crud.upsert_reset_token(db, email=user.email, token=token, reset_type=reset_type, code=code)
-    logger.info("password_reset_requested", user_id=user.id, reset_type=reset_type)
-
-    # TODO: send via SMTP / notification service
+    Returns a uniform payload regardless of whether the account exists; in
+    DEBUG the generated code/token are echoed so dev stacks need no mailbox.
+    """
+    result = await password_reset.request_password_reset(
+        db, identifier=identifier, reset_type=reset_type, client=client
+    )
+    payload: dict = {"sent": result.sent}
+    if result.expires_at:
+        payload["expires_at"] = result.expires_at
     if settings.DEBUG:
-        return {"sent": True, "debug_token": token, "debug_code": code}
-    return {"sent": True}
+        payload["debug_code"] = result.debug_code
+        payload["debug_token"] = result.debug_token
+    return payload
 
 
-async def reset_password(db: AsyncSession, *, email: str, token_or_code: str, new_password: str) -> None:
-    row = await crud.get_reset_token(db, email.lower())
-    if row is None:
-        raise AuthError("Invalid or expired reset token")
-    if row.created_at and datetime.now(UTC) - row.created_at > timedelta(minutes=_RESET_TOKEN_TTL_MINUTES):
-        await crud.delete_reset_token(db, email.lower())
-        raise AuthError("Reset token expired")
-    if not secrets.compare_digest(token_or_code, row.token) and not (
-        row.code and secrets.compare_digest(token_or_code, row.code)
-    ):
-        raise AuthError("Invalid or expired reset token")
-
-    user = await crud.get_by_email(db, email)
-    if user is None:
-        raise NotFoundError("User not found")
-    user.password = hash_password(new_password)
-    user.last_password_change_at = datetime.now(UTC)
-    user.failed_login_attempts = 0
-    user.locked_at = None
-    await crud.delete_reset_token(db, email.lower())
-    logger.info("password_reset_complete", user_id=user.id)
-
-    # Mirror the reset password into Authentik (best-effort; plaintext in scope).
-    await authentik_sync.sync_set_password(db, user, new_password)
+async def reset_password(
+    db: AsyncSession,
+    *,
+    identifier: str,
+    token_or_code: str,
+    new_password: str,
+    client: ClientInfo | None = None,
+) -> None:
+    await password_reset.reset_password(
+        db,
+        identifier=identifier,
+        token_or_code=token_or_code,
+        new_password=new_password,
+        client=client,
+    )
 
 
 # ── Authentik JIT provisioning ───────────────────────────────────────────────
@@ -265,6 +268,7 @@ async def create_user(db: AsyncSession, body: UserCreate, *, created_by: int | N
         raise ConflictError("A user with this email already exists")
     if body.username and await crud.get_by_username(db, body.username):
         raise ConflictError("This username is taken")
+    validate_password(body.password, email=body.email, name=body.name)
 
     values = _geo_to_elements(body.model_dump(exclude_unset=True, exclude_none=True))
     values["email"] = body.email.lower()

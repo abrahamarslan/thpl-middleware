@@ -79,23 +79,87 @@ Spatie-MediaLibrary-style galleries:
 
 ## Emails — `app/modules/emails/`
 
-Transactional email via Resend with a full lifecycle mirror:
+Transactional email built as a reusable layer, not a one-off Resend call:
 
+- **Provider adapter** (`provider.py`) — callers hand an `OutboundEmail` value
+  object to `get_email_provider()` and get a `ProviderResult`; the Resend
+  adapter is registered in a provider registry, so a new provider is one
+  registration, never a branch in caller code. `EMAIL_PROVIDER` selects it.
+  `get_email_provider()` is a lazy factory (the test patch point).
+- **Template registry** (`templates.py`) — one entry per transactional email
+  (subject + html/optional text, locale fallback to `EMAIL_DEFAULT_LOCALE`,
+  `required_context` validation). The environment uses a `ChoiceLoader` across
+  **every registered module's template directory**, so each feature owns its
+  templates (auth's live in `app/modules/users/templates/`). `POST
+  /api/emails/send-template` renders + queues; feature code calls
+  `service.send_template_email(...)` and never builds an HTML string.
 - `POST /api/emails/send` persists first (`emails` row, JSONB recipient
   arrays + deduped `all_recipients` for "ever emailed x@y?" queries),
   attaches existing Documents (single source of file truth), then queues
   `app/tasks/emails.send_email` (integrations queue). Scheduling via
   `scheduled_at` → Celery `eta`.
-- The worker builds the Resend payload (base64 attachments, inline CIDs),
-  honours `attempts/max_attempts` on the row under Celery backoff, and
-  records provider ids/responses.
+- **Sender provenance** — `emails.actor_id` / `source_ip` / `request_id`
+  (from request context) answer *who queued it, from where, when*; the
+  provider side (`email_events`) answers *when/where/who opened or clicked*.
+- The worker speaks only the provider-neutral layer, honours
+  `attempts/max_attempts` under Celery backoff, and respects
+  `EMAIL_ENABLED` (off ⇒ rows are `suppressed`) and `EMAIL_LOG_ONLY`
+  (dev: persist + mark sent without a provider call).
 - `POST /api/emails/webhooks/resend` (svix-signature-verified when
   `RESEND_WEBHOOK_SECRET` is set) appends `email_events` rows and maintains
   aggregates: delivered/bounced status, open/click counts, first/last
   timestamps. Unknown messages are acknowledged, never retry-stormed.
+- `GET /api/emails/stats` aggregates totals/rates over a window for the
+  analytics dashboards; `email_events`/`email_links` are in Debezium's
+  `table.include.list` for ClickHouse/Grafana. `emails` itself is
+  deliberately *not* CDC'd (message bodies are not analytics data).
 
-Settings: `RESEND_API_KEY`, `RESEND_DEFAULT_FROM`, `RESEND_WEBHOOK_SECRET`,
-`EMAIL_MAX_ATTEMPTS`.
+Settings: `EMAIL_PROVIDER`, `EMAIL_ENABLED`, `EMAIL_LOG_ONLY`,
+`RESEND_API_KEY`, `RESEND_API_URL`, `RESEND_DEFAULT_FROM`,
+`RESEND_DEFAULT_REPLY_TO`, `RESEND_WEBHOOK_SECRET`, `EMAIL_MAX_ATTEMPTS`,
+`EMAIL_COMPANY_NAME`, `EMAIL_SUPPORT_EMAIL`, `EMAIL_SITE_URL`,
+`EMAIL_COMPANY_ADDRESS`, `FRONTEND_URL`.
+
+## Auth — `app/modules/users/`
+
+> Full reference: [docs/modules/auth-module-documentation.md](modules/auth-module-documentation.md).
+
+- **Identifiers.** Login, password reset and login OTP all accept a single
+  `identifier` (email | username | phone), resolved by `identifiers.py`
+  (shape-driven, username fallback); responses never reveal which matched.
+- **Password policy** (`password_policy.py`) is configuration, not code:
+  `PASSWORD_MIN_LENGTH`/`MAX_LENGTH`, `REQUIRE_UPPERCASE`/`LOWERCASE`/`DIGIT`/
+  `SPECIAL`, `MIN_UNIQUE_CHARS`, `DISALLOW_COMMON`, `DISALLOW_USER_INFO`. One
+  engine drives register, admin-create, change-password and reset; the
+  `PasswordStr` Pydantic type enforces it at the boundary (422 envelope) and
+  `validate_password(...)` adds the user-specific rules in the service.
+  `GET /api/auth/password-policy` exposes the active rules to clients.
+- **Password reset** (`password_reset.py`) ships a configurable-length **digit
+  code (4 by default)** plus a link fallback. Defenses: code stored only as a
+  keyed HMAC (`security.hash_one_time_code`), short TTL
+  (`PASSWORD_RESET_CODE_TTL_MINUTES`), attempt cap
+  (`PASSWORD_RESET_MAX_ATTEMPTS`, row destroyed at the cap), single-use,
+  resend cooldown + hourly cap, and a uniform `{sent: true}` response. A
+  successful reset emails a security confirmation.
+- **Login OTP** (`login_otp.py`) is passwordless email OTP:
+  `POST /api/auth/login-otp/request` sends a 6-digit code;
+  `POST /api/auth/login-otp/verify` exchanges it for a token pair (clears the
+  lockout, records the session). Same HMAC-at-rest/attempt-cap/cooldown model
+  as reset, backed by `login_otp_tokens`.
+- **Auth emails** (`auth_emails.py` + `users/templates/`) are typed-context
+  wrappers over the email layer: `welcome` (on register), `login_otp`,
+  `password_reset_code` / `password_reset_link`, `password_changed`. Every
+  security email shows request-audit info.
+- **GeoIP / client context** (`app/common/geoip.py`, `app/common/client_info.py`):
+  `ClientInfoDep` resolves the real IP (`X-Forwarded-For`/`X-Real-IP`), parses
+  the device from the User-Agent, and (when `GEOIP_ENABLED=true`, GeoLite2 DB
+  mounted) the city/country. Used for logs and the audit block in auth emails.
+
+Settings (auth OTP): `LOGIN_OTP_CODE_LENGTH`, `LOGIN_OTP_TTL_MINUTES`,
+`LOGIN_OTP_MAX_ATTEMPTS`, `LOGIN_OTP_RESEND_COOLDOWN_SECONDS`,
+`LOGIN_OTP_MAX_PER_HOUR`. GeoIP: `GEOIP_ENABLED`, `GEOIP_CITY_DB_PATH`,
+`GEOIP_COUNTRY_DB_PATH` (see `deployment/config/geoip/README.md`).
+
 
 ## Favorites — upgraded
 

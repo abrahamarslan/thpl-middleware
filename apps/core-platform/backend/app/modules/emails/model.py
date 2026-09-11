@@ -10,7 +10,17 @@ import uuid as uuid_mod
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -24,6 +34,10 @@ from app.modules.tags.mixins import HasTagsMixin
 
 class Email(IntPKMixin, TimestampMixin, SoftDeleteFilteredMixin, HasDocumentsMixin, HasTagsMixin, Base):
     __tablename__ = "emails"
+
+    # Analytics/time-window queries filter on created_at (stats, list date
+    # range); an index keeps them from becoming sequential scans as it grows.
+    __table_args__ = (Index("ix_emails_created_at", "created_at"),)
 
     uuid: Mapped[uuid_mod.UUID] = mapped_column(
         PgUUID(as_uuid=True), default=uuid_mod.uuid4, unique=True, index=True
@@ -62,6 +76,14 @@ class Email(IntPKMixin, TimestampMixin, SoftDeleteFilteredMixin, HasDocumentsMix
     campaign_id: Mapped[str | None] = mapped_column(String(100), index=True)
     batch_id: Mapped[str | None] = mapped_column(String(100), index=True)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
+
+    # Provenance — "who queued it, from where" for the sender-side half of the
+    # analytics story (the provider side lives on email_events: when/where/who
+    # opened). Captured from request context at compose time.
+    actor_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    source_ip: Mapped[str | None] = mapped_column(String(45))
+    request_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512))
 
     # Status & processing (pending -> processing -> sent -> delivered | failed | bounced)
     status: Mapped[str | None] = mapped_column(String(20), default="pending", index=True)

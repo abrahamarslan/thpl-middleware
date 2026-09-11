@@ -1,0 +1,12 @@
+{{ company_name }} sign-in code
+
+Your temporary sign-in code is: {{ code }}
+It is valid for {{ expires_minutes }} minutes and can be used once.
+
+Login request information:
+  Browser:   {{ device }}
+  Location:  {{ location }} (IP: {{ ip }})
+  Timestamp: {{ requested_at }}
+
+If you did not initiate this sign-in attempt, no action is required.
+Need help? Contact {{ support_email }}.

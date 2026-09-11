@@ -1,0 +1,60 @@
+{% extends "_base.en.html" %}
+{% block title %}Registration complete — {{ company_name }}{% endblock %}
+{% block preheader %}Welcome to {{ company_name }}! Your account is active and ready to use.{% endblock %}
+{% block header_action %}<a href="{{ dashboard_url }}" style="font-family:'Inter', sans-serif; font-size:12px; font-weight:600; color:#64748b; text-decoration:none;">Dashboard &rarr;</a>{% endblock %}
+{% block content %}
+<span style="display:inline-block; padding:4px 12px; background-color:#ecfeff; border:1px solid #a5f3fc; border-radius:9999px; font-family:'Inter', sans-serif; font-size:11px; font-weight:600; color:#0891b2; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:14px;">
+  Account Activated
+</span>
+
+<h1 style="font-family:'Inter', sans-serif; font-size:26px; line-height:34px; font-weight:700; color:#0f172a; margin:0 0 12px 0; letter-spacing:-0.02em;">
+  Welcome to {{ company_name }}
+</h1>
+<p style="font-family:'Inter', sans-serif; font-size:15px; line-height:24px; color:#475569; margin:0 auto 28px auto; max-width:480px;">
+  {% if name %}Hi {{ name }}, y{% else %}Y{% endif %}our registration is complete! You can now access your workspace, collaborate with your team, and manage your projects through your account dashboard.
+</p>
+
+<table role="presentation" align="center" cellspacing="0" cellpadding="0" border="0" style="margin:0 auto 28px auto;">
+  <tr>
+    <td align="center" style="background-color:#0891b2; border-radius:9999px; padding:14px 40px; box-shadow:0 4px 14px rgba(8, 145, 178, 0.3);">
+      <a href="{{ dashboard_url }}" style="display:inline-block; font-family:'Inter', sans-serif; font-size:15px; font-weight:600; color:#ffffff; text-decoration:none; letter-spacing:0.01em;">Open Dashboard &rarr;</a>
+    </td>
+  </tr>
+</table>
+
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; text-align:left; margin-bottom:24px;">
+  <tr>
+    <td style="padding:18px 20px;">
+      <p style="margin:0 0 12px 0; font-family:'Inter', sans-serif; font-size:11px; font-weight:700; color:#0891b2; text-transform:uppercase; letter-spacing:0.06em;">
+        Account Profile
+      </p>
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="font-size:13px; line-height:22px; color:#475569;">
+        <tr><td style="padding:2px 0; color:#64748b; width:120px;">Primary Email:</td><td style="padding:2px 0; color:#0f172a; font-weight:500;">{{ email }}</td></tr>
+        {% if account_id %}<tr><td style="padding:2px 0; color:#64748b;">Account ID:</td><td style="padding:2px 0; color:#0f172a; font-weight:500;">{{ account_id }}</td></tr>{% endif %}
+        <tr><td style="padding:2px 0; color:#64748b;">Status:</td><td style="padding:2px 0; color:#16a34a; font-weight:600;">Active &amp; Verified</td></tr>
+        {% if workspace %}<tr><td style="padding:2px 0; color:#64748b;">Workspace:</td><td style="padding:2px 0; color:#0f172a; font-weight:500;">{{ workspace }}</td></tr>{% endif %}
+      </table>
+    </td>
+  </tr>
+</table>
+
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="text-align:left;">
+  <tr>
+    <td style="padding:14px; background-color:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; width:33%; vertical-align:top;">
+      <p style="margin:0; font-family:'Inter', sans-serif; font-size:13px; font-weight:600; color:#0f172a;"><a href="{{ site_url }}/docs" style="color:#0f172a; text-decoration:none;">Documentation &rarr;</a></p>
+      <p style="margin:4px 0 0 0; font-family:'Inter', sans-serif; font-size:11px; line-height:16px; color:#64748b;">Review platform guides and developer setup.</p>
+    </td>
+    <td width="10" style="width:10px;">&nbsp;</td>
+    <td style="padding:14px; background-color:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; width:33%; vertical-align:top;">
+      <p style="margin:0; font-family:'Inter', sans-serif; font-size:13px; font-weight:600; color:#0f172a;"><a href="{{ frontend_url }}/settings" style="color:#0f172a; text-decoration:none;">Settings &rarr;</a></p>
+      <p style="margin:4px 0 0 0; font-family:'Inter', sans-serif; font-size:11px; line-height:16px; color:#64748b;">Configure integrations and team access.</p>
+    </td>
+    <td width="10" style="width:10px;">&nbsp;</td>
+    <td style="padding:14px; background-color:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; width:33%; vertical-align:top;">
+      <p style="margin:0; font-family:'Inter', sans-serif; font-size:13px; font-weight:600; color:#0f172a;"><a href="{{ site_url }}/support" style="color:#0f172a; text-decoration:none;">Support &rarr;</a></p>
+      <p style="margin:4px 0 0 0; font-family:'Inter', sans-serif; font-size:11px; line-height:16px; color:#64748b;">Reach out to our customer success team.</p>
+    </td>
+  </tr>
+</table>
+{% endblock %}
+{% block footer_note %}You received this email because your account was activated on {{ company_name }}.{% endblock %}

@@ -1,5 +1,7 @@
 """HTTP endpoints for emails (mounted at /api/emails)."""
 
+from datetime import datetime
+
 from fastapi import APIRouter, Query, Request
 
 from app.common.response.schema import ResponseModel
@@ -11,14 +13,50 @@ router = APIRouter()
 
 
 @router.post("/send", response_model=ResponseModel[schema.EmailOut], status_code=202)
-async def send_email(user: CurrentUser, db: DBSession, email_in: schema.EmailCreate):
+async def send_email(user: CurrentUser, db: DBSession, email_in: schema.EmailCreate, request: Request):
     """Compose + persist + queue for async delivery via Resend."""
-    email = await service.compose_and_queue_email(db, email_in, actor_id=user.id)
+    email = await service.compose_and_queue_email(
+        db, email_in, actor_id=user.id, user_agent=request.headers.get("user-agent")
+    )
     full = await crud.get_email(db, email.id)  # eager-load documents for the response
     return ResponseModel(data=schema.EmailOut.model_validate(full), msg="Email queued")
 
 
-@router.get("", response_model=ResponseModel[list[schema.EmailOut]])
+@router.post("/send-template", response_model=ResponseModel[schema.EmailOut], status_code=202)
+async def send_template_email(user: CurrentUser, db: DBSession, body: schema.EmailTemplateSend):
+    """Render a registered template and queue it — the reusable send path."""
+    email = await service.send_template_email(
+        db,
+        body.template_name,
+        to=list(body.to),
+        context=body.context,
+        locale=body.locale,
+        cc=list(body.cc),
+        bcc=list(body.bcc),
+        email_from=body.email_from,
+        reply_to=body.reply_to,
+        emailable_type=body.emailable_type,
+        emailable_id=body.emailable_id,
+        scheduled_at=body.scheduled_at,
+        actor_id=user.id,
+    )
+    full = await crud.get_email(db, email.id)
+    return ResponseModel(data=schema.EmailOut.model_validate(full), msg="Email queued")
+
+
+@router.get("/stats", response_model=ResponseModel[schema.EmailStatsOut])
+async def email_stats(
+    _: CurrentUser,
+    db: DBSession,
+    date_from: datetime | None = Query(None, description="Inclusive lower bound (ISO 8601)"),
+    date_to: datetime | None = Query(None, description="Inclusive upper bound (ISO 8601)"),
+):
+    """Aggregate delivery/engagement analytics for a window."""
+    stats = await service.get_email_stats(db, since=date_from, until=date_to)
+    return ResponseModel(data=schema.EmailStatsOut(**stats))
+
+
+@router.get("", response_model=ResponseModel[list[schema.EmailSlimOut]])
 async def list_emails(
     _: CurrentUser,
     db: DBSession,
@@ -26,15 +64,19 @@ async def list_emails(
     recipient: str | None = Query(None, description="Matches To/CC/BCC"),
     emailable_type: str | None = Query(None),
     emailable_id: str | None = Query(None),
+    template_name: str | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
 ):
     emails = await crud.list_emails(
         db, status=status, recipient=recipient,
         emailable_type=emailable_type, emailable_id=emailable_id,
+        template_name=template_name, date_from=date_from, date_to=date_to,
         page=page, page_size=page_size,
     )
-    return ResponseModel(data=[schema.EmailOut.model_validate(e) for e in emails])
+    return ResponseModel(data=[schema.EmailSlimOut.model_validate(e) for e in emails])
 
 
 @router.get("/{email_id}", response_model=ResponseModel[schema.EmailOut])

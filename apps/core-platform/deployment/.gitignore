@@ -8,6 +8,10 @@
 config/traefik/certs/*
 !config/traefik/certs/.gitkeep
 
+# GeoIP databases (MaxMind licensing — never committed)
+config/geoip/*.mmdb
+config/geoip/*.mmdb.gz
+
 # acme-dns registration credentials
 config/traefik/acmedns/
 

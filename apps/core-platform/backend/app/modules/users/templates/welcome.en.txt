@@ -1,0 +1,16 @@
+Welcome to {{ company_name }}
+
+{% if name %}Hi {{ name }}, y{% else %}Y{% endif %}our registration is complete and your account is active.
+
+  Primary Email: {{ email }}
+{% if account_id %}  Account ID:    {{ account_id }}
+{% endif %}  Status:        Active & Verified
+{% if workspace %}  Workspace:     {{ workspace }}
+{% endif %}
+Open your dashboard: {{ dashboard_url }}
+
+Documentation: {{ site_url }}/docs
+Settings: {{ frontend_url }}/settings
+Support: {{ site_url }}/support
+
+You received this email because your account was activated on {{ company_name }}.

@@ -28,6 +28,9 @@ bcrypt>=4.2
 # --- HTTP client (single client; aiohttp removed) ---
 httpx>=0.28
 
+# --- GeoIP (request-audit location; MaxMind GeoLite2 DB not bundled) ---
+geoip2>=4.8
+
 # --- Settings & validation ---
 pydantic>=2.10,<3
 pydantic-settings>=2.7

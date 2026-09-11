@@ -21,36 +21,64 @@ from app.modules.activity.recorder import record_activity
 from app.modules.documents.crud import attach_documents_to_entity
 from app.modules.emails import crud, schema
 from app.modules.emails.model import Email, EmailEvent
+from app.modules.emails.templates import RenderedEmail, render_email
 
 logger = structlog.get_logger("app.emails")
 
 
+def _request_context() -> dict:
+    """request_id / client_ip bound by RequestContextMiddleware (contextvars)."""
+    from structlog.contextvars import get_contextvars
+
+    ctx = get_contextvars()
+    return {"request_id": ctx.get("request_id"), "source_ip": ctx.get("client_ip")}
+
+
 async def compose_and_queue_email(
-    db: AsyncSession, email_in: schema.EmailCreate, *, actor_id: int | None = None
+    db: AsyncSession,
+    email_in: schema.EmailCreate,
+    *,
+    actor_id: int | None = None,
+    rendered: RenderedEmail | None = None,
+    source_ip: str | None = None,
+    request_id: str | None = None,
+    user_agent: str | None = None,
 ) -> Email:
     all_recipients = sorted({*email_in.to, *email_in.cc, *email_in.bcc})
+    ctx = _request_context()
 
-    email = await crud.create_email(
-        db,
-        dict(
-            email_to=list(email_in.to),
-            email_cc=list(email_in.cc) or None,
-            email_bcc=list(email_in.bcc) or None,
-            all_recipients=all_recipients,
-            email_from=email_in.email_from or settings.RESEND_DEFAULT_FROM,
-            reply_to=email_in.reply_to,
-            subject=email_in.subject,
-            body_html=email_in.body_html,
-            body_text=email_in.body_text,
-            emailable_id=email_in.emailable_id,
-            emailable_type=email_in.emailable_type,
-            campaign_id=email_in.campaign_id,
-            scheduled_at=email_in.scheduled_at,
-            metadata_=email_in.metadata_,
-            status="pending",
-            max_attempts=settings.EMAIL_MAX_ATTEMPTS,
-        ),
+    values: dict = dict(
+        email_to=list(email_in.to),
+        email_cc=list(email_in.cc) or None,
+        email_bcc=list(email_in.bcc) or None,
+        all_recipients=all_recipients,
+        email_from=email_in.email_from or settings.RESEND_DEFAULT_FROM,
+        reply_to=email_in.reply_to or settings.RESEND_DEFAULT_REPLY_TO or None,
+        subject=email_in.subject,
+        body_html=email_in.body_html,
+        body_text=email_in.body_text,
+        emailable_id=email_in.emailable_id,
+        emailable_type=email_in.emailable_type,
+        campaign_id=email_in.campaign_id,
+        scheduled_at=email_in.scheduled_at,
+        metadata_=email_in.metadata_,
+        status="pending",
+        provider=settings.EMAIL_PROVIDER,
+        max_attempts=settings.EMAIL_MAX_ATTEMPTS,
+        actor_id=actor_id,
+        source_ip=source_ip if source_ip is not None else ctx.get("source_ip"),
+        request_id=request_id if request_id is not None else ctx.get("request_id"),
+        user_agent=user_agent,
     )
+    if rendered is not None:
+        values |= {
+            "template_name": rendered.template_name,
+            "template_data": rendered.context,
+            "locale": rendered.locale,
+            "body_type": "html" if rendered.html else "text",
+        }
+
+    email = await crud.create_email(db, values)
 
     # Attach existing documents; inline metadata (CID) rides on the document.
     if email_in.attachments:
@@ -69,12 +97,79 @@ async def compose_and_queue_email(
         changes={"to": list(email_in.to), "subject": email_in.subject},
     )
 
-    from app.tasks.emails import send_email  # lazy: avoid task import cycle
-
-    eta = email_in.scheduled_at if email_in.scheduled_at else None
-    send_email.apply_async(kwargs={"email_id": email.id}, eta=eta, countdown=None if eta else 2)
-    logger.info("email_queued", email_id=email.id, scheduled=bool(eta))
+    _enqueue_delivery(email, scheduled_at=email_in.scheduled_at)
+    logger.info(
+        "email_queued",
+        email_id=email.id,
+        template=rendered.template_name if rendered else None,
+        scheduled=bool(email_in.scheduled_at),
+    )
     return email
+
+
+def _enqueue_delivery(email: Email, *, scheduled_at: datetime | None = None) -> None:
+    """Hand off to the emails Celery task (lazy import avoids a cycle)."""
+    from app.tasks.emails import send_email
+
+    eta = scheduled_at or None
+    send_email.apply_async(kwargs={"email_id": email.id}, eta=eta, countdown=None if eta else 2)
+
+
+async def send_template_email(
+    db: AsyncSession,
+    template_name: str,
+    *,
+    to: list[str],
+    context: dict | None = None,
+    locale: str | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    email_from: str | None = None,
+    reply_to: str | None = None,
+    emailable_type: str | None = None,
+    emailable_id: str | None = None,
+    scheduled_at: datetime | None = None,
+    metadata: dict | None = None,
+    actor_id: int | None = None,
+    source_ip: str | None = None,
+    request_id: str | None = None,
+    user_agent: str | None = None,
+) -> Email:
+    """Reusable entry point: render a registered template, then compose+queue.
+
+    This is what feature code (auth emails, receipts, notifications) calls —
+    it never builds an HTML string itself.
+    """
+    rendered = render_email(template_name, context, locale=locale)
+    email_in = schema.EmailCreate(
+        to=to,
+        cc=cc or [],
+        bcc=bcc or [],
+        subject=rendered.subject,
+        body_html=rendered.html,
+        body_text=rendered.text,
+        email_from=email_from,
+        reply_to=reply_to,
+        emailable_type=emailable_type,
+        emailable_id=emailable_id,
+        scheduled_at=scheduled_at,
+        metadata_=metadata,
+    )
+    return await compose_and_queue_email(
+        db,
+        email_in,
+        actor_id=actor_id,
+        rendered=rendered,
+        source_ip=source_ip,
+        request_id=request_id,
+        user_agent=user_agent,
+    )
+
+
+async def get_email_stats(
+    db: AsyncSession, *, since: datetime | None = None, until: datetime | None = None
+) -> dict:
+    return await crud.email_stats(db, since=since, until=until)
 
 
 async def get_email(db: AsyncSession, email_id: int) -> Email:

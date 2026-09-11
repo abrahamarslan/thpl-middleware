@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.users.model import PasswordResetToken, User
+from app.modules.users.model import LoginOtpToken, PasswordResetToken, User
 
 
 def _base_query(include_deleted: bool = False) -> Select:
@@ -25,6 +25,12 @@ async def get_by_email(db: AsyncSession, email: str, *, include_deleted: bool = 
 
 async def get_by_username(db: AsyncSession, username: str) -> User | None:
     return await db.scalar(_base_query().where(User.username == username))
+
+
+async def get_by_phone(db: AsyncSession, phone: str, *, include_deleted: bool = False) -> User | None:
+    return await db.scalar(
+        _base_query(include_deleted).where(or_(User.phone == phone, User.contact == phone))
+    )
 
 
 async def get_by_external_id(db: AsyncSession, external_id: str) -> User | None:
@@ -122,17 +128,50 @@ async def hard_delete(db: AsyncSession, user: User) -> None:
 # ── Password reset tokens ─────────────────────────────────────────────────────
 
 async def upsert_reset_token(
-    db: AsyncSession, *, email: str, token: str, reset_type: str, code: str | None
+    db: AsyncSession,
+    *,
+    email: str,
+    token: str,
+    reset_type: str,
+    code_hash: str | None,
+    expires_at: datetime,
+    max_attempts: int,
+    request_ip: str | None = None,
 ) -> PasswordResetToken:
+    """Create or replace the single active reset row for an email.
+
+    Re-requesting resets the attempt counter (the user gets a fresh code) but
+    increments ``sent_count`` so the hourly abuse cap survives.
+    """
+    now = datetime.now(UTC)
     existing = await db.get(PasswordResetToken, email)
     if existing:
         existing.token = token
         existing.reset_type = reset_type
-        existing.code = code
-        existing.created_at = datetime.now(UTC)
+        existing.code_hash = code_hash
+        existing.attempts = 0
+        existing.max_attempts = max_attempts
+        existing.expires_at = expires_at
+        existing.consumed_at = None
+        existing.request_ip = request_ip
+        existing.sent_count = (existing.sent_count or 0) + 1
+        existing.last_sent_at = now
+        existing.created_at = existing.created_at or now
         await db.flush()
         return existing
-    row = PasswordResetToken(email=email, token=token, reset_type=reset_type, code=code)
+
+    row = PasswordResetToken(
+        email=email,
+        token=token,
+        reset_type=reset_type,
+        code_hash=code_hash,
+        expires_at=expires_at,
+        max_attempts=max_attempts,
+        request_ip=request_ip,
+        attempts=0,
+        sent_count=1,
+        last_sent_at=now,
+    )
     db.add(row)
     await db.flush()
     return row
@@ -144,6 +183,59 @@ async def get_reset_token(db: AsyncSession, email: str) -> PasswordResetToken | 
 
 async def delete_reset_token(db: AsyncSession, email: str) -> None:
     row = await db.get(PasswordResetToken, email)
+    if row:
+        await db.delete(row)
+        await db.flush()
+
+
+# ── Login OTP challenges ──────────────────────────────────────────────────────
+
+async def upsert_login_otp(
+    db: AsyncSession,
+    *,
+    email: str,
+    code_hash: str,
+    expires_at: datetime,
+    max_attempts: int,
+    request_ip: str | None = None,
+) -> LoginOtpToken:
+    """Create or replace the single active OTP challenge for an email."""
+    now = datetime.now(UTC)
+    existing = await db.get(LoginOtpToken, email)
+    if existing:
+        existing.code_hash = code_hash
+        existing.attempts = 0
+        existing.max_attempts = max_attempts
+        existing.expires_at = expires_at
+        existing.consumed_at = None
+        existing.request_ip = request_ip
+        existing.sent_count = (existing.sent_count or 0) + 1
+        existing.last_sent_at = now
+        existing.created_at = existing.created_at or now
+        await db.flush()
+        return existing
+
+    row = LoginOtpToken(
+        email=email,
+        code_hash=code_hash,
+        expires_at=expires_at,
+        max_attempts=max_attempts,
+        request_ip=request_ip,
+        attempts=0,
+        sent_count=1,
+        last_sent_at=now,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_login_otp(db: AsyncSession, email: str) -> LoginOtpToken | None:
+    return await db.get(LoginOtpToken, email)
+
+
+async def delete_login_otp(db: AsyncSession, email: str) -> None:
+    row = await db.get(LoginOtpToken, email)
     if row:
         await db.delete(row)
         await db.flush()

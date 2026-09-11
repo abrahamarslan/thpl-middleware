@@ -14,6 +14,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.modules.users.password_policy import PasswordStr
+
 GEO_FIELDS = (
     "location", "current_location", "route_points", "coordinates",
     "constituency_geometry", "sub_constituency_geometry",
@@ -246,7 +248,7 @@ class UserProfileBase(BaseModel):
 class UserCreate(UserProfileBase):
     name: str
     email: EmailStr
-    password: str = Field(min_length=8)
+    password: PasswordStr
 
 
 class UserUpdate(UserProfileBase):
@@ -269,6 +271,15 @@ class UserOut(UserProfileBase):
     last_password_change_at: datetime | None = None
     failed_login_attempts: int | None = None
     locked_at: datetime | None = None
+    # Moderation (read-only; see app/modules/users/moderation.py)
+    is_banned: bool | None = None
+    banned_at: datetime | None = None
+    banned_until: datetime | None = None
+    ban_reason: str | None = None
+    is_throttled: bool | None = None
+    throttled_at: datetime | None = None
+    throttled_until: datetime | None = None
+    throttle_reason: str | None = None
     created_by: int | None = None
     updated_by: int | None = None
     deleted_by: int | None = None
@@ -301,7 +312,7 @@ class UserListFilters(BaseModel):
 class RegisterRequest(BaseModel):
     name: str
     email: EmailStr
-    password: str = Field(min_length=8)
+    password: PasswordStr
     username: str | None = None
     phone: str | None = None
 
@@ -326,15 +337,77 @@ class RefreshRequest(BaseModel):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
-    new_password: str = Field(min_length=8)
+    new_password: PasswordStr
 
 
 class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
+    identifier: str = Field(
+        min_length=3, max_length=255, description="Account email, username or phone number"
+    )
     reset_type: str = Field(default="code", pattern="^(link|code)$")
 
 
 class ResetPasswordRequest(BaseModel):
-    email: EmailStr
-    token_or_code: str
-    new_password: str = Field(min_length=8)
+    identifier: str = Field(min_length=3, max_length=255)
+    token_or_code: str = Field(min_length=3, max_length=255, description="The emailed code or link token")
+    new_password: PasswordStr
+
+
+class LoginOtpRequest(BaseModel):
+    identifier: str = Field(
+        min_length=3, max_length=255, description="Account email, username or phone number"
+    )
+
+
+class LoginOtpVerifyRequest(BaseModel):
+    identifier: str = Field(min_length=3, max_length=255)
+    code: str = Field(min_length=4, max_length=10)
+    device_id: str | None = None
+    device_type: str | None = None
+
+
+class PasswordPolicyOut(BaseModel):
+    """The active password rules, for client-side pre-validation/hints."""
+
+    min_length: int
+    max_length: int
+    require_uppercase: bool
+    require_lowercase: bool
+    require_digit: bool
+    require_special: bool
+    min_unique_chars: int
+    disallow_common: bool
+    disallow_user_info: bool
+
+
+# ── Moderation schemas ────────────────────────────────────────────────────────
+
+class BanRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    until: datetime | None = Field(
+        default=None, description="Ban expiry (UTC). Omit for a permanent ban."
+    )
+
+
+class ThrottleRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    until: datetime | None = Field(
+        default=None, description="Throttle expiry (UTC). Omit to hold until lifted."
+    )
+
+
+class ModerationOut(BaseModel):
+    """Current moderation state of a user (see `moderation.moderation_state`)."""
+
+    state: str
+    is_banned: bool
+    ban_reason: str | None = None
+    banned_at: datetime | None = None
+    banned_until: datetime | None = None
+    is_throttled: bool
+    throttle_reason: str | None = None
+    throttled_at: datetime | None = None
+    throttled_until: datetime | None = None
+    is_locked: bool
+    locked_at: datetime | None = None
+    is_deactivated: bool

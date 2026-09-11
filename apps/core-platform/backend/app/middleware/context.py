@@ -15,6 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.common.client_info import client_ip_from_request
 from app.core.conf import settings
 
 access_logger = structlog.get_logger("app.access")
@@ -28,7 +29,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(
             request_id=request_id,
-            client_ip=request.client.host if request.client else None,
+            client_ip=client_ip_from_request(request),
         )
 
         start = time.perf_counter()

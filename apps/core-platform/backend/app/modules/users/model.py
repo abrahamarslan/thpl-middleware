@@ -75,6 +75,20 @@ class User(Base):
     deactivation_reason = mapped_column(Text, nullable=True, comment="Reason provided for account deactivation")
     confirmation_status = mapped_column(SmallInteger, nullable=True, default=0, comment="Confirmation status (0 = Not Confirmed, 1 = Confirmed)")
 
+    # == Moderation: ban (hard) & throttle (soft) ==
+    # `is_deactivated` is account lifecycle; these are policy/abuse controls.
+    # `*_until = NULL` means the restriction is permanent until lifted by an admin.
+    is_banned = mapped_column(Boolean, nullable=True, default=False, comment="Hard ban: cannot authenticate or use the API")
+    ban_reason = mapped_column(Text, nullable=True, comment="Why the account was banned")
+    banned_at = mapped_column(DateTime(timezone=True), nullable=True, comment="When the ban was applied")
+    banned_until = mapped_column(DateTime(timezone=True), nullable=True, comment="Ban expiry (NULL = permanent)")
+    banned_by = mapped_column(BigInteger, nullable=True, comment="Actor user id that applied the ban")
+    is_throttled = mapped_column(Boolean, nullable=True, default=False, comment="Soft restriction: new auth attempts are rate-limited")
+    throttle_reason = mapped_column(Text, nullable=True, comment="Why the account was throttled")
+    throttled_at = mapped_column(DateTime(timezone=True), nullable=True, comment="When the throttle was applied")
+    throttled_until = mapped_column(DateTime(timezone=True), nullable=True, comment="Throttle expiry (NULL = until lifted)")
+    throttled_by = mapped_column(BigInteger, nullable=True, comment="Actor user id that applied the throttle")
+
     # == Contact Information ==
     phone = mapped_column(String(255), nullable=True, comment="Primary phone number of the user")
     contact = mapped_column(String(50), nullable=True, comment="Alternative or secondary contact number/method")
@@ -302,6 +316,8 @@ class User(Base):
         Index("users_updated_by_index", "updated_by"),
         Index("users_deleted_by_index", "deleted_by"),
         Index("users_deleted_at_index", "deleted_at"),
+        Index("ix_users_is_banned", "is_banned"),
+        Index("ix_users_is_throttled", "is_throttled"),
     )
 
     @property
@@ -310,16 +326,51 @@ class User(Base):
 
     @property
     def is_active(self) -> bool:
-        return self.deleted_at is None and not self.is_deactivated
+        return self.deleted_at is None and not self.is_deactivated and not self.is_banned
 
 
 class PasswordResetToken(Base):
-    """Port of Laravel's password_reset_tokens table (first-party resets)."""
+    """Port of Laravel's password_reset_tokens table, hardened for OTP resets.
+
+    One *active* reset per email (email is the PK). The one-time code is stored
+    only as a keyed HMAC (``code_hash``); the high-entropy ``token`` backs the
+    link flow. Expiry, attempt cap, resend cooldown and send-count are all on
+    the row so brute-forcing a 4-digit code is bounded by data, not by luck.
+    """
 
     __tablename__ = "password_reset_tokens"
 
     email: Mapped[str] = mapped_column(String(255), primary_key=True)
-    token: Mapped[str] = mapped_column(String(255))
-    reset_type: Mapped[str] = mapped_column(String(255), default="link", comment="'link' or 'code'")
-    code = mapped_column(String(10), nullable=True)
+    token: Mapped[str] = mapped_column(String(255), comment="High-entropy token for the link flow")
+    reset_type: Mapped[str] = mapped_column(String(255), default="code", comment="'link' or 'code'")
+    code_hash: Mapped[str | None] = mapped_column(String(255), comment="HMAC-SHA256 of the one-time code")
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, nullable=False, server_default="5")
+    sent_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    request_ip: Mapped[str | None] = mapped_column(String(45))
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at = mapped_column(DateTime(timezone=True), nullable=True, default=_utcnow)
+
+
+class LoginOtpToken(Base):
+    """One-time login code challenge (passwordless email OTP).
+
+    One active challenge per email. The code is stored only as a keyed HMAC;
+    expiry, attempt cap, resend cooldown and send-count live on the row so a
+    6-digit code is bounded by data, not by luck.
+    """
+
+    __tablename__ = "login_otp_tokens"
+
+    email: Mapped[str] = mapped_column(String(255), primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(255), comment="HMAC-SHA256 of the one-time code")
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, nullable=False, server_default="5")
+    sent_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    request_ip: Mapped[str | None] = mapped_column(String(45))
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at = mapped_column(DateTime(timezone=True), nullable=True, default=_utcnow)

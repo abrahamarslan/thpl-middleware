@@ -42,6 +42,9 @@ _TEST_TABLES = (
     "email_events",
     "email_links",
     "emails",
+    "password_reset_tokens",
+    "login_otp_tokens",
+    "activity_logs",
     "documents",
     "media",
 )

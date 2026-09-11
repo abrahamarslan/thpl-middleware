@@ -33,6 +33,13 @@ class ForbiddenError(AppError):
     code = "forbidden"
 
 
+class RateLimitedError(AppError):
+    """The caller is temporarily restricted (e.g. an account throttle). 429."""
+
+    status_code = 429
+    code = "rate_limited"
+
+
 class ConflictError(AppError):
     status_code = 409
     code = "conflict"

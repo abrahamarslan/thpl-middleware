@@ -17,12 +17,12 @@ from typing import Annotated
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials
 
-from app.common.exception.errors import AuthError, ForbiddenError
+from app.common.exception.errors import AuthError
 from app.common.security.authentik import decode_authentik_token, looks_like_authentik_token
 from app.common.security.jwt import bearer_scheme, decode_token
 from app.core.conf import settings
 from app.database.db import DBSession
-from app.modules.users import crud, service
+from app.modules.users import crud, moderation, service
 from app.modules.users.model import User
 
 
@@ -46,8 +46,7 @@ async def get_current_user(
     user = await crud.get_by_id(db, user_id)
     if user is None:
         raise AuthError("User no longer exists")
-    if user.is_deactivated or user.deleted_at is not None:
-        raise ForbiddenError("Account is deactivated")
+    moderation.ensure_can_use_api(user)
     return user
 
 

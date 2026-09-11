@@ -52,7 +52,7 @@ class SyncResult(str, Enum):
 
 # Local field names that, when changed, require a profile push to Authentik.
 AUTHENTIK_SYNCED_FIELDS: frozenset[str] = frozenset(
-    {"username", "first_name", "last_name", "name", "email", "phone", "is_deactivated"}
+    {"username", "first_name", "last_name", "name", "email", "phone", "is_deactivated", "is_banned"}
 )
 
 
@@ -76,7 +76,14 @@ def _authentik_attributes(user: User) -> dict:
 
 
 def _is_active(user: User) -> bool:
-    return not bool(user.is_deactivated) and user.deleted_at is None
+    if user.is_deactivated or user.deleted_at is not None:
+        return False
+    if user.is_banned:
+        # An expired temporary ban is no longer in force.
+        if user.banned_until is not None and datetime.now(UTC) >= user.banned_until:
+            return True
+        return False
+    return True
 
 
 def _mark(user: User, status: str, error: str | None = None) -> None:
@@ -106,7 +113,7 @@ def _profile_patch(user: User, changed_fields: set[str]) -> dict:
         patch["email"] = user.email
     if "phone" in changed_fields:
         patch["attributes"] = _authentik_attributes(user)
-    if "is_deactivated" in changed_fields:
+    if "is_deactivated" in changed_fields or "is_banned" in changed_fields:
         patch["is_active"] = _is_active(user)
     return patch
 

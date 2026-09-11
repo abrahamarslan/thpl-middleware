@@ -9,7 +9,7 @@
   "plugin.name": "pgoutput",
   "slot.name": "zoho_mirror",
   "publication.autocreate.mode": "filtered",
-  "table.include.list": "public.zoho_contacts,public.zoho_items,public.zoho_organizations,public.zoho_sync_stats,public.zoho_queue_logs",
+  "table.include.list": "public.zoho_contacts,public.zoho_items,public.zoho_organizations,public.zoho_sync_stats,public.zoho_queue_logs,public.email_events,public.email_links",
   "snapshot.mode": "initial",
   "tombstones.on.delete": "false",
   "decimal.handling.mode": "double",

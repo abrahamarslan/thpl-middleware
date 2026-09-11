@@ -26,6 +26,8 @@ th-middleware/
 | `docs/PROJECT_STRUCTURE.md` | This file. |
 | `docs/ZOHO_SYNC_ENGINE.md` | **The MDM sync engine**: hierarchical config, strategies (full/incremental/index), N+1 handling, nested-entity routing, outbox, observability, add-a-module recipe. |
 | `docs/MODULES.md` | Cross-cutting modules: soft delete, tags, documents attachments, media, emails, favorites collections, search (CDC→Meilisearch), circuit breaker. |
+| `docs/modules/email-module-documentation.md` | **The email module**: provider adapter + registry, Jinja2 templates, compose/template send paths, delivery/retries, webhooks, provenance + analytics, config reference, ops runbook and extension recipes. |
+| `docs/modules/auth-module-documentation.md` | **The auth surface**: endpoint reference, password/OTP login + registration + reset flows, identifier resolution, password policy, one-time-code security model, request audit (IP/device/GeoIP), auth emails, config and runbook. |
 | `docs/zoho-module-implementation-guide.md` | Step-by-step: build a Zoho module (API → local Postgres → Debezium → ClickHouse). |
 | `docs/modules-to-implement/*.md` | The original module specs the implementations in MODULES.md were built from. |
 | `docs/AUTHENTIK_SYNC.md` | Outbound user sync (app → Authentik): architecture, field/ID mapping, lifecycle map, one-time Authentik setup, backfill, ops queries. |
@@ -104,6 +106,8 @@ Configuration precedence: code defaults → `config/logging/logging.yaml` → `e
 | `security/jwt.py` | First-party PyJWT helpers: HS256 access **and refresh** tokens (`create_access_token`, `create_refresh_token`, `decode_token` with type checking). |
 | `security/authentik.py` | Authentik OIDC validation (**inbound**): fetches the provider's JWKS (cached), verifies RS256 tokens (issuer/audience), used by the `CurrentUser` dependency for SSO logins. |
 | `security/authentik_client.py` | Authentik admin API client (**outbound**, app → Authentik): async wrapper over `/api/v3/core/users/` using a service-account bearer token (create / update / set_password / set_active / delete / find_by_email). Raises `AuthentikError` (→ 502). See [docs/AUTHENTIK_SYNC.md](AUTHENTIK_SYNC.md). |
+| `geoip.py` | MaxMind GeoLite2 lookups (`GeoLocation`, `lookup_ip`, `is_public_ip`) with graceful degradation — the DB is not bundled, and lookups are skipped for private/reserved IPs and when disabled. |
+| `client_info.py` | Request audit context: `ClientInfo` + `ClientInfoDep` dependency (IP via `X-Forwarded-For`/`X-Real-IP`, device parsed from the User-Agent, GeoIP location, `format_utc`). Used by every auth entry point and shared with the request-logging middleware. |
 
 #### `app/database/`
 
@@ -160,13 +164,21 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 
 | File | Purpose / usage |
 |---|---|
-| `users/model.py` | `User` (200+ columns: identity, 2FA, status, personal/family, professional, company, preferences, textual + geospatial location, tracking metadata, integration IDs incl. **Authentik mirror state** `authentik_pk`/`authentik_sync_status`/`authentik_sync_error`/`authentik_synced_at`, targets, login tracking, audit, soft deletes) and `PasswordResetToken`. Geography columns get GIST indexes automatically. |
-| `users/schema.py` | `UserProfileBase` (every editable field), `UserCreate`/`UserUpdate`/`UserOut` (secrets excluded; geography as WKT strings), `UserListFilters`, auth schemas (login/register/refresh/password flows). |
-| `users/crud.py` | Lookups (id/email/username/external_id), filtered + paginated list, create/update, soft-delete/restore/hard-delete, reset-token storage. |
-| `users/service.py` | Registration, login with lockout (5 fails → 15 min), token pair issuance/refresh, change/forgot/reset password, **Authentik JIT provisioning** (inbound; `external_id` ← OIDC `sub`), full CRUD lifecycle with WKT→PostGIS conversion. After every local write it calls the **outbound Authentik sync** layer and enqueues a retry task on failure. |
+| `users/model.py` | `User` (200+ columns: identity, 2FA, status, personal/family, professional, company, preferences, textual + geospatial location, tracking metadata, integration IDs incl. **Authentik mirror state**, targets, login tracking, audit, soft deletes), `PasswordResetToken` (hardened one-time-code row: keyed `code_hash`, attempt cap, expiry, send-count/cooldown) and `LoginOtpToken` (passwordless email OTP challenge). Geography columns get GIST indexes automatically. |
+| `users/schema.py` | `UserProfileBase` (every editable field), `UserCreate`/`UserUpdate`/`UserOut` (secrets excluded; geography as WKT strings), `UserListFilters`, auth schemas (login, **login-OTP**, register, refresh, password flows; password fields use the policy `PasswordStr` type; reset/OTP take a single `identifier`). |
+| `users/crud.py` | Lookups (id/email/username/**phone**/external_id), filtered + paginated list, create/update, soft-delete/restore/hard-delete, reset-token + login-OTP storage. |
+| `users/identifiers.py` | Resolves an auth `identifier` (email \| username \| phone) to a user, shape-driven with a username fallback. |
+| `users/security.py` | Password hashing (bcrypt) + one-time code hashing (keyed HMAC-SHA256, never plaintext) and numeric code generation. |
+| `users/tokens.py` | Shared first-party token-pair issuance (`issue_token_pair`) used by password and OTP login. |
+| `users/password_policy.py` | Configurable password policy (min/max length, character classes, unique chars, common-password denylist, no user info) — one validator reused by register/create/change/reset; `PasswordStr` Pydantic type + `validate_password` service entry point. |
+| `users/password_reset.py` | Password-reset feature: 4-digit code (configurable) and link flows, identifier resolution, HMAC-at-rest, attempt cap, expiry, resend cooldown/hourly cap, uniform "sent" response, confirmation email on success. |
+| `users/login_otp.py` | Passwordless **email OTP login**: request (6-digit, HMAC-at-rest, throttled) and verify (issues tokens, clears lockout, records activity). |
+| `users/auth_emails.py` | Auth transactional emails (typed Pydantic contexts) sent through the reusable email layer: welcome, login OTP, password reset code/link, password changed. Templates live in `users/templates/`. |
+| `users/templates/` | Auth email HTML/text templates (Jinja2) extending the shared `_base.en.html` shell. |
+| `users/service.py` | Registration (+ welcome email), login with lockout, token pair issuance/refresh, change password, **password reset** (delegates to `password_reset`), **Authentik JIT provisioning**, full CRUD lifecycle with WKT→PostGIS conversion. |
 | `users/authentik_sync.py` | **Outbound sync orchestration** (app → Authentik): `sync_create/update_profile/set_password/set_active/delete`, local→Authentik field mapping, `SyncResult` enum, `AUTHENTIK_SYNCED_FIELDS`. Best-effort — never raises into the request. See [docs/AUTHENTIK_SYNC.md](AUTHENTIK_SYNC.md). |
 | `users/deps.py` | `CurrentUser` dependency: accepts Authentik RS256 **or** first-party HS256 tokens, resolves/provisions the DB user, rejects deactivated accounts. Used by every protected endpoint. |
-| `users/api.py` | `/api/auth/*` (register, login, refresh, me, change/forgot/reset-password, dev-token) and `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore). |
+| `users/api.py` | `/api/auth/*` (register, login, **login-otp/request**, **login-otp/verify**, refresh, me, password-policy, change/forgot/reset-password, dev-token) and `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore). All auth entry points resolve request IP/device/GeoIP audit context. |
 | `documents/api.py` | `POST /api/documents/render` → enqueues Celery PDF task, returns `202 + task_id`; `GET /render/{task_id}` polls status. |
 | `documents/service.py` | `render_html_to_pdf()` — calls Gotenberg over the isolated `app-pdf` network, stores output in the shared media volume. Sync by design: PDF work belongs in workers. |
 | `documents/schema.py` | Render request / task status schemas. |
@@ -217,7 +229,7 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `tags/` | Multilingual polymorphic tags: `tags` + `taggables` pivot, `HasTagsMixin` (viewonly, selectinload-friendly), replace-set `/api/tags/sync`. |
 | `documents/model.py` + `mixins.py` + `crud.py` | Polymorphic attachments (UUID PK, `documentable_*`), `HasDocumentsMixin`, attach/register/list endpoints alongside the existing Gotenberg render API. Presentation via Pydantic `@computed_field` — no `*_formatted` columns. |
 | `media/` | Spatie-style galleries: `media` table + `HasMediaMixin` (`lazy="raise_on_sql"` N+1 firewall), storage strategy (local/S3), declarative `__media_conversions__` produced by Celery/Pillow. |
-| `emails/` | Resend transactional email: `emails`/`email_events`/`email_links`, compose-and-queue service, svix-verified webhook sink building the delivered→opened→clicked timeline. |
+| `emails/` | Reusable transactional email: `provider.py` (provider-neutral `OutboundEmail`/`ProviderResult` + registry, Resend adapter), `templates.py` (Jinja2 registry spanning **per-module template directories** + required-context validation), `emails`/`email_events`/`email_links` models with sender provenance (`actor_id`/`source_ip`/`request_id`), compose/template-send service, svix-verified webhook sink building the delivered→opened→clicked timeline, and a `/stats` analytics aggregate. Auth templates live in `users/templates/`. |
 | `search/indexer.py` | Standalone CDC consumer (compose service `search-indexer`, **FastStream** on aiokafka): Kafka `zoho-mirror.public.*` → Meilisearch. One batch subscriber per topic, `AckPolicy.ACK` (at-least-once), delete/soft-delete aware; bootstraps index settings on startup; OTel consumer spans via `KafkaTelemetryMiddleware`. Runs `python -m app.modules.search.indexer`. |
 | `search/registry.py` | `SearchableEntity` registry — THE place a table becomes searchable: model + Out schema + Meilisearch searchable/filterable/sortable attributes; `ensure_index_settings()` pushes them idempotently. |
 | `search/builder.py` | `ScoutBuilder` — Meilisearch relevance + Postgres hydration with preserved ordering. |
@@ -229,7 +241,7 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 |---|---|
 | `celery_app.py` | The Celery application: Redis broker/backend, reliability settings (`acks_late`, prefetch 1), queue routing (`integrations`, `documents`, `default`), Beat schedule (incl. the sync-engine dispatcher + weekly full sync), events for Flower/exporter, structlog + OTel wiring via signals. |
 | `zoho_sync.py` | **Sync-engine drivers**: `sync_module`, `fetch_detail` (N+1 fan-out), `push_outbound` (outbox executor), `sync_all_due` (config-driven beat dispatcher). Async-in-Celery via throwaway NullPool engines. Queue: `integrations`. |
-| `emails.py` | `send_email` — Resend delivery with attachment loading and row-driven retry accounting. Queue: `integrations`. |
+| `emails.py` | `send_email` — delivery via the provider adapter (`emails/provider.py`) with attachment loading, `EMAIL_ENABLED`/`EMAIL_LOG_ONLY` switches, and row-driven retry accounting. Queue: `integrations`. |
 | `media.py` | `generate_conversions` — Pillow resizes declared by `__media_conversions__`. Queue: `documents`. |
 | `zoho.py` | `sync_items` / `sync_contacts` tasks — paginate via `zoho_sync_client`, outer autoretry with backoff for prolonged outages. Queue: `integrations`. |
 | `documents.py` | `generate_pdf` task — Gotenberg rendering. Queue: `documents`. |
@@ -245,6 +257,9 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `zoho_sync/` | Sync-engine suite: config merging, mapper/transforms, engine strategies + N+1 + identity matching (FakeZohoClient + real Postgres), outbox flows, organizations module. |
 | `test_circuit_breaker.py` | Sliding-window breaker states, rates, half-open probe (real Redis). |
 | `test_soft_delete.py` / `test_tags.py` / `test_emails_webhook.py` | Global filter + partial unique indexes; tag pivot + UUID-PK eager loads; Resend webhook lifecycle. |
+| `test_emails_templates.py` / `test_password_policy.py` | Hermetic: template registry/required-context + provider payload shape; configurable password-policy rules. |
+| `test_auth_emails.py` | Hermetic: auth template rendering, User-Agent parsing, `format_utc`, client-info/IP extraction, GeoIP no-op behavior. |
+| `test_password_reset.py` / `test_login_otp.py` | Integration: reset/OTP codes hashed-at-rest, identifier resolution, cooldown, attempt cap, expiry, single-use (auth-email sends patched at the module boundary). |
 | `test_authentik_sync.py` | Outbound Authentik field mapping. |
 
 Dev helper dot-scripts in `backend/`: `.setup_venv.sh` (venv + deps),

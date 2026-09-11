@@ -1,19 +1,18 @@
 """Email delivery tasks (queue: integrations — outbound HTTP like Zoho).
 
-The worker owns everything slow: loading attachments, base64 encoding, the
-Resend HTTP call, and retry pacing. Retries are DB-driven (attempts /
-max_attempts on the row) layered under Celery's backoff — the email row is
-always the source of truth for its own state.
+The worker owns everything slow: loading attachments, the provider HTTP call,
+and retry pacing. It speaks only to the provider-neutral layer
+(``app/modules/emails/provider.py``) — no provider payload shapes live here.
+Retries are DB-driven (attempts / max_attempts on the row) layered under
+Celery's backoff; the email row is always the source of truth for its state.
 
 Async-in-Celery: same _run pattern as app/tasks/zoho_sync.py (asyncpg-only
 stack; throwaway NullPool engine per task).
 """
 
 import asyncio
-import base64
 from datetime import UTC, datetime
 
-import httpx
 import structlog
 from celery import shared_task
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -24,8 +23,8 @@ from app.core.conf import settings
 logger = structlog.get_logger("app.tasks.emails")
 
 
-async def _load_attachments(db, email) -> list[dict]:
-    """Documents -> Resend attachment dicts (base64 content).
+async def _load_attachments(db, email) -> list:
+    """Documents -> provider-neutral ``EmailAttachment`` objects (raw bytes).
 
     Local-disk backed documents are read directly; S3 documents are skipped
     with a loud log until the S3 client lands (attachment metadata carries
@@ -34,6 +33,7 @@ async def _load_attachments(db, email) -> list[dict]:
     from sqlalchemy import select
 
     from app.modules.documents.model import Document
+    from app.modules.emails.provider import EmailAttachment
 
     docs = (
         await db.scalars(
@@ -44,7 +44,7 @@ async def _load_attachments(db, email) -> list[dict]:
         )
     ).all()
 
-    attachments: list[dict] = []
+    attachments: list[EmailAttachment] = []
     for doc in docs:
         content: bytes | None = None
         meta = doc.metadata_ or {}
@@ -58,16 +58,20 @@ async def _load_attachments(db, email) -> list[dict]:
             logger.warning("email_attachment_s3_skipped", document_id=str(doc.id), s3_key=doc.s3_key)
         if content is None:
             continue
-        att = {"filename": doc.file_name, "content": base64.b64encode(content).decode()}
-        if meta.get("is_inline") and meta.get("content_id"):
-            att["content_id"] = meta["content_id"]
-        attachments.append(att)
+        attachments.append(
+            EmailAttachment(
+                filename=doc.file_name,
+                content=content,
+                content_id=meta.get("content_id") if meta.get("is_inline") else None,
+            )
+        )
     return attachments
 
 
 @shared_task(bind=True, name="app.tasks.emails.send_email", max_retries=5)
 def send_email(self, email_id: int) -> dict:
     from app.modules.emails.model import Email
+    from app.modules.emails.provider import get_email_provider
 
     async def work() -> dict:
         engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
@@ -80,39 +84,41 @@ def send_email(self, email_id: int) -> dict:
                 if email.status not in ("pending", "queued"):
                     return {"status": "already_processed", "current": email.status}
 
+                # Master switch: record the intent, never touch the network.
+                if not settings.EMAIL_ENABLED:
+                    email.push_status("suppressed", "outbound email disabled (EMAIL_ENABLED=false)")
+                    await db.commit()
+                    logger.warning("email_suppressed_disabled", email_id=email_id)
+                    return {"status": "suppressed"}
+
                 email.push_status("processing")
                 email.attempts = (email.attempts or 0) + 1
                 await db.commit()
 
-                payload: dict = {
-                    "from": email.email_from,
-                    "to": email.email_to,
-                    "subject": email.subject,
-                }
-                if email.body_html:
-                    payload["html"] = email.body_html
-                if email.body_text:
-                    payload["text"] = email.body_text
-                if email.email_cc:
-                    payload["cc"] = email.email_cc
-                if email.email_bcc:
-                    payload["bcc"] = email.email_bcc
-                if email.reply_to:
-                    payload["reply_to"] = email.reply_to
+                # Dev: persist + mark sent without a provider call (no key/network).
+                if settings.EMAIL_LOG_ONLY:
+                    email.push_status("sent", "EMAIL_LOG_ONLY=true (not delivered)")
+                    email.sent_at = datetime.now(UTC)
+                    await db.commit()
+                    logger.info("email_log_only", email_id=email_id)
+                    return {"status": "sent", "log_only": True}
 
-                attachments = await _load_attachments(db, email)
-                if attachments:
-                    payload["attachments"] = attachments
+                from app.modules.emails.provider import OutboundEmail
+
+                message = OutboundEmail(
+                    to=email.email_to or [],
+                    cc=email.email_cc or [],
+                    bcc=email.email_bcc or [],
+                    sender=email.email_from,
+                    reply_to=email.reply_to,
+                    subject=email.subject or "",
+                    html=email.body_html,
+                    text=email.body_text,
+                )
+                message.attachments = await _load_attachments(db, email)
 
                 try:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.post(
-                            settings.RESEND_API_URL,
-                            json=payload,
-                            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
-                        )
-                    resp.raise_for_status()
-                    data = resp.json()
+                    result = await get_email_provider().send(message)
                 except Exception as e:  # noqa: BLE001 — classified below
                     email.error_message = str(e)[:2000]
                     if (email.attempts or 0) >= (email.max_attempts or settings.EMAIL_MAX_ATTEMPTS):
@@ -126,13 +132,14 @@ def send_email(self, email_id: int) -> dict:
                     return {"status": "retry", "error": str(e)[:200]}
 
                 email.push_status("sent")
-                email.provider_message_id = data.get("id")
-                email.provider_response = data
+                email.provider = result.provider
+                email.provider_message_id = result.message_id
+                email.provider_response = result.raw
                 email.sent_at = datetime.now(UTC)
                 email.error_message = None
                 await db.commit()
-                logger.info("email_sent", email_id=email_id, provider_message_id=data.get("id"))
-                return {"status": "sent", "provider_message_id": data.get("id")}
+                logger.info("email_sent", email_id=email_id, provider_message_id=result.message_id)
+                return {"status": "sent", "provider_message_id": result.message_id}
         finally:
             await engine.dispose()
 
@@ -140,6 +147,10 @@ def send_email(self, email_id: int) -> dict:
     if out.get("status") == "missing":
         raise self.retry(countdown=10)  # enqueued before the compose txn committed
     if out.get("status") == "retry":
-        # Exponential pacing: 1 min, 5 min, 15 min, ...
-        raise self.retry(countdown=min(60 * (5 ** self.request.retries), 900))
+        # Exponential pacing: base, 2x, 4x, … capped.
+        backoff = min(
+            settings.EMAIL_RETRY_BASE_SECONDS * (2 ** self.request.retries),
+            settings.EMAIL_RETRY_MAX_BACKOFF_SECONDS,
+        )
+        raise self.retry(countdown=backoff)
     return out

@@ -175,12 +175,72 @@ class Settings(BaseSettings):
     ZOHO_SYNC_WAIT_BETWEEN_CALLS: float = 0.0 # pacing for inline N+1 detail calls
     ZOHO_SYNC_RETRY_LIMIT: int = 5
 
-    # --- Email (Resend) ---
+    # --- Email (Resend) — the reusable transactional-email layer ---
+    # Provider adapters live in app/modules/emails/provider.py (registry key =
+    # EMAIL_PROVIDER); templates in app/modules/emails/templates.py + templates/.
+    EMAIL_PROVIDER: str = "resend"             # adapter registry key
+    EMAIL_ENABLED: bool = True                 # master outbound switch (off => "suppressed" rows)
+    EMAIL_LOG_ONLY: bool = False               # dev: persist + mark sent WITHOUT calling the provider
     RESEND_API_KEY: str = ""
     RESEND_API_URL: str = "https://api.resend.com/emails"
     RESEND_DEFAULT_FROM: str = "Core Platform <noreply@example.com>"
+    RESEND_DEFAULT_REPLY_TO: str = ""
     RESEND_WEBHOOK_SECRET: str = ""           # svix signing secret (empty = skip verification, dev only)
     EMAIL_MAX_ATTEMPTS: int = 3
+    EMAIL_RETRY_BASE_SECONDS: int = 60        # exponential backoff base (1m, 2m, 4m …)
+    EMAIL_RETRY_MAX_BACKOFF_SECONDS: int = 900
+    EMAIL_TIMEOUT_SECONDS: float = 30.0       # per-request provider HTTP timeout
+    EMAIL_TEMPLATE_DIR: str = "app/modules/emails/templates"
+    EMAIL_DEFAULT_LOCALE: str = "en"
+    EMAIL_COMPANY_NAME: str = "Tarrina Health"
+    EMAIL_SUPPORT_EMAIL: str = "tech@tarrinahealth.com"
+    EMAIL_SITE_URL: str = "https://tarrinahealth.com"
+    EMAIL_COMPANY_ADDRESS: str = (
+        "iHub, Gujarat Knowledge Consortium, Navrangpura — 380009, Ahmedabad, Gujarat, India"
+    )
+    # Base URL the SPA is served from — used to build action links in emails.
+    FRONTEND_URL: str = "http://localhost:5173"
+
+    # --- GeoIP (MaxMind GeoLite2) — request audit info for auth emails/logs ---
+    # Disabled by default: no DB is bundled (MaxMind licensing). Mount the .mmdb
+    # read-only and point GEOIP_CITY_DB_PATH / GEOIP_COUNTRY_DB_PATH at it.
+    GEOIP_ENABLED: bool = False
+    GEOIP_CITY_DB_PATH: str = ""       # e.g. /app/geoip/GeoLite2-City.mmdb
+    GEOIP_COUNTRY_DB_PATH: str = ""    # e.g. /app/geoip/GeoLite2-Country.mmdb
+
+    # --- Password policy (app/modules/users/password_policy.py) ---
+    # One validator, reused by register / admin-create / change-password /
+    # reset-password; flipping a flag here changes all four together.
+    PASSWORD_MIN_LENGTH: int = 8
+    PASSWORD_MAX_LENGTH: int = 128
+    PASSWORD_REQUIRE_UPPERCASE: bool = True
+    PASSWORD_REQUIRE_LOWERCASE: bool = True
+    PASSWORD_REQUIRE_DIGIT: bool = True
+    PASSWORD_REQUIRE_SPECIAL: bool = False
+    # Explicit accepted special-char set; empty means "any non-alphanumeric".
+    # If set via .env, single-quote it (shell sources that file).
+    PASSWORD_SPECIAL_CHARS: str = ""
+    PASSWORD_MIN_UNIQUE_CHARS: int = 4
+    PASSWORD_DISALLOW_COMMON: bool = True
+    PASSWORD_DISALLOW_USER_INFO: bool = True
+    PASSWORD_BCRYPT_ROUNDS: int = 12
+
+    # --- Password reset (4-digit code by default; see users/password_reset.py) ---
+    PASSWORD_RESET_CODE_LENGTH: int = 4
+    PASSWORD_RESET_CODE_TTL_MINUTES: int = 10   # short — a 4-digit code is low entropy
+    PASSWORD_RESET_LINK_TTL_MINUTES: int = 60
+    PASSWORD_RESET_MAX_ATTEMPTS: int = 3
+    PASSWORD_RESET_RESEND_COOLDOWN_SECONDS: int = 60
+    PASSWORD_RESET_MAX_PER_HOUR: int = 5
+    # Keyed hash for one-time codes at rest; falls back to JWT_SECRET_KEY.
+    PASSWORD_RESET_HMAC_KEY: str = ""
+
+    # --- Login OTP (passwordless email OTP; users/login_otp.py) ---
+    LOGIN_OTP_CODE_LENGTH: int = 6
+    LOGIN_OTP_TTL_MINUTES: int = 15
+    LOGIN_OTP_MAX_ATTEMPTS: int = 5
+    LOGIN_OTP_RESEND_COOLDOWN_SECONDS: int = 60
+    LOGIN_OTP_MAX_PER_HOUR: int = 5
 
     # --- MeiliSearch (queries from the API; indexing via the CDC indexer) ---
     MEILISEARCH_URL: str = "http://meilisearch:7700"
