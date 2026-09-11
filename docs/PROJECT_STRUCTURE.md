@@ -172,13 +172,15 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `users/tokens.py` | Shared first-party token-pair issuance (`issue_token_pair`) used by password and OTP login. |
 | `users/password_policy.py` | Configurable password policy (min/max length, character classes, unique chars, common-password denylist, no user info) — one validator reused by register/create/change/reset; `PasswordStr` Pydantic type + `validate_password` service entry point. |
 | `users/password_reset.py` | Password-reset feature: 4-digit code (configurable) and link flows, identifier resolution, HMAC-at-rest, attempt cap, expiry, resend cooldown/hourly cap, uniform "sent" response, confirmation email on success. |
-| `users/login_otp.py` | Passwordless **email OTP login**: request (6-digit, HMAC-at-rest, throttled) and verify (issues tokens, clears lockout, records activity). |
+| `users/login_otp.py` | Passwordless **email OTP login**: request (6-digit, HMAC-at-rest, throttled) and verify (issues tokens, records activity). |
+| `users/moderation.py` | **Ban/unban** (hard, permanent or time-boxed) and **throttle/unthrottle** (soft): pure predicates + session/auth guards, async mutators that record activity and mirror active state to Authentik. |
+| `users/audit.py` | Auth **event catalog** + `audit()` dual-write helper (append-only `activity_logs` row + structured log); `commit=True` persists failure-path state before raising. |
 | `users/auth_emails.py` | Auth transactional emails (typed Pydantic contexts) sent through the reusable email layer: welcome, login OTP, password reset code/link, password changed. Templates live in `users/templates/`. |
 | `users/templates/` | Auth email HTML/text templates (Jinja2) extending the shared `_base.en.html` shell. |
 | `users/service.py` | Registration (+ welcome email), login with lockout, token pair issuance/refresh, change password, **password reset** (delegates to `password_reset`), **Authentik JIT provisioning**, full CRUD lifecycle with WKT→PostGIS conversion. |
 | `users/authentik_sync.py` | **Outbound sync orchestration** (app → Authentik): `sync_create/update_profile/set_password/set_active/delete`, local→Authentik field mapping, `SyncResult` enum, `AUTHENTIK_SYNCED_FIELDS`. Best-effort — never raises into the request. See [docs/AUTHENTIK_SYNC.md](AUTHENTIK_SYNC.md). |
 | `users/deps.py` | `CurrentUser` dependency: accepts Authentik RS256 **or** first-party HS256 tokens, resolves/provisions the DB user, rejects deactivated accounts. Used by every protected endpoint. |
-| `users/api.py` | `/api/auth/*` (register, login, **login-otp/request**, **login-otp/verify**, refresh, me, password-policy, change/forgot/reset-password, dev-token) and `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore). All auth entry points resolve request IP/device/GeoIP audit context. |
+| `users/api.py` | `/api/auth/*` (register, login, **login-otp/request**, **login-otp/verify**, refresh, **logout**, me, password-policy, change/forgot/reset-password, dev-token) and `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore, **ban/unban**, **throttle/unthrottle**, moderation status). All auth entry points resolve request IP/device/GeoIP audit context and are audited. |
 | `documents/api.py` | `POST /api/documents/render` → enqueues Celery PDF task, returns `202 + task_id`; `GET /render/{task_id}` polls status. |
 | `documents/service.py` | `render_html_to_pdf()` — calls Gotenberg over the isolated `app-pdf` network, stores output in the shared media volume. Sync by design: PDF work belongs in workers. |
 | `documents/schema.py` | Render request / task status schemas. |
@@ -260,6 +262,9 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `test_emails_templates.py` / `test_password_policy.py` | Hermetic: template registry/required-context + provider payload shape; configurable password-policy rules. |
 | `test_auth_emails.py` | Hermetic: auth template rendering, User-Agent parsing, `format_utc`, client-info/IP extraction, GeoIP no-op behavior. |
 | `test_password_reset.py` / `test_login_otp.py` | Integration: reset/OTP codes hashed-at-rest, identifier resolution, cooldown, attempt cap, expiry, single-use (auth-email sends patched at the module boundary). |
+| `test_moderation.py` / `test_auth_reset_flow.py` | Integration: ban/unban + throttle guards and temporary-ban expiry; full `tech@tarrinahealth.com` reset flow (code + link, service and HTTP) then login with the new password. |
+| `test_geoip.py` | GeoIP against the real GeoLite2 `.mmdb` files (skips if absent): city lookup, country fallback, `registered_country` fallback, private-IP skip. |
+| `test_auth_audit.py` / `test_auth_failure_persistence.py` | Integration: auth event audit rows + profile diff JSON; failed-login counter/audit survive the 401 rollback (real HTTP + `get_db`). |
 | `test_authentik_sync.py` | Outbound Authentik field mapping. |
 
 Dev helper dot-scripts in `backend/`: `.setup_venv.sh` (venv + deps),

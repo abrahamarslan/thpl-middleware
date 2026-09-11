@@ -61,12 +61,12 @@ async def test_code_reset_flow_service(db, mocker):
     assert re.fullmatch(r"\d{4}", code)
 
     await password_reset.reset_password(
-        db, identifier=TECH, token_or_code=code, new_password="N3wTechPass!"
+        db, identifier=TECH, token_or_code=code, new_password="N3wSecurePass!"
     )
-    assert verify_password("N3wTechPass!", user.password)
+    assert verify_password("N3wSecurePass!", user.password)
 
     # New password logs in; the old one is rejected.
-    _, tokens = await service.login(db, LoginRequest(email_or_username=TECH, password="N3wTechPass!"))
+    _, tokens = await service.login(db, LoginRequest(email_or_username=TECH, password="N3wSecurePass!"))
     assert tokens.access_token
     with pytest.raises(AuthError):
         await service.login(db, LoginRequest(email_or_username=TECH, password=OLD_PASSWORD))
@@ -93,7 +93,7 @@ async def test_wrong_code_rejected(db, mocker):
 
     with pytest.raises(AuthError):
         await password_reset.reset_password(
-            db, identifier=TECH, token_or_code="0000", new_password="N3wTechPass!"
+            db, identifier=TECH, token_or_code="0000", new_password="N3wSecurePass!"
         )
 
 

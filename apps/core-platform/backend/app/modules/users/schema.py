@@ -8,7 +8,7 @@ Conventions:
     two_factor_recovery_codes, api_token, remember_token are write/internal only.
 """
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -382,11 +382,23 @@ class PasswordPolicyOut(BaseModel):
 
 # ── Moderation schemas ────────────────────────────────────────────────────────
 
+def _ensure_utc(value: datetime | None) -> datetime | None:
+    """Coerce a naive datetime to UTC so comparisons never mix aware/naive."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 class BanRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
     until: datetime | None = Field(
         default=None, description="Ban expiry (UTC). Omit for a permanent ban."
     )
+
+    @field_validator("until", mode="after")
+    @classmethod
+    def _utc(cls, v: datetime | None) -> datetime | None:
+        return _ensure_utc(v)
 
 
 class ThrottleRequest(BaseModel):
@@ -394,6 +406,11 @@ class ThrottleRequest(BaseModel):
     until: datetime | None = Field(
         default=None, description="Throttle expiry (UTC). Omit to hold until lifted."
     )
+
+    @field_validator("until", mode="after")
+    @classmethod
+    def _utc(cls, v: datetime | None) -> datetime | None:
+        return _ensure_utc(v)
 
 
 class ModerationOut(BaseModel):

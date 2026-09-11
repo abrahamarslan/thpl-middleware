@@ -13,10 +13,12 @@ from geoalchemy2 import WKTElement
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.client_info import ClientInfo
-from app.common.exception.errors import AuthError, ConflictError, ForbiddenError, NotFoundError
+from app.common.exception.errors import AppError, AuthError, ConflictError, ForbiddenError, NotFoundError
 from app.common.security.jwt import decode_token
 from app.core.conf import settings
+from app.modules.activity.recorder import model_changes
 from app.modules.users import auth_emails, authentik_sync, crud, identifiers, moderation, password_reset
+from app.modules.users.audit import Event, audit
 from app.modules.users.authentik_sync import AUTHENTIK_SYNCED_FIELDS, SyncResult
 from app.modules.users.model import User
 from app.modules.users.password_policy import validate_password
@@ -78,7 +80,10 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
         "password": hash_password(body.password),
         "last_password_change_at": datetime.now(UTC),
     })
-    logger.info("user_registered", user_id=user.id, ip=client.ip if client else None)
+    await audit(
+        db, Event.REGISTER, user=user, client=client,
+        context={"has_username": bool(user.username), "has_phone": bool(user.phone)},
+    )
 
     # Mirror into Authentik (best-effort). Plaintext is only available here.
     result = await authentik_sync.sync_create(db, user, body.password)
@@ -98,26 +103,61 @@ async def login(
 ) -> tuple[User, TokenPair]:
     user = await identifiers.resolve_user_by_identifier(db, body.email_or_username)
     if user is None:
+        await audit(
+            db, Event.LOGIN_FAILURE, actor_label=body.email_or_username, status="failure",
+            description="unknown identifier", client=client, commit=True,
+        )
         raise AuthError("Invalid credentials")
 
     # Lockout window (automatic, from failed password attempts)
     if user.locked_at is not None:
         unlock_at = user.locked_at + timedelta(minutes=settings.AUTH_LOCKOUT_MINUTES)
         if datetime.now(UTC) < unlock_at:
+            await audit(
+                db, Event.LOGIN_FAILURE, user=user, status="failure",
+                description="account locked", client=client, commit=True,
+            )
             raise AuthError("Account locked due to failed login attempts; try again later")
         user.locked_at = None
         user.failed_login_attempts = 0
 
     # Moderation: deactivated / banned / throttled.
-    moderation.ensure_can_authenticate(user)
+    try:
+        moderation.ensure_can_authenticate(user)
+    except AppError as exc:
+        await audit(
+            db, Event.LOGIN_FAILURE, user=user, status="failure",
+            description=exc.msg, client=client, context={"reason": exc.code}, commit=True,
+        )
+        raise
 
     if not verify_password(body.password, user.password):
         user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
-        if user.failed_login_attempts >= settings.AUTH_MAX_FAILED_LOGINS:
+        locked = user.failed_login_attempts >= settings.AUTH_MAX_FAILED_LOGINS
+        if locked:
             user.locked_at = datetime.now(UTC)
-            logger.warning("user_locked", user_id=user.id, attempts=user.failed_login_attempts)
         await db.flush()
+        await audit(
+            db, Event.LOGIN_FAILURE, user=user, status="failure",
+            description="invalid credentials", client=client,
+            context={"attempts": user.failed_login_attempts, "locked": locked}, commit=True,
+        )
+        if locked:
+            await audit(
+                db, Event.LOGIN_LOCKED, user=user, status="failure",
+                description=f"locked after {user.failed_login_attempts} failed attempts",
+                client=client, commit=True,
+            )
         raise AuthError("Invalid credentials")
+
+    try:
+        tokens = issue_token_pair(user)
+    except Exception as exc:  # noqa: BLE001
+        await audit(
+            db, Event.LOGIN_FAILURE, user=user, status="failure",
+            description=f"token issuance failed: {exc}", client=client, commit=True,
+        )
+        raise
 
     user.failed_login_attempts = 0
     user.locked_at = None
@@ -129,22 +169,42 @@ async def login(
         user.device_type = body.device_type
     await db.flush()
 
-    logger.info(
-        "user_login",
-        user_id=user.id,
-        device_id=body.device_id,
-        ip=client.ip if client else None,
-        location=client.location if client else None,
+    await audit(
+        db, Event.LOGIN_SUCCESS, user=user, client=client,
+        context={"method": "password", "device_id": body.device_id},
     )
-    return user, issue_token_pair(user)
+    await audit(
+        db, Event.TOKEN_ISSUED, user=user, client=client,
+        context={"method": "password", "access": True, "refresh": True},
+    )
+    return user, tokens
 
 
-async def refresh_tokens(db: AsyncSession, refresh_token: str) -> TokenPair:
-    payload = decode_token(refresh_token, expected_type="refresh")
+async def refresh_tokens(
+    db: AsyncSession, refresh_token: str, *, client: ClientInfo | None = None
+) -> TokenPair:
+    try:
+        payload = decode_token(refresh_token, expected_type="refresh")
+    except AuthError:
+        await audit(
+            db, Event.TOKEN_REFRESH_FAILURE, status="failure",
+            description="invalid refresh token", client=client, commit=True,
+        )
+        raise
     user = await crud.get_by_id(db, int(payload["sub"]))
     if user is None or user.is_deactivated:
+        await audit(
+            db, Event.TOKEN_REFRESH_FAILURE, user=user, status="failure",
+            description="user no longer active", client=client, commit=True,
+        )
         raise AuthError("User no longer active")
-    return issue_token_pair(user)
+    tokens = issue_token_pair(user)
+    await audit(db, Event.TOKEN_REFRESH, user=user, client=client)
+    await audit(
+        db, Event.TOKEN_ISSUED, user=user, client=client,
+        context={"method": "refresh", "access": True, "refresh": True},
+    )
+    return tokens
 
 
 async def change_password(
@@ -156,12 +216,16 @@ async def change_password(
     client: ClientInfo | None = None,
 ) -> None:
     if not verify_password(current_password, user.password):
+        await audit(
+            db, Event.PASSWORD_CHANGE_FAILURE, user=user, status="failure",
+            description="current password incorrect", client=client, commit=True,
+        )
         raise AuthError("Current password is incorrect")
     validate_password(new_password, email=user.email, name=user.name)
     user.password = hash_password(new_password)
     user.last_password_change_at = datetime.now(UTC)
     await db.flush()
-    logger.info("password_changed", user_id=user.id, ip=client.ip if client else None)
+    await audit(db, Event.PASSWORD_CHANGED, user=user, client=client, context={"method": "self"})
 
     # Mirror the new password into Authentik (best-effort; plaintext in scope).
     await authentik_sync.sync_set_password(db, user, new_password)
@@ -241,7 +305,7 @@ async def provision_from_authentik(db: AsyncSession, claims: dict) -> User:
             "user_type": "sso",
             "onboarding_status": "provisioned",
         })
-        logger.info("user_provisioned_from_authentik", user_id=user.id, sub=sub)
+        await audit(db, Event.PROVISIONED, user=user, context={"method": "authentik", "sub": sub})
 
     if user.is_deactivated or user.deleted_at is not None:
         raise ForbiddenError("Account is deactivated")
@@ -263,7 +327,13 @@ async def get_user(db: AsyncSession, user_id: int, *, include_deleted: bool = Fa
     return user
 
 
-async def create_user(db: AsyncSession, body: UserCreate, *, created_by: int | None = None) -> User:
+async def create_user(
+    db: AsyncSession,
+    body: UserCreate,
+    *,
+    created_by: int | None = None,
+    actor_label: str | None = None,
+) -> User:
     if await crud.get_by_email(db, body.email, include_deleted=True):
         raise ConflictError("A user with this email already exists")
     if body.username and await crud.get_by_username(db, body.username):
@@ -276,7 +346,10 @@ async def create_user(db: AsyncSession, body: UserCreate, *, created_by: int | N
     values["created_by"] = created_by
     values["last_password_change_at"] = datetime.now(UTC)
     user = await crud.create(db, values)
-    logger.info("user_created", user_id=user.id, created_by=created_by)
+    await audit(
+        db, Event.USER_CREATED, user=user, actor_id=created_by, actor_label=actor_label,
+        context={"created_by": created_by},
+    )
 
     # Mirror into Authentik (best-effort). Plaintext is only available here.
     result = await authentik_sync.sync_create(db, user, body.password)
@@ -285,7 +358,15 @@ async def create_user(db: AsyncSession, body: UserCreate, *, created_by: int | N
     return user
 
 
-async def update_user(db: AsyncSession, user_id: int, body: UserUpdate, *, updated_by: int | None = None) -> User:
+async def update_user(
+    db: AsyncSession,
+    user_id: int,
+    body: UserUpdate,
+    *,
+    updated_by: int | None = None,
+    actor_label: str | None = None,
+    client: ClientInfo | None = None,
+) -> User:
     user = await get_user(db, user_id)
 
     values = _geo_to_elements(body.model_dump(exclude_unset=True))
@@ -300,8 +381,18 @@ async def update_user(db: AsyncSession, user_id: int, body: UserUpdate, *, updat
             raise ConflictError("This username is taken")
 
     values["updated_by"] = updated_by
-    user = await crud.update(db, user, values)
-    logger.info("user_updated", user_id=user.id, updated_by=updated_by, fields=list(values.keys()))
+    # Apply, capture a masked {field: {old,new}} diff *before* flushing (history
+    # is reset by flush), then persist the change.
+    crud.apply_values(user, values)
+    diff = model_changes(user, exclude=set(GEO_FIELDS) | {"updated_by"})
+    await db.flush()
+    await db.refresh(user)
+
+    if diff:
+        await audit(
+            db, Event.USER_UPDATED, user=user, actor_id=updated_by, actor_label=actor_label,
+            client=client, changes=diff, context={"fields": sorted(diff.keys())},
+        )
 
     # Mirror profile changes into Authentik only when a synced field changed.
     changed = AUTHENTIK_SYNCED_FIELDS & set(values.keys())
@@ -312,19 +403,30 @@ async def update_user(db: AsyncSession, user_id: int, body: UserUpdate, *, updat
     return user
 
 
-async def delete_user(db: AsyncSession, user_id: int, *, deleted_by: int | None = None, hard: bool = False) -> None:
+async def delete_user(
+    db: AsyncSession,
+    user_id: int,
+    *,
+    deleted_by: int | None = None,
+    hard: bool = False,
+    actor_label: str | None = None,
+) -> None:
     user = await get_user(db, user_id, include_deleted=hard)
     if hard:
         authentik_pk = user.authentik_pk  # capture before the row is removed
+        # Audit first: hard delete removes the subject row (audit is append-only).
+        await audit(
+            db, Event.USER_HARD_DELETED, user=user, actor_id=deleted_by, actor_label=actor_label,
+            context={"authentik_pk": authentik_pk},
+        )
         await crud.hard_delete(db, user)
-        logger.warning("user_hard_deleted", user_id=user_id, deleted_by=deleted_by)
         if authentik_pk:
             result = await authentik_sync.sync_delete(authentik_pk)
             if result is SyncResult.FAILED:
                 _enqueue_authentik("delete_user", authentik_pk)
     else:
         await crud.soft_delete(db, user, deleted_by=deleted_by)
-        logger.info("user_soft_deleted", user_id=user_id, deleted_by=deleted_by)
+        await audit(db, Event.USER_DELETED, user=user, actor_id=deleted_by, actor_label=actor_label)
         # A soft delete deactivates the Authentik account (keeps it for restore).
         result = await authentik_sync.sync_set_active(db, user, False)
         if result is SyncResult.FAILED:
@@ -338,10 +440,21 @@ async def restore_user(db: AsyncSession, user_id: int) -> User:
     if user.deleted_at is None:
         raise ConflictError("User is not deleted")
     user = await crud.restore(db, user)
-    logger.info("user_restored", user_id=user.id)
+    await audit(db, Event.USER_RESTORED, user=user)
 
     # Reactivate the Authentik account that the soft delete disabled.
     result = await authentik_sync.sync_set_active(db, user, True)
     if result is SyncResult.FAILED:
         _enqueue_authentik("sync_status", user.id, True)
     return user
+
+
+async def logout(db: AsyncSession, user: User, *, client: ClientInfo | None = None) -> None:
+    """Close the session (client drops its tokens) and audit the event.
+
+    Tokens are stateless JWTs; this marks the in-app presence flag and records
+    ``auth.logout``. See the audit plan doc for server-side token revocation.
+    """
+    user.has_active_session = False
+    await db.flush()
+    await audit(db, Event.LOGOUT, user=user, client=client)

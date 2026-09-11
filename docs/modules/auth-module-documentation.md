@@ -26,6 +26,8 @@ context (IP/device/GeoIP), and the transactional emails they trigger.
 | `security.py` | bcrypt password hashing + keyed-HMAC one-time-code hashing/verification + numeric code generation. |
 | `password_reset.py` | Password-reset feature: request (code/link) + reset. |
 | `login_otp.py` | Passwordless email-OTP login: request + verify. |
+| `moderation.py` | Ban/unban (hard) + throttle/unthrottle (soft): pure predicates, session/auth guards, and async mutators that record activity and mirror active state to Authentik. |
+| `audit.py` | Auth event catalog (`Event`) + `audit()` dual-write helper (persisted `activity_logs` row **and** structured log). `commit=True` persists failure-path state before raising. |
 | `auth_emails.py` | Auth transactional emails: typed contexts + senders; registers the auth templates. |
 | `templates/` | Auth email HTML/text templates (`_base.en.html` + one file per email). |
 | `deps.py` | `CurrentUser` dependency (Authentik RS256 **or** first-party HS256). |
@@ -55,6 +57,7 @@ hierarchy: `AuthError` → 401 `unauthorized`, `ForbiddenError` → 403
 | POST | `/api/auth/login-otp/request` | public | `identifier` | `{sent, expires_at, debug_code?}` |
 | POST | `/api/auth/login-otp/verify` | public | `identifier, code, device_id?, device_type?` | `TokenPair` |
 | POST | `/api/auth/refresh` | public | `refresh_token` | `TokenPair` |
+| POST | `/api/auth/logout` | JWT | — | `{logged_out: true}` |
 | GET | `/api/auth/me` | JWT | — | `UserOut` |
 | POST | `/api/auth/change-password` | JWT | `current_password, new_password` | `{changed: true}` (also sends **password changed** email) |
 | GET | `/api/auth/password-policy` | public | — | `PasswordPolicyOut` |
@@ -66,6 +69,16 @@ hierarchy: `AuthError` → 401 `unauthorized`, `ForbiddenError` → 403
 
 User administration (JWT-protected) lives on the same module: `GET/POST
 /api/users`, `GET/PUT/DELETE /api/users/{id}`, `POST /api/users/{id}/restore`.
+
+Moderation (JWT-protected, `/api/users/{id}/*`):
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| GET | `/api/users/{id}/moderation` | — | Current state: `active`/`throttled`/`banned`/`locked`/`deactivated`/`deleted` |
+| POST | `/api/users/{id}/ban` | `{reason, until?}` | Hard ban (permanent unless `until`); Authentik deactivated |
+| POST | `/api/users/{id}/unban` | — | Lift the ban; Authentik reactivated if otherwise usable |
+| POST | `/api/users/{id}/throttle` | `{reason, until?}` | Soft restriction: new auth attempts 429 until `until` |
+| POST | `/api/users/{id}/unthrottle` | — | Lift the throttle |
 
 **Identifier vs `email_or_username`.** Reset and OTP endpoints take a single
 `identifier` (email, username **or** phone). Login keeps the historical
@@ -253,7 +266,8 @@ one file pair + one `register_template` entry + one sender (see
 ## 10. Operations
 
 ```bash
-./manage.sh migrate            # b7c1f2a9d4e0 (reset hardening) + d2e3f4a5b6c7 (login_otp_tokens)
+./manage.sh migrate            # b7c1f2a9d4e0 (reset hardening) + d2e3f4a5b6c7
+                               # (login_otp_tokens) + e5f6a7b8c9d0 (moderation)
 ```
 
 1. Set `JWT_SECRET_KEY` (and optionally a dedicated `PASSWORD_RESET_HMAC_KEY`).
@@ -277,6 +291,11 @@ or `/login-otp/request`.
 | `tests/test_auth_emails.py` | hermetic | template rendering, UA parser, `format_utc`, client-info/IP, GeoIP no-op. |
 | `tests/test_password_reset.py` | integration (Postgres) | identifier resolution, hashed codes, cooldown, attempt cap, expiry, single-use, confirmation email. |
 | `tests/test_login_otp.py` | integration (Postgres) | request/verify, cooldown, attempt cap, expiry, token issuance, single-use. |
+| `tests/test_moderation.py` | integration (Postgres) | ban/unban, throttle/unthrottle, temporary-ban expiry, challenge cleanup, activity log. |
+| `tests/test_auth_reset_flow.py` | integration (Postgres) | full `tech@tarrinahealth.com` reset flow at service **and** HTTP level (code + link), login with the new password. |
+| `tests/test_geoip.py` | integration (mmdb, skips if absent) | city lookup, country-only fallback, `registered_country` fallback, private-IP skip, disabled no-op. |
+| `tests/test_auth_audit.py` | integration (Postgres) | register/login/logout/token-issue, profile diff JSON, moderation, password-change events. |
+| `tests/test_auth_failure_persistence.py` | integration (real HTTP + `get_db`) | failed-login counter + failure audit survive the rollback. |
 | `tests/test_health.py` | hermetic | every auth route is registered. |
 
 Auth-email sends are patched at the `auth_emails` module boundary
@@ -300,3 +319,104 @@ Integration tests skip cleanly without Postgres.
   time is the robust long-term fix.
 - **`LoginRequest` keeps `email_or_username`** for API compatibility even
   though it now resolves phone too; only reset/OTP use `identifier` by name.
+- **Moderation endpoints require authentication only** (like the existing
+  `/api/users` admin surface). A role/scope check (RBAC) is a deliberate
+  follow-up — see §13.
+
+---
+
+## 13. Moderation — ban / unban / throttle
+
+`app/modules/users/moderation.py` adds two levers, distinct from lifecycle and
+from automatic lockout:
+
+| Lever | Semantics | Enforcement |
+|---|---|---|
+| **Ban** (`is_banned`, `banned_until`) | Hard denial — no auth, no API | `deps.ensure_can_use_api` (every JWT request) + `ensure_can_authenticate` on login/OTP/reset; Authentik `is_active=False`; in-flight reset/OTP challenges destroyed |
+| **Throttle** (`is_throttled`, `throttled_until`) | Soft — existing session works, **new** auth/credential flows return 429 | `ensure_can_authenticate` on login/OTP/reset; request endpoints (`forgot-password`, `login-otp/request`) raise `RateLimitedError` for a throttled account |
+| **Lockout** (`locked_at`, `failed_login_attempts`) | Automatic, from failed password attempts | Password login only (`AUTH_MAX_FAILED_LOGINS` / `AUTH_LOCKOUT_MINUTES`) |
+| **Deactivation** (`is_deactivated`) | Account lifecycle | Same guards as ban, but no expiry |
+
+- **Permanent vs temporary**: `*_until = NULL` is permanent; once an expiry
+  passes the restriction is transparently treated as lifted (the columns remain
+  for audit).
+- **State** via `GET /api/users/{id}/moderation` → `active` | `throttled` |
+  `banned` | `locked` | `deactivated` | `deleted`.
+- Every action is recorded in `activity_logs` (`user_banned`, `user_unbanned`,
+  `user_throttled`, `user_unthrottled`) with actor + reason + expiry.
+- Banning also sets `has_active_session = False`; existing JWTs are rejected on
+  their next request because the ban is checked in the dependency (there is no
+  token denylist — stateless JWTs need none).
+
+> **Authorization gap (honest):** these endpoints (and the existing
+> `/api/users` CRUD) require a valid token but do **not** yet check a role. Add
+> an admin/RBAC guard before exposing them beyond trusted operators.
+
+---
+
+## 14. Authentik integration
+
+Identity is local-first: Postgres is the source of truth and Authentik is a
+mirror. Both directions are wired; each needs `.env` configuration to activate.
+
+**Inbound (Authentik → app, OIDC login).** `deps.CurrentUser` accepts Authentik
+RS256 tokens when `AUTHENTIK_ENABLED=true`; validation fetches the provider
+JWKS (`AUTHENTIK_ISSUER`/`AUTHENTIK_JWKS_URL`/`AUTHENTIK_AUDIENCE`). Unknown
+subjects are JIT-provisioned and linked by `external_id ← sub`. Wired but
+**disabled** by default (`AUTHENTIK_OIDC_ENABLED=false`).
+
+**Outbound (app → Authentik admin API).** `authentik_sync.py` mirrors
+create/update/password/(de)activate/delete through a service-account token.
+Called from:
+- `register` / `create_user` → `sync_create` (retry `provision_user`)
+- `update_user` → `sync_update_profile` (retry `sync_profile`)
+- `change_password` / `reset_password` → `sync_set_password`
+- soft-delete / restore / **ban** / **unban** → `sync_set_active` (retry `sync_status`)
+- hard-delete → `sync_delete`
+
+All calls are **best-effort** (never raise into the request); failures set
+`authentik_sync_status`/`_error` and enqueue a Celery retry
+(`app/tasks/authentik.py`). Ban/unban now flow through `sync_set_active`, and
+`_is_active()` treats a banned (non-expired) account as inactive.
+
+**Infra:** `authentik-server` joins `app-frontend` + `app-auth` +
+`app-monitoring`; the backend and Celery workers reach it at
+`http://authentik-server:9000` over the shared network. The compose anchor
+already passes `AUTHENTIK_SYNC_ENABLED` / `AUTHENTIK_BASE_URL` /
+`AUTHENTIK_SERVICE_TOKEN` (defaults: disabled / internal URL / empty).
+
+**To activate live sync:** create an Authentik service account with *Core: Can
+create/change/delete User* + *Can reset User's password*, copy its token, then
+set in `deployment/.env`:
+
+```env
+AUTHENTIK_SYNC_ENABLED=true
+AUTHENTIK_BASE_URL=http://authentik-server:9000
+AUTHENTIK_SERVICE_TOKEN=<service-account-token>
+```
+
+Full field map, lifecycle, backfill (`./manage.sh authentik-backfill`) and ops
+queries: [`docs/AUTHENTIK_SYNC.md`](../AUTHENTIK_SYNC.md).
+
+---
+
+## 15. Auth audit logging
+
+Every auth/credential/moderation event is recorded by `audit.py::audit()`, which
+writes **both** an append-only `activity_logs` row (compliance, queryable) and a
+structured log line (Loki), correlated by `request_id`. Events: `auth.register`,
+`auth.login.success|failure|locked`, `auth.logout`, `auth.token.issued|refresh`,
+`auth.otp.request|login|failure`, `auth.password.changed`,
+`auth.password.reset.request|completed|failure`, `user.created`,
+`user.profile.updated` (**field-level `{old,new}` JSON diff**, secrets masked),
+`user.moderation.ban|unban|throttle|unthrottle`.
+
+**Critical rule:** a failed operation raises a domain error, which makes the
+request dependency roll the transaction back. Failure paths therefore call
+`audit(..., commit=True)` to persist the attempt counter/lockout **and** the
+audit row before raising — otherwise lockout and the OTP/reset caps silently
+never persist. (This release includes the fix; regression test:
+`tests/test_auth_failure_persistence.py`.)
+
+Full design, event catalog and roadmap:
+[`apps/core-platform/docs/AUTH_AUDIT_LOGGING_PLAN.md`](../../apps/core-platform/docs/AUTH_AUDIT_LOGGING_PLAN.md).

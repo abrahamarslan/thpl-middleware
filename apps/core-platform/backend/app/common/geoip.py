@@ -83,13 +83,27 @@ def _reader() -> Any | None:
         return None
 
 
+def _country_fields(response: Any) -> tuple[str | None, str | None]:
+    """(name, iso_code), falling back to registered_country.
+
+    Some ranges (e.g. Cloudflare 1.1.1.1) have an empty ``country`` but a
+    populated ``registered_country`` — without the fallback the lookup would
+    report no country at all.
+    """
+    country = response.country
+    if not country.iso_code:
+        country = response.registered_country
+    return country.name, country.iso_code
+
+
 def _city_response(response: Any, ip: str) -> GeoLocation:
+    country_name, country_code = _country_fields(response)
     return GeoLocation(
         ip=ip,
         city=response.city.name,
         region=response.subdivisions.most_specific.name,
-        country=response.country.name,
-        country_code=response.country.iso_code,
+        country=country_name,
+        country_code=country_code,
         latitude=response.location.latitude,
         longitude=response.location.longitude,
         timezone=response.location.time_zone,
@@ -111,11 +125,8 @@ def lookup_ip(ip: str | None) -> GeoLocation | None:
             return _city_response(reader.city(ip), ip)
         if "country" in database_type:
             response = reader.country(ip)
-            return GeoLocation(
-                ip=ip,
-                country=response.country.name,
-                country_code=response.country.iso_code,
-            )
+            country_name, country_code = _country_fields(response)
+            return GeoLocation(ip=ip, country=country_name, country_code=country_code)
         return None
     except geoip2.errors.AddressNotFoundError:
         return None

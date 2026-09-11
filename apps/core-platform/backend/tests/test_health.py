@@ -28,6 +28,7 @@ def test_module_routers_registered():
         "/api/auth/login",
         "/api/auth/login-otp/request",
         "/api/auth/login-otp/verify",
+        "/api/auth/logout",
         "/api/auth/forgot-password",
         "/api/auth/reset-password",
         "/api/auth/password-policy",

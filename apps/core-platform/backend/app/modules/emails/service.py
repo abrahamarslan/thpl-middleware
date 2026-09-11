@@ -92,7 +92,7 @@ async def compose_and_queue_email(
         )
 
     await record_activity(
-        db, action="email_queued", actor_id=actor_id,
+        db, action="email.queued", actor_id=actor_id,
         subject_type="Email", subject_id=email.id,
         changes={"to": list(email_in.to), "subject": email_in.subject},
     )

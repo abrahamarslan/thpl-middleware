@@ -89,8 +89,14 @@ async def login_otp_verify(db: DBSession, body: LoginOtpVerifyRequest, client: C
 
 
 @auth_router.post("/refresh", response_model=ResponseModel[TokenPair])
-async def refresh(db: DBSession, body: RefreshRequest):
-    return ResponseModel(data=await service.refresh_tokens(db, body.refresh_token))
+async def refresh(db: DBSession, body: RefreshRequest, client: ClientInfoDep):
+    return ResponseModel(data=await service.refresh_tokens(db, body.refresh_token, client=client))
+
+
+@auth_router.post("/logout", response_model=ResponseModel[dict])
+async def logout(db: DBSession, user: CurrentUser, client: ClientInfoDep):
+    await service.logout(db, user, client=client)
+    return ResponseModel(data={"logged_out": True})
 
 
 @auth_router.get("/me", response_model=ResponseModel[UserOut])
@@ -179,7 +185,7 @@ async def list_users(db: DBSession, _: CurrentUser, filters: UserListFilters = Q
 
 @users_router.post("", response_model=ResponseModel[UserOut], status_code=201)
 async def create_user(db: DBSession, current: CurrentUser, body: UserCreate):
-    user = await service.create_user(db, body, created_by=current.id)
+    user = await service.create_user(db, body, created_by=current.id, actor_label=current.email)
     return ResponseModel(data=UserOut.model_validate(user))
 
 
@@ -193,8 +199,12 @@ async def get_user(
 
 
 @users_router.put("/{user_id}", response_model=ResponseModel[UserOut])
-async def update_user(db: DBSession, current: CurrentUser, user_id: int, body: UserUpdate):
-    user = await service.update_user(db, user_id, body, updated_by=current.id)
+async def update_user(
+    db: DBSession, current: CurrentUser, user_id: int, body: UserUpdate, client: ClientInfoDep
+):
+    user = await service.update_user(
+        db, user_id, body, updated_by=current.id, actor_label=current.email, client=client
+    )
     return ResponseModel(data=UserOut.model_validate(user))
 
 
@@ -203,7 +213,9 @@ async def delete_user(
     db: DBSession, current: CurrentUser, user_id: int,
     hard: bool = Query(False, description="Permanently delete instead of soft delete"),
 ):
-    await service.delete_user(db, user_id, deleted_by=current.id, hard=hard)
+    await service.delete_user(
+        db, user_id, deleted_by=current.id, hard=hard, actor_label=current.email
+    )
     return ResponseModel(data={"deleted": True, "hard": hard})
 
 

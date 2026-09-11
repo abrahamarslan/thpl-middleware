@@ -5,6 +5,10 @@ HMAC, TTL is short, attempts are capped (row destroyed at the cap and on
 success), resends are throttled per row, and responses never reveal whether an
 identifier exists. Verification issues the same first-party token pair as
 password login and clears the account lockout counters.
+
+Every transition is audited (dual-write: activity_logs + structlog). Failure
+paths commit their counter/audit explicitly because the request transaction is
+rolled back when the domain error propagates.
 """
 
 from __future__ import annotations
@@ -16,10 +20,10 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.client_info import ClientInfo
-from app.common.exception.errors import AuthError, RateLimitedError
+from app.common.exception.errors import AppError, AuthError, RateLimitedError
 from app.core.conf import settings
-from app.modules.activity.recorder import record_activity
 from app.modules.users import auth_emails, crud, identifiers, moderation
+from app.modules.users.audit import Event, audit
 from app.modules.users.model import User
 from app.modules.users.schema import TokenPair
 from app.modules.users.security import generate_numeric_code, hash_one_time_code, verify_one_time_code
@@ -46,9 +50,16 @@ async def request_login_otp(
         or moderation.is_banned(user)
     ):
         # Uniform response — never reveal account existence/state.
-        logger.info("login_otp_unknown_identifier")
+        await audit(
+            db, Event.OTP_REQUEST_SUPPRESSED, actor_label=identifier, status="failure",
+            description="unknown or unavailable account", client=client,
+        )
         return OtpRequestResult(sent=True)
     if moderation.is_throttled(user):
+        await audit(
+            db, Event.OTP_REQUEST_SUPPRESSED, user=user, status="failure",
+            description="account throttled", client=client, commit=True,
+        )
         raise RateLimitedError("Account is temporarily throttled; try again later")
 
     now = datetime.now(UTC)
@@ -56,7 +67,10 @@ async def request_login_otp(
 
     cooldown = settings.LOGIN_OTP_RESEND_COOLDOWN_SECONDS
     if existing and existing.last_sent_at and (now - existing.last_sent_at).total_seconds() < cooldown:
-        logger.warning("login_otp_cooldown", user_id=user.id)
+        await audit(
+            db, Event.OTP_REQUEST_SUPPRESSED, user=user, status="failure",
+            description="resend cooldown", client=client,
+        )
         return OtpRequestResult(sent=True)
     if (
         existing
@@ -64,7 +78,10 @@ async def request_login_otp(
         and (now - existing.created_at) < timedelta(hours=1)
         and (existing.sent_count or 0) >= settings.LOGIN_OTP_MAX_PER_HOUR
     ):
-        logger.warning("login_otp_hourly_cap", user_id=user.id, sent=existing.sent_count)
+        await audit(
+            db, Event.OTP_REQUEST_SUPPRESSED, user=user, status="failure",
+            description="hourly cap reached", client=client,
+        )
         return OtpRequestResult(sent=True)
 
     code = generate_numeric_code(settings.LOGIN_OTP_CODE_LENGTH)
@@ -80,7 +97,10 @@ async def request_login_otp(
     await auth_emails.send_login_otp_email(
         db, user, code=code, expires_minutes=settings.LOGIN_OTP_TTL_MINUTES, client=client
     )
-    logger.info("login_otp_requested", user_id=user.id)
+    await audit(
+        db, Event.OTP_REQUEST, user=user, client=client,
+        context={"expires_at": expires_at.isoformat()},
+    )
 
     result = OtpRequestResult(sent=True, expires_at=expires_at)
     if settings.DEBUG:
@@ -99,10 +119,21 @@ async def verify_login_otp(
 ) -> tuple[User, TokenPair]:
     user = await identifiers.resolve_user_by_identifier(db, identifier)
     if user is None:
+        await audit(
+            db, Event.OTP_FAILURE, actor_label=identifier, status="failure",
+            description="unknown identifier", client=client, commit=True,
+        )
         raise AuthError("Invalid or expired code")
 
     now = datetime.now(UTC)
-    moderation.ensure_can_authenticate(user)
+    try:
+        moderation.ensure_can_authenticate(user)
+    except AppError as exc:
+        await audit(
+            db, Event.OTP_FAILURE, user=user, status="failure", description=exc.msg,
+            client=client, context={"reason": exc.code}, commit=True,
+        )
+        raise
 
     # OTP is a possession factor, so a *password* lockout deliberately does not
     # block it — the user may be recovering. OTP brute-force is instead bounded
@@ -111,22 +142,40 @@ async def verify_login_otp(
     # let an attacker lock a legitimate user out of OTP too).
     row = await crud.get_login_otp(db, user.email)
     if row is None:
+        await audit(
+            db, Event.OTP_FAILURE, user=user, status="failure",
+            description="no challenge", client=client, commit=True,
+        )
         raise AuthError("Invalid or expired code")
     if row.expires_at is not None and now > row.expires_at:
         await crud.delete_login_otp(db, user.email)
+        await audit(
+            db, Event.OTP_FAILURE, user=user, status="failure",
+            description="expired", client=client, commit=True,
+        )
         raise AuthError("Code expired")
 
     max_attempts = row.max_attempts or settings.LOGIN_OTP_MAX_ATTEMPTS
     if (row.attempts or 0) >= max_attempts:
         await crud.delete_login_otp(db, user.email)
+        await audit(
+            db, Event.OTP_FAILURE, user=user, status="failure",
+            description="attempt cap reached", client=client, commit=True,
+        )
         raise AuthError("Too many invalid attempts; request a new code")
 
     if not verify_one_time_code(code, row.code_hash):
         row.attempts = (row.attempts or 0) + 1
-        if row.attempts >= max_attempts:
+        exhausted = row.attempts >= max_attempts
+        if exhausted:
             await crud.delete_login_otp(db, user.email)
         else:
             await db.flush()
+        await audit(
+            db, Event.OTP_FAILURE, user=user, status="failure",
+            description="invalid code", client=client,
+            context={"attempts": row.attempts, "exhausted": exhausted}, commit=True,
+        )
         raise AuthError("Invalid or expired code")
 
     # Success — single use, clear any password lockout, record the session.
@@ -140,13 +189,10 @@ async def verify_login_otp(
     if device_type:
         user.device_type = device_type
     await db.flush()
-    await record_activity(
-        db,
-        action="user_login_otp",
-        actor_id=user.id,
-        subject_type="User",
-        subject_id=user.id,
-        changes={"method": "otp", "ip": client.ip if client else None},
+
+    await audit(db, Event.OTP_LOGIN, user=user, client=client, context={"device_id": device_id})
+    await audit(
+        db, Event.TOKEN_ISSUED, user=user, client=client,
+        context={"method": "otp", "access": True, "refresh": True},
     )
-    logger.info("user_login_otp", user_id=user.id)
     return user, issue_token_pair(user)

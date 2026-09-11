@@ -8,6 +8,10 @@ security confirmation.
 
 The link flow reuses the same row and its high-entropy token, so it works for
 clients that can open a URL; the app-first clients use the 4-digit code.
+
+Every request/verify (and every suppression/failure) is audited; failure paths
+commit explicitly because the request transaction is rolled back when the domain
+error propagates.
 """
 
 from __future__ import annotations
@@ -20,10 +24,10 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.client_info import ClientInfo
-from app.common.exception.errors import AuthError, RateLimitedError
+from app.common.exception.errors import AppError, AuthError, RateLimitedError
 from app.core.conf import settings
-from app.modules.activity.recorder import record_activity
 from app.modules.users import auth_emails, crud, identifiers, moderation
+from app.modules.users.audit import Event, audit
 from app.modules.users.authentik_sync import sync_set_password
 from app.modules.users.password_policy import validate_password
 from app.modules.users.security import (
@@ -48,6 +52,13 @@ class ResetRequestResult:
     debug_token: str | None = None
 
 
+async def _suppress(db, *, user=None, identifier: str | None = None, reason: str, client=None) -> None:
+    await audit(
+        db, Event.PASSWORD_RESET_REQUEST, user=user, actor_label=identifier,
+        status="failure", description=reason, client=client,
+    )
+
+
 async def request_password_reset(
     db: AsyncSession,
     *,
@@ -63,9 +74,13 @@ async def request_password_reset(
         or moderation.is_banned(user)
     ):
         # Uniform response — never reveal account existence/state.
-        logger.info("password_reset_unknown_identifier")
+        await _suppress(db, identifier=identifier, reason="unknown or unavailable account", client=client)
         return ResetRequestResult(sent=True)
     if moderation.is_throttled(user):
+        await audit(
+            db, Event.PASSWORD_RESET_REQUEST, user=user, status="failure",
+            description="account throttled", client=client, commit=True,
+        )
         raise RateLimitedError("Account is temporarily throttled; try again later")
 
     now = datetime.now(UTC)
@@ -73,7 +88,7 @@ async def request_password_reset(
 
     cooldown = settings.PASSWORD_RESET_RESEND_COOLDOWN_SECONDS
     if existing and existing.last_sent_at and (now - existing.last_sent_at).total_seconds() < cooldown:
-        logger.warning("password_reset_cooldown", user_id=user.id)
+        await _suppress(db, user=user, reason="resend cooldown", client=client)
         return ResetRequestResult(sent=True)
     if (
         existing
@@ -81,7 +96,7 @@ async def request_password_reset(
         and (now - existing.created_at) < timedelta(hours=1)
         and (existing.sent_count or 0) >= settings.PASSWORD_RESET_MAX_PER_HOUR
     ):
-        logger.warning("password_reset_hourly_cap", user_id=user.id, sent=existing.sent_count)
+        await _suppress(db, user=user, reason="hourly cap reached", client=client)
         return ResetRequestResult(sent=True)
 
     is_code = reset_type == RESET_TYPE_CODE
@@ -122,7 +137,11 @@ async def request_password_reset(
             db, user, reset_url=reset_url, expires_minutes=ttl_minutes, client=client
         )
 
-    logger.info("password_reset_requested", user_id=user.id, reset_type=reset_type)
+    await audit(
+        db, Event.PASSWORD_RESET_REQUEST, user=user, client=client,
+        context={"reset_type": reset_type, "expires_at": expires_at.isoformat()},
+    )
+
     result = ResetRequestResult(sent=True, expires_at=expires_at)
     if settings.DEBUG:
         result.debug_code = code
@@ -140,22 +159,44 @@ async def reset_password(
 ) -> None:
     user = await identifiers.resolve_user_by_identifier(db, identifier)
     if user is None:
+        await audit(
+            db, Event.PASSWORD_RESET_FAILURE, actor_label=identifier, status="failure",
+            description="unknown identifier", client=client, commit=True,
+        )
         raise AuthError("Invalid or expired reset code")
-    moderation.ensure_can_authenticate(user)
+    try:
+        moderation.ensure_can_authenticate(user)
+    except AppError as exc:
+        await audit(
+            db, Event.PASSWORD_RESET_FAILURE, user=user, status="failure", description=exc.msg,
+            client=client, context={"reason": exc.code}, commit=True,
+        )
+        raise
 
     row = await crud.get_reset_token(db, user.email)
     if row is None:
+        await audit(
+            db, Event.PASSWORD_RESET_FAILURE, user=user, status="failure",
+            description="no challenge", client=client, commit=True,
+        )
         raise AuthError("Invalid or expired reset code")
 
     now = datetime.now(UTC)
     if row.expires_at is not None and now > row.expires_at:
         await crud.delete_reset_token(db, user.email)
+        await audit(
+            db, Event.PASSWORD_RESET_FAILURE, user=user, status="failure",
+            description="expired", client=client, commit=True,
+        )
         raise AuthError("Reset code expired")
 
     max_attempts = row.max_attempts or settings.PASSWORD_RESET_MAX_ATTEMPTS
     if (row.attempts or 0) >= max_attempts:
         await crud.delete_reset_token(db, user.email)
-        logger.warning("password_reset_attempts_exhausted", user_id=user.id)
+        await audit(
+            db, Event.PASSWORD_RESET_FAILURE, user=user, status="failure",
+            description="attempt cap reached", client=client, commit=True,
+        )
         raise AuthError("Too many invalid attempts; request a new code")
 
     matches = False
@@ -165,10 +206,16 @@ async def reset_password(
         matches = secrets.compare_digest(token_or_code, row.token)
     if not matches:
         row.attempts = (row.attempts or 0) + 1
-        if row.attempts >= max_attempts:
+        exhausted = row.attempts >= max_attempts
+        if exhausted:
             await crud.delete_reset_token(db, user.email)
         else:
             await db.flush()
+        await audit(
+            db, Event.PASSWORD_RESET_FAILURE, user=user, status="failure",
+            description="invalid code", client=client,
+            context={"attempts": row.attempts, "exhausted": exhausted}, commit=True,
+        )
         raise AuthError("Invalid or expired reset code")
 
     # Schema already enforces complexity; this adds the user-specific rules
@@ -181,15 +228,10 @@ async def reset_password(
     user.locked_at = None
     reset_type = row.reset_type
     await crud.delete_reset_token(db, user.email)
-    await record_activity(
-        db,
-        action="password_reset_completed",
-        actor_id=user.id,
-        subject_type="User",
-        subject_id=user.id,
-        changes={"method": reset_type, "ip": client.ip if client else None},
+    await audit(
+        db, Event.PASSWORD_RESET_COMPLETED, user=user, client=client,
+        context={"method": reset_type},
     )
-    logger.info("password_reset_complete", user_id=user.id)
 
     # Mirror into Authentik (best-effort; plaintext only in scope here).
     await sync_set_password(db, user, new_password)

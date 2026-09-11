@@ -24,8 +24,8 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exception.errors import AuthError, ForbiddenError, RateLimitedError
-from app.modules.activity.recorder import record_activity
 from app.modules.users import authentik_sync, crud
+from app.modules.users.audit import Event, audit
 from app.modules.users.authentik_sync import SyncResult
 from app.modules.users.model import User
 
@@ -136,17 +136,13 @@ async def ban_user(
     await crud.delete_reset_token(db, user.email)
     await crud.delete_login_otp(db, user.email)
     await db.flush()
-    await record_activity(
-        db,
-        action="user_banned",
-        actor_id=actor_id,
-        subject_type="User",
-        subject_id=user.id,
+    await audit(
+        db, Event.BAN, user=user, actor_id=actor_id,
         changes={"reason": reason, "until": until.isoformat() if until else None},
+        context={"until": until.isoformat() if until else None},
     )
     if await authentik_sync.sync_set_active(db, user, False) is SyncResult.FAILED:
         _enqueue_sync_active(user.id, False)
-    logger.warning("user_banned", user_id=user.id, by=actor_id, until=until)
     return user
 
 
@@ -157,15 +153,11 @@ async def unban_user(db: AsyncSession, user: User, *, actor_id: int | None = Non
     user.banned_until = None
     user.banned_by = None
     await db.flush()
-    await record_activity(
-        db, action="user_unbanned", actor_id=actor_id,
-        subject_type="User", subject_id=user.id,
-    )
+    await audit(db, Event.UNBAN, user=user, actor_id=actor_id)
     # Restore Authentik access only if the account is otherwise usable.
     if not user.is_deactivated and user.deleted_at is None:
         if await authentik_sync.sync_set_active(db, user, True) is SyncResult.FAILED:
             _enqueue_sync_active(user.id, True)
-    logger.info("user_unbanned", user_id=user.id, by=actor_id)
     return user
 
 
@@ -183,12 +175,11 @@ async def throttle_user(
     user.throttled_until = until
     user.throttled_by = actor_id
     await db.flush()
-    await record_activity(
-        db, action="user_throttled", actor_id=actor_id,
-        subject_type="User", subject_id=user.id,
+    await audit(
+        db, Event.THROTTLE, user=user, actor_id=actor_id,
         changes={"reason": reason, "until": until.isoformat() if until else None},
+        context={"until": until.isoformat() if until else None},
     )
-    logger.warning("user_throttled", user_id=user.id, by=actor_id, until=until)
     return user
 
 
@@ -199,9 +190,5 @@ async def unthrottle_user(db: AsyncSession, user: User, *, actor_id: int | None 
     user.throttled_until = None
     user.throttled_by = None
     await db.flush()
-    await record_activity(
-        db, action="user_unthrottled", actor_id=actor_id,
-        subject_type="User", subject_id=user.id,
-    )
-    logger.info("user_unthrottled", user_id=user.id, by=actor_id)
+    await audit(db, Event.UNTHROTTLE, user=user, actor_id=actor_id)
     return user

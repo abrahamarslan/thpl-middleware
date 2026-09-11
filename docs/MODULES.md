@@ -154,6 +154,19 @@ Settings: `EMAIL_PROVIDER`, `EMAIL_ENABLED`, `EMAIL_LOG_ONLY`,
   `ClientInfoDep` resolves the real IP (`X-Forwarded-For`/`X-Real-IP`), parses
   the device from the User-Agent, and (when `GEOIP_ENABLED=true`, GeoLite2 DB
   mounted) the city/country. Used for logs and the audit block in auth emails.
+- **Moderation** (`moderation.py`): admin **ban**/**unban** (hard; permanent or
+  time-boxed) and **throttle**/**unthrottle** (soft; existing session keeps
+  working, new auth returns 429). Ban destroys in-flight reset/OTP challenges
+  and deactivates the Authentik account. Endpoints under
+  `/api/users/{id}/ban|unban|throttle|unthrottle|moderation`; every action is
+  written to the activity log. Automatic lockout (`locked_at`) remains separate.
+- **Audit logging** (`audit.py`): every auth event (register, login success/
+  failure/lockout, logout, token issue/refresh, OTP, password change/reset,
+  profile diff, ban/throttle) dual-writes an append-only `activity_logs` row +
+  a structured log, correlated by `request_id`. Failure paths commit the
+  counter/lockout **and** their audit row before raising (otherwise the request
+  rollback discards them). See
+  `apps/core-platform/docs/AUTH_AUDIT_LOGGING_PLAN.md`.
 
 Settings (auth OTP): `LOGIN_OTP_CODE_LENGTH`, `LOGIN_OTP_TTL_MINUTES`,
 `LOGIN_OTP_MAX_ATTEMPTS`, `LOGIN_OTP_RESEND_COOLDOWN_SECONDS`,

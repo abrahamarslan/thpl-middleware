@@ -44,9 +44,21 @@ def test_country_only_db_lookup(monkeypatch):
         pytest.skip("GeoLite2-Country.mmdb not present")
     _enable(monkeypatch, city=None, country=_COUNTRY_DB)
     try:
+        location = geoip.lookup_ip("8.8.8.8")
+        assert location is not None
+        assert location.country_code == "US"  # country-only DB still resolves the country
+    finally:
+        geoip._reader.cache_clear()
+
+
+def test_registered_country_fallback(monkeypatch):
+    """Some ranges (Cloudflare 1.1.1.1) have an empty country but a populated
+    registered_country; the lookup must still resolve a country."""
+    _enable(monkeypatch, city=_CITY_DB)
+    try:
         location = geoip.lookup_ip("1.1.1.1")
         assert location is not None
-        assert location.country_code  # country-only DB still resolves the country
+        assert location.country_code == "AU"
     finally:
         geoip._reader.cache_clear()
 

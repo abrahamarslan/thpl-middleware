@@ -14,6 +14,15 @@ from app.modules.users.security import hash_password
 PASSWORD = "0ldPassw0rd"
 
 
+def test_ban_request_coerces_naive_until_to_utc():
+    from datetime import datetime
+
+    from app.modules.users.schema import BanRequest
+
+    req = BanRequest(reason="x", until=datetime(2030, 1, 1, 12, 0))
+    assert req.until is not None and req.until.tzinfo is not None
+
+
 async def _user(db, **overrides) -> User:
     suffix = uuid.uuid4().hex[:8]
     user = User(
@@ -105,6 +114,6 @@ async def test_ban_records_activity(db):
     user = await _user(db)
     await moderation.ban_user(db, user, reason="abuse", actor_id=user.id)
     rows = (
-        await db.scalars(select(ActivityLog).where(ActivityLog.action == "user_banned"))
+        await db.scalars(select(ActivityLog).where(ActivityLog.action == "user.moderation.ban"))
     ).all()
-    assert rows and rows[-1].subject_id == user.id
+    assert rows and rows[-1].subject_id == str(user.id)

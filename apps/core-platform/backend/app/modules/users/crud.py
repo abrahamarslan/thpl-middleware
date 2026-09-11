@@ -98,9 +98,18 @@ async def create(db: AsyncSession, values: dict) -> User:
     return user
 
 
-async def update(db: AsyncSession, user: User, values: dict) -> User:
+def apply_values(user: User, values: dict) -> None:
+    """Set attributes without flushing.
+
+    Lets the service capture a field-level diff (``model_changes``) while the
+    unit-of-work history is still populated, before the flush resets it.
+    """
     for key, value in values.items():
         setattr(user, key, value)
+
+
+async def update(db: AsyncSession, user: User, values: dict) -> User:
+    apply_values(user, values)
     await db.flush()
     await db.refresh(user)
     return user
