@@ -41,6 +41,8 @@ def test_module_routers_registered():
         "/api/zoho/items",
         "/api/zoho/organizations",
         "/api/zoho/sync-engine/modules",
+        "/api/zoho/auth/revoke",
+        "/api/zoho/auth/status",
         "/api/documents/render",
         "/api/documents/attach",
         "/api/files",
@@ -54,6 +56,9 @@ def test_module_routers_registered():
         "/api/activity",
         "/api/search/indexes",
         "/api/search/{index_name}",
+        "/api/me/profile",
+        "/api/countries",
+        "/api/countries/{iso2}/timezones",
     }
     missing = expected - paths
     assert not missing, f"routes missing from the app: {sorted(missing)}"

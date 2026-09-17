@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pydantic import BaseModel
 
 from app.common.client_info import ClientInfo, format_utc
+from app.common.time import format_user_datetime_display
 from app.core.conf import settings
 from app.modules.emails.model import Email
 from app.modules.emails.service import send_template_email
@@ -110,14 +111,21 @@ class PasswordChangedEmailContext(BaseAuthEmailContext):
     pass
 
 
-def _audit_fields(client: ClientInfo | None, at: datetime | None = None) -> dict:
+def _audit_fields(
+    client: ClientInfo | None,
+    at: datetime | None = None,
+    user_tz: str | None = None,
+) -> dict:
     if client is not None:
-        return client.email_context(at=at)
+        return client.email_context(at=at, user_tz=user_tz)
+    timestamp_str = (
+        format_user_datetime_display(at, iana_tz=user_tz) if user_tz else format_utc(at)
+    )
     return {
         "device": "Unknown device",
         "location": "Unknown location",
         "ip": "Unknown",
-        "requested_at": format_utc(at),
+        "requested_at": timestamp_str,
     }
 
 
@@ -152,13 +160,14 @@ async def _send(
 async def send_welcome_email(
     db, user: User, *, client: ClientInfo | None = None, workspace: str | None = None
 ) -> Email:
+    user_tz = getattr(user, "timezone", None) or "Asia/Kolkata"
     context = WelcomeEmailContext(
         name=user.name,
         email=user.email,
         account_id=account_id_for(user),
         workspace=workspace,
         dashboard_url=f"{settings.FRONTEND_URL.rstrip('/')}/dashboard",
-        **_audit_fields(client),
+        **_audit_fields(client, user_tz=user_tz),
     )
     return await _send(db, "welcome", user, context, client, purpose="welcome")
 
@@ -167,13 +176,14 @@ async def send_login_otp_email(
     db, user: User, *, code: str, expires_minutes: int, client: ClientInfo | None = None
 ) -> Email:
     formatted = f"{code[:3]}-{code[3:]}" if len(code) > 3 else code
+    user_tz = getattr(user, "timezone", None) or "Asia/Kolkata"
     context = LoginOtpEmailContext(
         name=user.name,
         email=user.email,
         code=code,
         code_formatted=formatted,
         expires_minutes=expires_minutes,
-        **_audit_fields(client),
+        **_audit_fields(client, user_tz=user_tz),
     )
     return await _send(db, "login_otp", user, context, client, purpose="login_otp")
 
@@ -188,8 +198,9 @@ async def send_password_reset_code_email(
     attempts_allowed: int,
     client: ClientInfo | None = None,
 ) -> Email:
+    user_tz = getattr(user, "timezone", None) or "Asia/Kolkata"
     formatted_expiry = (
-        f"{expires_at.astimezone(UTC):%H:%M} UTC" if expires_at else None
+        format_user_datetime_display(expires_at, iana_tz=user_tz) if expires_at else None
     )
     context = PasswordResetCodeEmailContext(
         name=user.name,
@@ -198,7 +209,7 @@ async def send_password_reset_code_email(
         expires_minutes=expires_minutes,
         expires_at=formatted_expiry,
         attempts_allowed=attempts_allowed,
-        **_audit_fields(client),
+        **_audit_fields(client, user_tz=user_tz),
     )
     return await _send(db, "password_reset_code", user, context, client, purpose="password_reset")
 
@@ -211,12 +222,13 @@ async def send_password_reset_link_email(
     expires_minutes: int,
     client: ClientInfo | None = None,
 ) -> Email:
+    user_tz = getattr(user, "timezone", None) or "Asia/Kolkata"
     context = PasswordResetLinkEmailContext(
         name=user.name,
         email=user.email,
         reset_url=reset_url,
         expires_minutes=expires_minutes,
-        **_audit_fields(client),
+        **_audit_fields(client, user_tz=user_tz),
     )
     return await _send(db, "password_reset_link", user, context, client, purpose="password_reset")
 
@@ -224,9 +236,8 @@ async def send_password_reset_link_email(
 async def send_password_changed_email(
     db, user: User, *, client: ClientInfo | None = None
 ) -> Email:
+    user_tz = getattr(user, "timezone", None) or "Asia/Kolkata"
     context = PasswordChangedEmailContext(
-        name=user.name,
-        email=user.email,
-        **_audit_fields(client),
+        name=user.name, email=user.email, **_audit_fields(client, user_tz=user_tz)
     )
     return await _send(db, "password_changed", user, context, client, purpose="password_changed")

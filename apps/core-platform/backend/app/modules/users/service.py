@@ -5,22 +5,27 @@ password change/forgot/reset, Authentik JIT provisioning, and the full
 user CRUD lifecycle (list/get/create/update/soft-delete/restore/hard-delete).
 """
 
+import json
 import secrets
+import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from geoalchemy2 import WKTElement
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.client_info import ClientInfo
 from app.common.exception.errors import AppError, AuthError, ConflictError, ForbiddenError, NotFoundError
 from app.common.security.jwt import decode_token
+from app.common.time import is_valid_iana_timezone
 from app.core.conf import settings
 from app.modules.activity.recorder import model_changes
 from app.modules.users import auth_emails, authentik_sync, crud, identifiers, moderation, password_reset
 from app.modules.users.audit import Event, audit
 from app.modules.users.authentik_sync import AUTHENTIK_SYNCED_FIELDS, SyncResult
-from app.modules.users.model import User
+from app.modules.users.model import Country, CountryTimezone, Timezone, TimezoneSource, User, UserProfile
 from app.modules.users.password_policy import validate_password
 from app.modules.users.schema import (
     GEO_FIELDS,
@@ -29,6 +34,7 @@ from app.modules.users.schema import (
     TokenPair,
     UserCreate,
     UserListFilters,
+    UserProfileUpdate,
     UserUpdate,
 )
 from app.modules.users.security import hash_password, verify_password
@@ -72,6 +78,33 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
         raise ConflictError("This username is taken")
     validate_password(body.password, email=body.email, name=body.name)
 
+    # Localization resolution via GeoIP client info
+    detected_country_code = (client.country_code.strip().upper() if client and client.country_code else None)
+    detected_country_name = client.country if client else None
+    detected_timezone = (client.timezone.strip() if client and client.timezone else None)
+
+    country_row = None
+    if detected_country_code:
+        country_row = await db.scalar(select(Country).where(Country.iso2 == detected_country_code))
+
+    resolved_country_iso2 = country_row.iso2 if country_row else (detected_country_code or "IN")
+    resolved_country_name = country_row.name if country_row else (detected_country_name or "India")
+    resolved_currency = country_row.currency_code if (country_row and country_row.currency_code) else "INR"
+
+    resolved_tz = None
+    if detected_timezone and is_valid_iana_timezone(detected_timezone):
+        resolved_tz = detected_timezone
+    elif resolved_country_iso2:
+        default_tz = await db.scalar(
+            select(CountryTimezone.timezone_name)
+            .where(CountryTimezone.country_iso2 == resolved_country_iso2)
+            .where(CountryTimezone.is_default.is_(True))
+        )
+        if default_tz:
+            resolved_tz = default_tz
+
+    resolved_tz = resolved_tz or "Asia/Kolkata"
+
     user = await crud.create(db, {
         "name": body.name,
         "email": body.email.lower(),
@@ -79,6 +112,10 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
         "phone": body.phone,
         "password": hash_password(body.password),
         "last_password_change_at": datetime.now(UTC),
+        "country": resolved_country_name,
+        "country_code": resolved_country_iso2,
+        "timezone": resolved_tz,
+        "currency": resolved_currency,
     })
     await audit(
         db, Event.REGISTER, user=user, client=client,
@@ -95,6 +132,15 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
         await auth_emails.send_welcome_email(db, user, client=client)
     except Exception as e:  # noqa: BLE001
         logger.error("welcome_email_failed", user_id=user.id, error=str(e))
+
+    # Initialize localization profile (auto-timezone)
+    await get_or_create_profile(
+        db,
+        user.id,
+        initial_country=resolved_country_iso2 if (country_row or detected_country_code) else None,
+        initial_timezone=resolved_tz,
+    )
+
     return user
 
 
@@ -259,9 +305,12 @@ async def request_password_reset(
     result = await password_reset.request_password_reset(
         db, identifier=identifier, reset_type=reset_type, client=client
     )
-    payload: dict = {"sent": result.sent}
-    if result.expires_at:
-        payload["expires_at"] = result.expires_at
+    payload: dict = {
+        "sent": result.sent,
+        "email": result.email,
+        "masked_email": result.masked_email,
+        "expires_at": result.expires_at,
+    }
     if settings.DEBUG:
         payload["debug_code"] = result.debug_code
         payload["debug_token"] = result.debug_token
@@ -466,3 +515,210 @@ async def logout(db: AsyncSession, user: User, *, client: ClientInfo | None = No
     user.has_active_session = False
     await db.flush()
     await audit(db, Event.LOGOUT, user=user, client=client)
+
+
+# ── Profile & Localization (auto-unless-overridden) ───────────────────────────
+
+async def get_or_create_profile(
+    db: AsyncSession,
+    user_id: int,
+    initial_country: str | None = None,
+    initial_timezone: str | None = None,
+) -> UserProfile:
+    """Retrieve existing UserProfile or initialize with detected or default localization."""
+    stmt = select(UserProfile).where(UserProfile.user_id == user_id)
+    profile = await db.scalar(stmt)
+    if profile is None:
+        profile = UserProfile(
+            user_id=user_id,
+            country_iso2=initial_country or "IN",
+            timezone_name=initial_timezone or "Asia/Kolkata",
+            timezone_source=TimezoneSource.auto,
+        )
+        db.add(profile)
+        await db.flush()
+        await db.refresh(profile)
+    return profile
+
+
+async def set_user_country(db: AsyncSession, profile: UserProfile, country_iso2: str) -> UserProfile:
+    """Update user country; auto-fills default timezone if timezone_source is 'auto'."""
+    iso2 = country_iso2.strip().upper()
+    country = await db.scalar(select(Country).where(Country.iso2 == iso2))
+    if not country:
+        raise NotFoundError(f"Country with ISO2 code '{iso2}' not found")
+
+    profile.country_iso2 = iso2
+
+    if profile.timezone_source == TimezoneSource.auto:
+        default_tz = await db.scalar(
+            select(CountryTimezone.timezone_name)
+            .where(CountryTimezone.country_iso2 == iso2)
+            .where(CountryTimezone.is_default.is_(True))
+        )
+        if default_tz:
+            profile.timezone_name = default_tz
+
+    user = await crud.get_by_id(db, profile.user_id)
+    if user:
+        user.country = country.name
+        user.country_code = country.iso2
+        if profile.timezone_name:
+            user.timezone = profile.timezone_name
+        if country.currency_code:
+            user.currency = country.currency_code
+
+    await db.flush()
+    return profile
+
+
+async def set_user_timezone_manually(db: AsyncSession, profile: UserProfile, timezone_name: str) -> UserProfile:
+    """Manually set user timezone, permanently locking timezone_source to 'manual'."""
+    tz_name = timezone_name.strip()
+    tz_exists = await db.scalar(select(Timezone.iana_name).where(Timezone.iana_name == tz_name))
+    if not tz_exists:
+        raise NotFoundError(f"Timezone '{tz_name}' not found in reference database")
+
+    profile.timezone_name = tz_name
+    profile.timezone_source = TimezoneSource.manual
+
+    user = await crud.get_by_id(db, profile.user_id)
+    if user:
+        user.timezone = tz_name
+
+    await db.flush()
+    return profile
+
+
+async def update_user_profile(
+    db: AsyncSession, user: User, body: UserProfileUpdate
+) -> UserProfile:
+    """Update user profile country and/or timezone."""
+    profile = await get_or_create_profile(db, user.id)
+    if body.country:
+        profile = await set_user_country(db, profile, body.country)
+    if body.timezone:
+        profile = await set_user_timezone_manually(db, profile, body.timezone)
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+# ── Reference Data Caching (L1 In-Memory + L2 Redis DB 0) ────────────────────
+
+_L1_CACHE: dict[str, tuple[float, Any]] = {}
+_L1_TTL_SECONDS = 3600  # 1 hour in-process TTL
+
+
+def _get_l1(key: str) -> Any | None:
+    if key in _L1_CACHE:
+        expires_at, val = _L1_CACHE[key]
+        if time.monotonic() < expires_at:
+            return val
+        del _L1_CACHE[key]
+    return None
+
+
+def _set_l1(key: str, val: Any, ttl: float = _L1_TTL_SECONDS) -> None:
+    _L1_CACHE[key] = (time.monotonic() + ttl, val)
+
+
+def invalidate_l1_cache() -> None:
+    _L1_CACHE.clear()
+
+
+async def get_cached_countries(db: AsyncSession) -> list[dict]:
+    """Retrieve list of active countries (L1 Memory -> L2 Redis -> DB)."""
+    cache_key = "ref:countries:all"
+    l1_val = _get_l1(cache_key)
+    if l1_val is not None:
+        return l1_val
+
+    try:
+        from app.database.redis import redis_client
+        cached_redis = await redis_client.get(cache_key)
+        if cached_redis:
+            data = json.loads(cached_redis)
+            _set_l1(cache_key, data)
+            return data
+    except Exception as e:
+        logger.warning("redis_cache_get_failed", key=cache_key, error=str(e))
+
+    stmt = select(Country).where(Country.is_active.is_(True)).order_by(Country.name)
+    rows = (await db.scalars(stmt)).all()
+    data = [
+        {
+            "iso2": c.iso2,
+            "iso3": c.iso3,
+            "numeric_code": c.numeric_code,
+            "name": c.name,
+            "official_name": c.official_name,
+            "region": c.region,
+            "subregion": c.subregion,
+            "phone_code": c.phone_code,
+            "currency_code": c.currency_code,
+            "is_active": c.is_active,
+        }
+        for c in rows
+    ]
+
+    _set_l1(cache_key, data)
+    try:
+        from app.database.redis import redis_client
+        await redis_client.set(cache_key, json.dumps(data), ex=86400)
+    except Exception as e:
+        logger.warning("redis_cache_set_failed", key=cache_key, error=str(e))
+
+    return data
+
+
+async def get_cached_country_timezones(db: AsyncSession, country_iso2: str) -> list[dict]:
+    """Retrieve timezones for a given country (L1 Memory -> L2 Redis -> DB)."""
+    iso2 = country_iso2.strip().upper()
+    cache_key = f"ref:country_tz:{iso2}"
+
+    l1_val = _get_l1(cache_key)
+    if l1_val is not None:
+        return l1_val
+
+    try:
+        from app.database.redis import redis_client
+        cached_redis = await redis_client.get(cache_key)
+        if cached_redis:
+            data = json.loads(cached_redis)
+            _set_l1(cache_key, data)
+            return data
+    except Exception as e:
+        logger.warning("redis_cache_get_failed", key=cache_key, error=str(e))
+
+    stmt = (
+        select(CountryTimezone)
+        .where(CountryTimezone.country_iso2 == iso2)
+        .order_by(CountryTimezone.is_default.desc(), CountryTimezone.timezone_name)
+    )
+    rows = (await db.scalars(stmt)).all()
+    data = [
+        {"timezone_name": r.timezone_name, "is_default": r.is_default}
+        for r in rows
+    ]
+
+    _set_l1(cache_key, data)
+    try:
+        from app.database.redis import redis_client
+        await redis_client.set(cache_key, json.dumps(data), ex=86400)
+    except Exception as e:
+        logger.warning("redis_cache_set_failed", key=cache_key, error=str(e))
+
+    return data
+
+
+async def invalidate_reference_cache() -> None:
+    """Clear both L1 in-memory and L2 Redis reference cache keys."""
+    invalidate_l1_cache()
+    try:
+        from app.database.redis import redis_client
+        keys = await redis_client.keys("ref:*")
+        if keys:
+            await redis_client.delete(*keys)
+    except Exception as e:
+        logger.warning("redis_cache_invalidation_failed", error=str(e))

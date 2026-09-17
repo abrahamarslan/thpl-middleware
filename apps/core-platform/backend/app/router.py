@@ -10,7 +10,7 @@ from app.modules.files.api import router as files_router
 from app.modules.media.api import router as media_router
 from app.modules.search.api import router as search_router
 from app.modules.tags.api import router as tags_router
-from app.modules.users.api import auth_router, users_router
+from app.modules.users.api import auth_router, countries_router, me_router, users_router
 from app.modules.zoho.api import router as zoho_router
 from app.modules.zoho.organizations.api import router as zoho_organizations_router
 from app.modules.zoho.sync.api import router as zoho_sync_engine_router
@@ -21,6 +21,8 @@ api_router = APIRouter()
 
 api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 api_router.include_router(users_router, prefix="/users", tags=["users"])
+api_router.include_router(me_router, prefix="/me", tags=["me"])
+api_router.include_router(countries_router, prefix="/countries", tags=["countries"])
 # Zoho: specific sub-routers BEFORE the generic /zoho router (route priority)
 api_router.include_router(zoho_auth_router, prefix="/zoho/auth", tags=["zoho:auth"])
 api_router.include_router(zoho_organizations_router, prefix="/zoho/organizations", tags=["zoho:organizations"])

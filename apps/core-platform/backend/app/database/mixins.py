@@ -17,6 +17,7 @@ Mix into a model in this order (most-specific first, Base last):
 """
 
 import uuid
+from uuid import UUID as PyUUID, uuid4 as py_uuid4
 from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, func
@@ -28,6 +29,18 @@ class IntPKMixin:
     """Surrogate big-integer primary key (internal; never exposed in APIs)."""
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+
+class BigIntPKWithUUIDMixin(IntPKMixin):
+    """Surrogate BigInteger PK for internal indexing/joins + public UUID for API exposure."""
+
+    uuid: Mapped[PyUUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        default=py_uuid4,
+        unique=True,
+        index=True,
+        nullable=False,
+    )
 
 
 class TimestampMixin:

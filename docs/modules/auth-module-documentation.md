@@ -143,6 +143,45 @@ the code flow instead.
 `POST /refresh`: decode the refresh token (type-checked) → user must still be
 active → new `TokenPair`.
 
+### 3.8 Password reset vs. passwordless OTP login
+
+These are two **different** one-time-code flows. Both reuse the shared code
+security model (§6), but they serve different purposes and use different
+endpoints, tables and limits.
+
+| | Password reset | Passwordless OTP login |
+|---|---|---|
+| Endpoints | `POST /forgot-password` → `POST /reset-password` | `POST /login-otp/request` → `POST /login-otp/verify` |
+| Purpose | Recover access when the user forgot their password | Sign in without a password |
+| Result | New password stored; the user still has to log in | `TokenPair` issued immediately (logged in) |
+| Request returns | `{sent, email, masked_email, expires_at, debug_code?, debug_token?}` | `{sent, expires_at, debug_code?}` |
+| Verify returns | `{reset: true}` | `TokenPair` |
+| Challenge table | `PasswordResetToken` | `LoginOtpToken` |
+| Code length | `PASSWORD_RESET_CODE_LENGTH` (4) | `LOGIN_OTP_CODE_LENGTH` (6) |
+| TTL | code `PASSWORD_RESET_CODE_TTL_MINUTES` (10) / link `PASSWORD_RESET_LINK_TTL_MINUTES` (60) | `LOGIN_OTP_TTL_MINUTES` (15) |
+| Attempt cap | `PASSWORD_RESET_MAX_ATTEMPTS` (3) | `LOGIN_OTP_MAX_ATTEMPTS` (5) |
+| Extras | optional link token; sends **password changed** email | clears any password lockout |
+
+- `/forgot-password` = **request** step: creates the challenge and emails the
+  code (or link). `/reset-password` = **complete** step: verifies
+  `token_or_code`, applies the password policy, stores the new hash, deletes the
+  challenge (single use).
+- Neither endpoint is a login: after a successful reset the client must call
+  `/login` (or `/login-otp/verify`) to obtain tokens.
+
+**Client-side countdown (progress bar / remaining time).** Do **not** hardcode
+the duration — the backend already returns it:
+- `/forgot-password` returns `expires_at` (UTC ISO-8601). Capture it on the
+  request response and compute `remaining = expires_at - now`.
+- The **total** duration depends on `reset_type`: `code` → 10 min, `link` →
+  60 min. Derive it as `total = expires_at - requestedAt` (the moment the
+  request returned) so the progress fraction is `remaining / total`; fall back
+  to the configured TTL only if `expires_at` is absent.
+- `/reset-password` returns no timing (it is the terminal action).
+- The resend cooldown is `PASSWORD_RESET_RESEND_COOLDOWN_SECONDS` (60) and is
+  **not** currently returned by the API — use a client constant if you need to
+  disable the "Resend" button.
+
 ---
 
 ## 4. Identifier resolution — `identifiers.py`
@@ -197,8 +236,14 @@ Shared by password reset and login OTP (`PasswordResetToken`,
 - **Attempt cap** — default 3 (reset) / 5 (OTP); the row is destroyed at the cap.
 - **Single use** — deleted on success.
 - **Resend throttle** — per-row cooldown (60 s) + hourly cap (5).
-- **Uniform responses** — `{sent:true}` regardless of account existence/state;
-  401 `"Invalid or expired reset code"` on verify failure.
+- **Uniform responses** — `{sent:true, email, masked_email, expires_at}` regardless of account
+  existence/state (`expires_at`, `email`, and `masked_email` are always present;
+  for unknown accounts with an email identifier, the submitted email is echoed
+  and masked, preventing account enumeration); 401
+  `"Invalid or expired reset code"` on verify failure.
+- **User timezone formatting** — OTP and security email timestamps are formatted
+  in the user's local timezone (e.g. `17:20 IST` or `08:00 EDT`) rather than
+  raw UTC.
 - **Numeric codes** drawn from `secrets`.
 
 A 4-digit code is only safe *because* of these caps — the TTL is deliberately
@@ -309,7 +354,9 @@ Integration tests skip cleanly without Postgres.
 ## 12. Security decisions & caveats
 
 - **Uniform responses** everywhere account existence could leak
-  (`forgot-password`, `login-otp/request`, `login` invalid credentials).
+  (`forgot-password`, `login-otp/request`, `login` invalid credentials). The
+  `{sent, expires_at}` payload has identical keys for known and unknown
+  accounts — the implied expiry is returned even when no challenge is created.
 - **Best-effort notifications** (welcome, password-changed) never roll back a
   completed state change; a mail outage is logged, not surfaced as a 500.
 - **OTP vs password lockout are independent** (see §6).

@@ -29,6 +29,7 @@ th-middleware/
 | `docs/modules/email-module-documentation.md` | **The email module**: provider adapter + registry, Jinja2 templates, compose/template send paths, delivery/retries, webhooks, provenance + analytics, config reference, ops runbook and extension recipes. |
 | `docs/modules/auth-module-documentation.md` | **The auth surface**: endpoint reference, password/OTP login + registration + reset flows, identifier resolution, password policy, one-time-code security model, request audit (IP/device/GeoIP), auth emails, config and runbook. |
 | `docs/zoho-module-implementation-guide.md` | Step-by-step: build a Zoho module (API → local Postgres → Debezium → ClickHouse). |
+| `docs/features-implemented/user-localization-timezone-and-messaging.md` | **User Localization, Timezone & Messaging Architecture**: Dynamic module-level language resolution, DST-safe `whenever` time engine, dual-key user profiles (`BigInteger` PK + `UUID`), reference geo/timezone data, factories, seeders, and migration guide. |
 | `docs/modules-to-implement/*.md` | The original module specs the implementations in MODULES.md were built from. |
 | `docs/AUTHENTIK_SYNC.md` | Outbound user sync (app → Authentik): architecture, field/ID mapping, lifecycle map, one-time Authentik setup, backfill, ops queries. |
 | `docs/zoho-docs-md/*.md` | Vendored Zoho Books API reference (oauth, contacts, items, invoices, …). Used when implementing modules. |
@@ -56,7 +57,7 @@ th-middleware/
 |---|---|
 | `env.py` | Async migration environment. Imports `Base` and every module's `model.py` so `--autogenerate` detects tables. URL comes from `app.core.conf.settings`. |
 | `script.py.mako` | Template for generated migration files. |
-| `versions/` | Generated migrations live here. Create: `./manage.sh makemig "add zoho_contacts"`; apply: `./manage.sh migrate`. |
+| `versions/` | Generated migrations live here. Create: `./manage.sh makemig "add zoho_contacts"`; apply: `./manage.sh migrate`. Includes `20260917_1800_a1b2c3d4e5f6_add_country_code_to_users.py` (adds `country_code` to `users`). |
 
 ### 2.2b Logging config — `config/logging/` (baked into the image; bind-mountable)
 
@@ -101,7 +102,10 @@ Configuration precedence: code defaults → `config/logging/logging.yaml` → `e
 | `log.py` | Backward-compat facade re-exporting `configure_logging` / `get_logger` / `get_logging_config` from `app.core.logging`. Called by the app factory and the Celery `setup_logging` signal. Use `structlog.get_logger("app.<module>.<area>")` in code so per-module config applies. |
 | `exception/errors.py` | Domain exception hierarchy (`AppError`, `NotFoundError`, `AuthError`, `ForbiddenError`, `ConflictError`, `UpstreamError`). Services raise these; never raise bare `HTTPException` for business errors. |
 | `exception/handlers.py` | Global handlers translating any exception into the unified envelope `{code, msg, data, request_id}`. Unhandled exceptions log a full traceback (→ Loki) and return an opaque 500. |
-| `response/schema.py` | `ResponseModel[T]` success envelope and `PageModel[T]` for paginated payloads. |
+| `response/schema.py` | `ResponseModel[T]` success envelope with `ResponseModel.ok(...)` localized catalog helper, and `PageModel[T]` for paginated payloads. |
+| `response/messages.py` | Dynamic module-level language catalog loader: memory-cached, dot/slash path normalized, fallback to `en`, keyword interpolation (`{param}`). |
+| `time.py` | Type-safe, DST-safe datetime/timezone engine powered by `whenever`: `now_utc()`, `to_user_tz()`, `format_user_datetime()`, `to_db_utc()`, `from_db_utc()`, `is_valid_iana_timezone()`, and `WheneverInstant` SQLAlchemy TypeDecorator. |
+| `generators/identities.py` | Shared mock and test data primitives: Indian phone numbers, PAN, GSTIN, recent `whenever.Instant` timestamps. |
 | `serialization.py` | `to_jsonable()` — coerces datetime/Decimal/UUID/Enum (recursively) into JSON-safe values before writing JSONB columns (used by the activity recorder). |
 | `security/jwt.py` | First-party PyJWT helpers: HS256 access **and refresh** tokens (`create_access_token`, `create_refresh_token`, `decode_token` with type checking). |
 | `security/authentik.py` | Authentik OIDC validation (**inbound**): fetches the provider's JWKS (cached), verifies RS256 tokens (issuer/audience), used by the `CurrentUser` dependency for SSO logins. |
@@ -114,7 +118,7 @@ Configuration precedence: code defaults → `config/logging/logging.yaml` → `e
 | File | Purpose / usage |
 |---|---|
 | `db.py` | Async SQLAlchemy engine (pool settings from conf), `Base` declarative class, `get_db` session dependency (`DBSession` annotation) with commit-or-rollback semantics. Imports `soft_delete` for its listener side effect. |
-| `mixins.py` | Reusable model mixins (cross-cutting **columns**): `IntPKMixin`, `TimestampMixin`, `SoftDeleteMixin`, `TenantMixin`, `AuditUserMixin`. Mix in most-specific-first, `Base` last. |
+| `mixins.py` | Reusable model mixins (cross-cutting **columns**): `IntPKMixin`, `BigIntPKWithUUIDMixin` (BigInteger PK + indexed unique UUID public key), `TimestampMixin`, `SoftDeleteMixin`, `TenantMixin`, `AuditUserMixin`. Mix in most-specific-first, `Base` last. |
 | `soft_delete.py` | `SoftDeleteFilteredMixin` + global `do_orm_execute` listener: opted-in models get `deleted_at IS NULL` on every SELECT; escape with `execution_options(include_deleted=True)`. See docs/MODULES.md. |
 | `redis.py` | Shared async Redis client (`redis_client`) for caching, locks, token storage. |
 
@@ -164,8 +168,8 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 
 | File | Purpose / usage |
 |---|---|
-| `users/model.py` | `User` (200+ columns: identity, 2FA, status, personal/family, professional, company, preferences, textual + geospatial location, tracking metadata, integration IDs incl. **Authentik mirror state**, targets, login tracking, audit, soft deletes), `PasswordResetToken` (hardened one-time-code row: keyed `code_hash`, attempt cap, expiry, send-count/cooldown) and `LoginOtpToken` (passwordless email OTP challenge). Geography columns get GIST indexes automatically. |
-| `users/schema.py` | `UserProfileBase` (every editable field), `UserCreate`/`UserUpdate`/`UserOut` (secrets excluded; geography as WKT strings), `UserListFilters`, auth schemas (login, **login-OTP**, register, refresh, password flows; password fields use the policy `PasswordStr` type; reset/OTP take a single `identifier`). |
+| `users/model.py` | `User` (200+ columns: identity, 2FA, status, personal/family, professional, company, preferences, textual + geospatial location, `country_code` ISO-2, tracking metadata, integration IDs incl. **Authentik mirror state**, targets, login tracking, audit, soft deletes), `PasswordResetToken` (hardened one-time-code row: keyed `code_hash`, attempt cap, expiry, send-count/cooldown), `LoginOtpToken` (passwordless email OTP challenge), `Country` (ISO 3166-1 alpha-2/3, numeric, dialing code, currency, continent), `Timezone` (IANA identifier), `CountryTimezone` (many-to-many with partial unique default index), and `UserProfile` (dual-key `BigIntPKWithUUIDMixin`, `user_id` FK, timezone settings, auto/manual `TimezoneSource`). Geography columns get GIST indexes automatically. |
+| `users/schema.py` | `UserProfileBase` (every editable field), `UserCreate`/`UserUpdate`/`UserOut` (secrets excluded; geography as WKT strings), `UserListFilters`, auth schemas (login, **login-OTP**, register, refresh, password flows; password fields use the policy `PasswordStr` type; reset/OTP take a single `identifier`), `CountryOut`, `CountryTimezoneOut`, `UserProfileUpdate`, and `UserProfileOut`. |
 | `users/crud.py` | Lookups (id/email/username/**phone**/external_id), filtered + paginated list, create/update, soft-delete/restore/hard-delete, reset-token + login-OTP storage. |
 | `users/identifiers.py` | Resolves an auth `identifier` (email \| username \| phone) to a user, shape-driven with a username fallback. |
 | `users/security.py` | Password hashing (bcrypt) + one-time code hashing (keyed HMAC-SHA256, never plaintext) and numeric code generation. |
@@ -177,10 +181,13 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `users/audit.py` | Auth **event catalog** + `audit()` dual-write helper (append-only `activity_logs` row + structured log); `commit=True` persists failure-path state before raising. |
 | `users/auth_emails.py` | Auth transactional emails (typed Pydantic contexts) sent through the reusable email layer: welcome, login OTP, password reset code/link, password changed. Templates live in `users/templates/`. |
 | `users/templates/` | Auth email HTML/text templates (Jinja2) extending the shared `_base.en.html` shell. |
-| `users/service.py` | Registration (+ welcome email), login with lockout, token pair issuance/refresh, change password, **password reset** (delegates to `password_reset`), **Authentik JIT provisioning**, full CRUD lifecycle with WKT→PostGIS conversion. |
+| `users/service.py` | Registration (+ welcome email + profile initialization), login with lockout, token pair issuance/refresh, change password, **password reset** (delegates to `password_reset`), **Authentik JIT provisioning**, full CRUD lifecycle with WKT→PostGIS conversion, and `UserProfile` operations (`get_or_create_profile`, `set_user_country` with auto-timezone, `set_user_timezone_manually`, cached countries/timezones). |
 | `users/authentik_sync.py` | **Outbound sync orchestration** (app → Authentik): `sync_create/update_profile/set_password/set_active/delete`, local→Authentik field mapping, `SyncResult` enum, `AUTHENTIK_SYNCED_FIELDS`. Best-effort — never raises into the request. See [docs/AUTHENTIK_SYNC.md](AUTHENTIK_SYNC.md). |
 | `users/deps.py` | `CurrentUser` dependency: accepts Authentik RS256 **or** first-party HS256 tokens, resolves/provisions the DB user, rejects deactivated accounts. Used by every protected endpoint. |
-| `users/api.py` | `/api/auth/*` (register, login, **login-otp/request**, **login-otp/verify**, refresh, **logout**, me, password-policy, change/forgot/reset-password, dev-token) and `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore, **ban/unban**, **throttle/unthrottle**, moderation status). All auth entry points resolve request IP/device/GeoIP audit context and are audited. |
+| `users/api.py` | `/api/auth/*` (register with localized friendly messages, login, **login-otp/request**, **login-otp/verify**, refresh, **logout**, me, password-policy, change/forgot/reset-password, dev-token), `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore, **ban/unban**, **throttle/unthrottle**, moderation status), `countries_router` (`/api/countries`, `/api/countries/{iso2}/timezones`), and `me_router` (`/api/me/profile`). All auth entry points resolve request IP/device/GeoIP audit context and are audited. |
+| `users/lang/en.py` | English translation catalog for user module responses (`register.success`, `profile.updated`, etc.). |
+| `users/generators/user_factory.py` | Mock data generation factories: `create_mock_user` and `create_mock_user_profile`. |
+| `users/seeders/reference.py` | Reference data seeder populating `countries`, `timezones`, and `country_timezones` from ISO 3166-1 `countries.json` and IANA `zone1970.tab`. |
 | `documents/api.py` | `POST /api/documents/render` → enqueues Celery PDF task, returns `202 + task_id`; `GET /render/{task_id}` polls status. |
 | `documents/service.py` | `render_html_to_pdf()` — calls Gotenberg over the isolated `app-pdf` network, stores output in the shared media volume. Sync by design: PDF work belongs in workers. |
 | `documents/schema.py` | Render request / task status schemas. |
@@ -202,6 +209,13 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `crud.py` | Upsert/read of `zoho_sync_state`. |
 | `model.py` | `ZohoSyncState` table — legacy incremental-sync cursor per entity (the sync engine uses `zoho_sync_stats` instead). |
 | `schema.py` | Transport schemas (`ZohoItem`, `SyncStateOut`). |
+
+#### `app/modules/zoho/auth/` — Zoho OAuth authentication & token management
+
+| File | Purpose / usage |
+|---|---|
+| `api.py` | OAuth flow endpoints: `/api/zoho/auth/initiate`, `/api/zoho/auth/callback`, `/api/zoho/auth/status`, and `/api/zoho/auth/revoke` (localized response envelope via `ResponseModel.ok`). |
+| `lang/en.py` | English translation catalog for Zoho auth callbacks, initiate, status, and token revocations (`auth_initiated`, `auth_connected`, `auth_disconnected`, `status_connected`, `status_disconnected`). |
 
 #### `app/modules/zoho/sync/` — **the Sync Engine** (see [docs/ZOHO_SYNC_ENGINE.md](ZOHO_SYNC_ENGINE.md))
 
@@ -266,6 +280,18 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `test_geoip.py` | GeoIP against the real GeoLite2 `.mmdb` files (skips if absent): city lookup, country fallback, `registered_country` fallback, private-IP skip. |
 | `test_auth_audit.py` / `test_auth_failure_persistence.py` | Integration: auth event audit rows + profile diff JSON; failed-login counter/audit survive the 401 rollback (real HTTP + `get_db`). |
 | `test_authentik_sync.py` | Outbound Authentik field mapping. |
+| `test_time_utility.py` | Hermetic: `whenever` datetime/timezone engine, UTC conversions, ISO 8601 parsing, and `WheneverInstant` SQLAlchemy TypeDecorator. |
+| `test_response_messages.py` | Hermetic: module language catalog loading, memory caching, parameter interpolation, and fallback resolution. |
+| `test_zone1970_parser.py` | Unit tests for IANA `zone1970.tab` country timezone mapping and primary timezone defaults. |
+| `test_profile_endpoints.py` | Hermetic & mocked boundary tests for `/api/countries`, `/api/countries/{iso2}/timezones`, `/api/me/profile`, localized `/register` responses, and `/api/zoho/auth/revoke`. |
+
+#### `scripts/` — Seeding & Utility Scripts
+
+| File | Purpose / usage |
+|---|---|
+| `seed.py` | Central database seeding orchestrator running domain seeders in strict dependency order. |
+| `seed_countries_timezones.py` | Standalone CLI seeder: parses ISO 3166-1 `countries.json` and IANA `zone1970.tab` to seed countries, timezones, and country-timezone associations with progress logging. |
+| `seed_countries_timezones.sh` | Shell wrapper loading `.env` and executing `seed_countries_timezones.py`. |
 
 Dev helper dot-scripts in `backend/`: `.setup_venv.sh` (venv + deps),
 `.dev_check.sh [test]` (import smoke + pytest), `.dev_migrate.sh

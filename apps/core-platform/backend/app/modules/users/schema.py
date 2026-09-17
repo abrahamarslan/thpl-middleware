@@ -11,6 +11,7 @@ Conventions:
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -161,6 +162,7 @@ class UserProfileBase(BaseModel):
     state: str | None = None
     postal_code: str | None = None
     country: str | None = None
+    country_code: str | None = Field(None, max_length=2, description="ISO 3166-1 alpha-2 country code")
 
     # == Location (geospatial — WKT strings, SRID 4326, lng/lat) ==
     location: str | None = None
@@ -360,6 +362,15 @@ class ForgotPasswordRequest(BaseModel):
     reset_type: str = Field(default="code", pattern="^(link|code)$")
 
 
+class ForgotPasswordOut(BaseModel):
+    sent: bool = True
+    email: str | None = None
+    masked_email: str | None = None
+    expires_at: datetime | None = None
+    debug_code: str | None = None
+    debug_token: str | None = None
+
+
 class ResetPasswordRequest(BaseModel):
     identifier: str = Field(min_length=3, max_length=255)
     token_or_code: str = Field(min_length=3, max_length=255, description="The emailed code or link token")
@@ -441,3 +452,50 @@ class ModerationOut(BaseModel):
     is_locked: bool
     locked_at: datetime | None = None
     is_deactivated: bool
+
+
+class CountryOut(BaseModel):
+    """ISO 3166-1 country transport schema."""
+
+    iso2: str
+    iso3: str
+    numeric_code: str | None = None
+    name: str
+    official_name: str | None = None
+    region: str | None = None
+    subregion: str | None = None
+    phone_code: str | None = None
+    currency_code: str | None = None
+    is_active: bool = True
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CountryTimezoneOut(BaseModel):
+    """Country timezone mapping transport schema."""
+
+    timezone_name: str
+    is_default: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserProfileUpdate(BaseModel):
+    """Update payload for user localization preferences."""
+
+    country: str | None = Field(None, min_length=2, max_length=2, description="ISO2 country code, e.g. IN, US")
+    timezone: str | None = Field(None, description="IANA timezone name, e.g. Asia/Kolkata")
+
+
+class UserProfileOut(BaseModel):
+    """User profile localization output."""
+
+    id: int
+    uuid: UUID
+    user_id: int
+    country_iso2: str | None = None
+    timezone_name: str | None = None
+    timezone_source: str
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

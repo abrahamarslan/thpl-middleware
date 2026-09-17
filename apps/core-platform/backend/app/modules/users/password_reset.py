@@ -43,9 +43,23 @@ RESET_TYPE_CODE = "code"
 RESET_TYPE_LINK = "link"
 
 
+def mask_email(email: str | None) -> str | None:
+    """Mask email for secure client display (e.g. j***e@domain.com)."""
+    if not email or "@" not in email:
+        return None
+    userpart, domain = email.split("@", 1)
+    if len(userpart) <= 2:
+        masked_user = userpart[0] + "*"
+    else:
+        masked_user = userpart[0] + "*" * (len(userpart) - 2) + userpart[-1]
+    return f"{masked_user}@{domain}"
+
+
 @dataclass(slots=True)
 class ResetRequestResult:
     sent: bool
+    email: str | None = None
+    masked_email: str | None = None
     expires_at: datetime | None = None
     # DEBUG-only echoes so local/dev clients don't need a mailbox.
     debug_code: str | None = None
@@ -66,6 +80,16 @@ async def request_password_reset(
     reset_type: str = RESET_TYPE_CODE,
     client: ClientInfo | None = None,
 ) -> ResetRequestResult:
+    # Compute the implied expiry up front so *every* response branch — including
+    # the uniform "account unknown/unavailable" path — returns the same shape.
+    # Otherwise the mere presence of `expires_at` would leak account existence.
+    is_code = reset_type == RESET_TYPE_CODE
+    ttl_minutes = (
+        settings.PASSWORD_RESET_CODE_TTL_MINUTES if is_code else settings.PASSWORD_RESET_LINK_TTL_MINUTES
+    )
+    now = datetime.now(UTC)
+    implied_expiry = now + timedelta(minutes=ttl_minutes)
+
     user = await identifiers.resolve_user_by_identifier(db, identifier)
     if (
         user is None
@@ -74,8 +98,12 @@ async def request_password_reset(
         or moderation.is_banned(user)
     ):
         # Uniform response — never reveal account existence/state.
+        email = identifier.strip().lower() if "@" in identifier else None
+        masked_email = mask_email(email)
         await _suppress(db, identifier=identifier, reason="unknown or unavailable account", client=client)
-        return ResetRequestResult(sent=True)
+        return ResetRequestResult(
+            sent=True, email=email, masked_email=masked_email, expires_at=implied_expiry
+        )
     if moderation.is_throttled(user):
         await audit(
             db, Event.PASSWORD_RESET_REQUEST, user=user, status="failure",
@@ -83,13 +111,17 @@ async def request_password_reset(
         )
         raise RateLimitedError("Account is temporarily throttled; try again later")
 
-    now = datetime.now(UTC)
+    email = user.email
+    masked_email = mask_email(user.email)
+
     existing = await crud.get_reset_token(db, user.email)
 
     cooldown = settings.PASSWORD_RESET_RESEND_COOLDOWN_SECONDS
     if existing and existing.last_sent_at and (now - existing.last_sent_at).total_seconds() < cooldown:
         await _suppress(db, user=user, reason="resend cooldown", client=client)
-        return ResetRequestResult(sent=True)
+        return ResetRequestResult(
+            sent=True, email=email, masked_email=masked_email, expires_at=implied_expiry
+        )
     if (
         existing
         and existing.created_at
@@ -97,15 +129,13 @@ async def request_password_reset(
         and (existing.sent_count or 0) >= settings.PASSWORD_RESET_MAX_PER_HOUR
     ):
         await _suppress(db, user=user, reason="hourly cap reached", client=client)
-        return ResetRequestResult(sent=True)
+        return ResetRequestResult(
+            sent=True, email=email, masked_email=masked_email, expires_at=implied_expiry
+        )
 
-    is_code = reset_type == RESET_TYPE_CODE
     code = generate_numeric_code(settings.PASSWORD_RESET_CODE_LENGTH) if is_code else None
     token = secrets.token_urlsafe(48)
-    ttl_minutes = (
-        settings.PASSWORD_RESET_CODE_TTL_MINUTES if is_code else settings.PASSWORD_RESET_LINK_TTL_MINUTES
-    )
-    expires_at = now + timedelta(minutes=ttl_minutes)
+    expires_at = implied_expiry
 
     await crud.upsert_reset_token(
         db,
@@ -142,7 +172,12 @@ async def request_password_reset(
         context={"reset_type": reset_type, "expires_at": expires_at.isoformat()},
     )
 
-    result = ResetRequestResult(sent=True, expires_at=expires_at)
+    result = ResetRequestResult(
+        sent=True,
+        email=email,
+        masked_email=masked_email,
+        expires_at=expires_at,
+    )
     if settings.DEBUG:
         result.debug_code = code
         result.debug_token = token

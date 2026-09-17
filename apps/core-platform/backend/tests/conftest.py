@@ -47,6 +47,10 @@ _TEST_TABLES = (
     "activity_logs",
     "documents",
     "media",
+    "user_profiles",
+    "country_timezones",
+    "timezones",
+    "countries",
 )
 
 

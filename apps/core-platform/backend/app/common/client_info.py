@@ -19,6 +19,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 
 from app.common.geoip import GeoLocation, lookup_ip
+from app.common.time import format_user_datetime_display
 
 _BROWSERS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"Tarrina|THApp", re.IGNORECASE), "Tarrina App"),
@@ -85,13 +86,14 @@ class ClientInfo:
     country_code: str | None = None
     timezone: str | None = None
 
-    def email_context(self, *, at: datetime | None = None) -> dict:
+    def email_context(self, *, at: datetime | None = None, user_tz: str | None = None) -> dict:
         """Fields injected into every auth security email's template context."""
+        timestamp_str = format_user_datetime_display(at, iana_tz=user_tz) if user_tz else format_utc(at)
         return {
             "ip": self.ip or "Unknown",
             "location": self.location,
             "device": self.device,
-            "requested_at": format_utc(at),
+            "requested_at": timestamp_str,
         }
 
 

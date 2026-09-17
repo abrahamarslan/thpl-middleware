@@ -11,7 +11,7 @@ import pytest
 
 from app.common.exception.errors import AuthError
 from app.core.conf import settings
-from app.modules.users import auth_emails, crud, password_reset
+from app.modules.users import auth_emails, crud, password_reset, service
 from app.modules.users.model import User
 from app.modules.users.security import hash_one_time_code
 from app.modules.users.service import hash_password, verify_password
@@ -83,12 +83,32 @@ async def test_request_unknown_identifier_is_uniform_and_sends_nothing(db, mocke
     send = mocker.patch.object(
         auth_emails, "send_password_reset_code_email", new=mocker.AsyncMock()
     )
+    before = datetime.now(UTC)
     result = await password_reset.request_password_reset(
         db, identifier="nobody@example.com", reset_type="code"
     )
     assert result.sent is True
+    # Present even for an unknown account — otherwise its absence leaks existence.
+    assert result.expires_at is not None
+    ttl = settings.PASSWORD_RESET_CODE_TTL_MINUTES * 60
+    assert ttl - 5 <= (result.expires_at - before).total_seconds() <= ttl + 5
     send.assert_not_awaited()
     assert await crud.get_reset_token(db, "nobody@example.com") is None
+
+
+async def test_request_payload_shape_is_uniform(db, mocker):
+    mocker.patch.object(auth_emails, "send_password_reset_code_email", new=mocker.AsyncMock())
+    known_email = f"shape-{uuid.uuid4().hex[:8]}@example.com"
+    await _make_user(db, known_email)
+
+    known = await service.request_password_reset(db, identifier=known_email, reset_type="code")
+    unknown = await service.request_password_reset(
+        db, identifier="nobody@example.com", reset_type="code"
+    )
+
+    assert set(known.keys()) == set(unknown.keys())
+    assert known["expires_at"] is not None
+    assert unknown["expires_at"] is not None
 
 
 async def test_request_is_rate_limited_by_cooldown(db, mocker):

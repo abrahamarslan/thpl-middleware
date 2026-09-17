@@ -80,3 +80,6 @@ shapely>=2.0
 
 # --- Utilities ---
 pydash>=8.0
+
+# --- Time & Timezone (DST-safe, type-safe date-time arithmetic) ---
+whenever>=0.6.2,<1.0

@@ -4,12 +4,14 @@ import httpx
 import structlog
 from urllib.parse import urlencode
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.common.exception.errors import AuthError
 from app.core.conf import settings
 from app.database.redis import redis_client
+from app.modules.activity.recorder import record_activity
 from app.modules.zoho.core.token_manager import zoho_token_manager
 from app.modules.zoho.core.exceptions import ZohoAuthError
-from app.modules.zoho.auth.schema import OAuthTokenResponse
-from app.modules.activity.recorder import record_activity
 
 logger = structlog.get_logger("app.zoho.auth")
 
@@ -46,13 +48,17 @@ class ZohoAuthService:
         logger.info("zoho_oauth_initiated", state=state, return_url=return_url)
         return auth_url
 
-    async def handle_callback(self, code: str, state: str, user_id: int | None = None) -> str:
+    async def handle_callback(
+        self, db: AsyncSession, code: str, state: str, user_id: int | None = None
+    ) -> str:
         """Validate state, exchange code for tokens, and return the original return_url."""
         state_key = f"{STATE_KEY_PREFIX}{state}"
         state_data_raw = await redis_client.get(state_key)
-        
+
         if not state_data_raw:
-            raise ZohoAuthError("Invalid or expired OAuth state parameter (CSRF protection)")
+            # A missing/expired state is a client error (failed CSRF check),
+            # not an upstream Zoho failure — surface it as 401, not 502.
+            raise AuthError("Invalid or expired OAuth state parameter (CSRF protection)")
             
         state_data = json.loads(state_data_raw)
         return_url = state_data.get("return_url")
@@ -96,15 +102,21 @@ class ZohoAuthService:
         await zoho_token_manager.store_tokens(access_token, refresh_token, expires_in)
         
         logger.info("zoho_oauth_callback_success", expires_in=expires_in)
-        
-        # We don't have a DB session directly here for activity recording, 
-        # but record_activity supports passing a session. Since we don't have one,
-        # we can just rely on standard logging or pass it in if needed. 
-        # In this implementation, the logger serves as the primary audit log.
+
+        # Credential-changing action — persisted to activity_logs for audit.
+        await record_activity(
+            db,
+            action="zoho_auth_connected",
+            actor_id=user_id,
+            subject_type="ZohoIntegration",
+            subject_id="global",
+            description="Connected the Zoho account (OAuth callback)",
+            context={"expires_in": expires_in, "refresh_token_rotated": bool(refresh_token)},
+        )
         
         return return_url or settings.ZOHO_REDIRECT_URL
 
-    async def revoke_token(self) -> None:
+    async def revoke_token(self, db: AsyncSession, *, actor_id: int | None = None) -> None:
         """Revoke the current Zoho token."""
         refresh_token = await zoho_token_manager.get_refresh_token()
         
@@ -126,6 +138,17 @@ class ZohoAuthService:
             # Even if it fails on Zoho's side, we should clear our local cache
             
         await zoho_token_manager.clear_tokens()
+
+        # Credential-changing action — persisted to activity_logs for audit.
+        await record_activity(
+            db,
+            action="zoho_auth_revoked",
+            actor_id=actor_id,
+            subject_type="ZohoIntegration",
+            subject_id="global",
+            description="Revoked the Zoho connection",
+            context={"zoho_revoke_status": resp.status_code},
+        )
         logger.info("zoho_oauth_revoke_success")
 
 zoho_auth_service = ZohoAuthService()

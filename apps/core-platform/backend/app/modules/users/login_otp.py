@@ -42,6 +42,12 @@ class OtpRequestResult:
 async def request_login_otp(
     db: AsyncSession, *, identifier: str, client: ClientInfo | None = None
 ) -> OtpRequestResult:
+    # Compute the implied expiry up front so *every* response branch — including
+    # the uniform "account unknown/unavailable" path — returns the same shape.
+    # Otherwise the mere presence of `expires_at` would leak account existence.
+    now = datetime.now(UTC)
+    implied_expiry = now + timedelta(minutes=settings.LOGIN_OTP_TTL_MINUTES)
+
     user = await identifiers.resolve_user_by_identifier(db, identifier)
     if (
         user is None
@@ -54,7 +60,7 @@ async def request_login_otp(
             db, Event.OTP_REQUEST_SUPPRESSED, actor_label=identifier, status="failure",
             description="unknown or unavailable account", client=client,
         )
-        return OtpRequestResult(sent=True)
+        return OtpRequestResult(sent=True, expires_at=implied_expiry)
     if moderation.is_throttled(user):
         await audit(
             db, Event.OTP_REQUEST_SUPPRESSED, user=user, status="failure",
@@ -62,7 +68,6 @@ async def request_login_otp(
         )
         raise RateLimitedError("Account is temporarily throttled; try again later")
 
-    now = datetime.now(UTC)
     existing = await crud.get_login_otp(db, user.email)
 
     cooldown = settings.LOGIN_OTP_RESEND_COOLDOWN_SECONDS
@@ -71,7 +76,7 @@ async def request_login_otp(
             db, Event.OTP_REQUEST_SUPPRESSED, user=user, status="failure",
             description="resend cooldown", client=client,
         )
-        return OtpRequestResult(sent=True)
+        return OtpRequestResult(sent=True, expires_at=implied_expiry)
     if (
         existing
         and existing.created_at
@@ -82,10 +87,10 @@ async def request_login_otp(
             db, Event.OTP_REQUEST_SUPPRESSED, user=user, status="failure",
             description="hourly cap reached", client=client,
         )
-        return OtpRequestResult(sent=True)
+        return OtpRequestResult(sent=True, expires_at=implied_expiry)
 
     code = generate_numeric_code(settings.LOGIN_OTP_CODE_LENGTH)
-    expires_at = now + timedelta(minutes=settings.LOGIN_OTP_TTL_MINUTES)
+    expires_at = implied_expiry
     await crud.upsert_login_otp(
         db,
         email=user.email,

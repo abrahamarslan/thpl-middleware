@@ -15,26 +15,32 @@ stateless JWTs + Authentik; `current_sessions`/`has_active_session` columns
 cover in-app presence. `password_reset_tokens` IS ported (first-party flow).
 """
 
+import enum
 from datetime import UTC, datetime
 
 from geoalchemy2 import Geography
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
+    Enum,
     Float,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
     SmallInteger,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.db import Base
+from app.database.mixins import BigIntPKWithUUIDMixin, TimestampMixin
 
 
 def _utcnow() -> datetime:
@@ -188,8 +194,12 @@ class User(Base):
     district = mapped_column(String(255), nullable=True, comment="Name of the district")
     city = mapped_column(String(255), nullable=True, comment="Name of the city")
     state = mapped_column(String(255), nullable=True, comment="Name of the state or province")
-    postal_code = mapped_column(String(255), nullable=True, comment="Postal code")
     country = mapped_column(String(255), nullable=True, comment="Name of the country")
+    country_code = mapped_column(
+        String(2),
+        nullable=True,
+        comment="ISO 3166-1 alpha-2 country code (e.g. IN, US)",
+    )
 
     # == Location Information (Geospatial — PostGIS Geography, SRID 4326) ==
     # geoalchemy2 creates GIST spatial indexes automatically for these columns
@@ -305,6 +315,7 @@ class User(Base):
         Index("users_city_index", "city"),
         Index("users_state_index", "state"),
         Index("users_country_index", "country"),
+        Index("ix_users_country_code", "country_code"),
         Index("users_last_login_index", "last_login"),
         Index("users_last_tracked_at_index", "last_tracked_at"),
         Index("users_device_id_index", "device_id"),
@@ -374,3 +385,100 @@ class LoginOtpToken(Base):
     request_ip: Mapped[str | None] = mapped_column(String(45))
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at = mapped_column(DateTime(timezone=True), nullable=True, default=_utcnow)
+
+
+class TimezoneSource(str, enum.Enum):
+    auto = "auto"
+    manual = "manual"
+
+
+class Country(TimestampMixin, Base):
+    """ISO 3166-1 reference table of countries."""
+
+    __tablename__ = "countries"
+
+    iso2: Mapped[str] = mapped_column(String(2), primary_key=True)
+    iso3: Mapped[str] = mapped_column(String(3), unique=True, nullable=False)
+    numeric_code: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    official_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(75), nullable=True)
+    subregion: Mapped[str | None] = mapped_column(String(75), nullable=True)
+    phone_code: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    timezones: Mapped[list["CountryTimezone"]] = relationship(
+        "CountryTimezone", back_populates="country", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
+class Timezone(Base):
+    """Reference table of IANA tz database timezone identifiers."""
+
+    __tablename__ = "timezones"
+
+    iana_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class CountryTimezone(Base):
+    """Mapping table: a country can have multiple timezones (e.g. US, RU, AU, BR, CA)."""
+
+    __tablename__ = "country_timezones"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    country_iso2: Mapped[str] = mapped_column(
+        String(2), ForeignKey("countries.iso2", ondelete="CASCADE"), nullable=False
+    )
+    timezone_name: Mapped[str] = mapped_column(
+        String(64), ForeignKey("timezones.iana_name", ondelete="CASCADE"), nullable=False
+    )
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    country: Mapped["Country"] = relationship("Country", back_populates="timezones")
+    timezone: Mapped["Timezone"] = relationship("Timezone")
+
+    __table_args__ = (
+        Index("uq_country_timezone", "country_iso2", "timezone_name", unique=True),
+        Index(
+            "uq_country_default_tz",
+            "country_iso2",
+            unique=True,
+            postgresql_where=text("is_default = TRUE"),
+        ),
+    )
+
+
+class UserProfile(BigIntPKWithUUIDMixin, Base):
+    """User profile localization preferences: auto-unless-overridden timezone logic."""
+
+    __tablename__ = "user_profiles"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    country_iso2: Mapped[str | None] = mapped_column(
+        String(2), ForeignKey("countries.iso2", ondelete="SET NULL"), nullable=True
+    )
+    timezone_name: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("timezones.iana_name", ondelete="SET NULL"), nullable=True
+    )
+    timezone_source: Mapped[TimezoneSource] = mapped_column(
+        Enum(TimezoneSource, native_enum=False, length=10),
+        default=TimezoneSource.auto,
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    user: Mapped["User"] = relationship("User", backref="profile")
+    country: Mapped["Country | None"] = relationship("Country")
+    timezone: Mapped["Timezone | None"] = relationship("Timezone")
+
+    __table_args__ = (
+        Index("idx_user_profiles_country", "country_iso2"),
+        CheckConstraint("timezone_source IN ('auto', 'manual')", name="ck_user_profiles_tz_source"),
+    )

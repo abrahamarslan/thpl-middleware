@@ -27,6 +27,9 @@ from app.modules.users.password_policy import get_password_policy
 from app.modules.users.schema import (
     BanRequest,
     ChangePasswordRequest,
+    CountryOut,
+    CountryTimezoneOut,
+    ForgotPasswordOut,
     ForgotPasswordRequest,
     LoginOtpRequest,
     LoginOtpVerifyRequest,
@@ -41,11 +44,15 @@ from app.modules.users.schema import (
     UserCreate,
     UserListFilters,
     UserOut,
+    UserProfileOut,
+    UserProfileUpdate,
     UserUpdate,
 )
 
 auth_router = APIRouter()
 users_router = APIRouter()
+countries_router = APIRouter()
+me_router = APIRouter()
 
 
 # ════════════════════════════════ AUTH ════════════════════════════════════════
@@ -53,7 +60,11 @@ users_router = APIRouter()
 @auth_router.post("/register", response_model=ResponseModel[UserOut], status_code=201)
 async def register(db: DBSession, body: RegisterRequest, client: ClientInfoDep):
     user = await service.register(db, body, client=client)
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel.ok(
+        data=UserOut.model_validate(user),
+        module="users",
+        msg_key="register_success",
+    )
 
 
 @auth_router.post("/login", response_model=ResponseModel[TokenPair])
@@ -66,9 +77,7 @@ async def login(db: DBSession, body: LoginRequest, client: ClientInfoDep):
 async def login_otp_request(db: DBSession, body: LoginOtpRequest, client: ClientInfoDep):
     """Send a one-time sign-in code to the account's email on file."""
     result = await login_otp.request_login_otp(db, identifier=body.identifier, client=client)
-    payload: dict = {"sent": result.sent}
-    if result.expires_at:
-        payload["expires_at"] = result.expires_at
+    payload: dict = {"sent": result.sent, "expires_at": result.expires_at}
     if settings.DEBUG:
         payload["debug_code"] = result.debug_code
     return ResponseModel(data=payload)
@@ -124,12 +133,12 @@ async def password_policy():
     return ResponseModel(data=PasswordPolicyOut(**asdict(get_password_policy())))
 
 
-@auth_router.post("/forgot-password", response_model=ResponseModel[dict])
+@auth_router.post("/forgot-password", response_model=ResponseModel[ForgotPasswordOut])
 async def forgot_password(db: DBSession, body: ForgotPasswordRequest, client: ClientInfoDep):
     result = await service.request_password_reset(
         db, identifier=body.identifier, reset_type=body.reset_type, client=client
     )
-    return ResponseModel(data=result)
+    return ResponseModel.ok(data=result, module="users", msg_key="password_reset_sent")
 
 
 @auth_router.post("/reset-password", response_model=ResponseModel[dict])
@@ -270,3 +279,53 @@ async def unthrottle_user(db: DBSession, current: CurrentUser, user_id: int):
     user = await service.get_user(db, user_id, include_deleted=True)
     user = await moderation.unthrottle_user(db, user, actor_id=current.id)
     return ResponseModel(data=UserOut.model_validate(user))
+
+
+# ════════════════════════════════ ME / PROFILE ═══════════════════════════════
+
+@me_router.get("/profile", response_model=ResponseModel[UserProfileOut])
+@auth_router.get("/me/profile", response_model=ResponseModel[UserProfileOut])
+async def get_my_profile(db: DBSession, user: CurrentUser):
+    """Retrieve the authenticated user's localization profile."""
+    profile = await service.get_or_create_profile(db, user.id)
+    return ResponseModel.ok(
+        data=UserProfileOut.model_validate(profile),
+        module="users",
+        msg_key="profile_fetched",
+    )
+
+
+@me_router.patch("/profile", response_model=ResponseModel[UserProfileOut])
+@auth_router.patch("/me/profile", response_model=ResponseModel[UserProfileOut])
+async def update_my_profile(db: DBSession, user: CurrentUser, body: UserProfileUpdate):
+    """Update user country (auto-timezone) and/or timezone (locks source to 'manual')."""
+    profile = await service.update_user_profile(db, user, body)
+    return ResponseModel.ok(
+        data=UserProfileOut.model_validate(profile),
+        module="users",
+        msg_key="profile_updated",
+    )
+
+
+# ════════════════════════════════ COUNTRIES & TIMEZONES ══════════════════════
+
+@countries_router.get("", response_model=ResponseModel[list[CountryOut]])
+async def list_countries(db: DBSession):
+    """List all active ISO 3166-1 countries (cached)."""
+    countries = await service.get_cached_countries(db)
+    return ResponseModel.ok(
+        data=[CountryOut(**c) for c in countries],
+        module="users",
+        msg_key="countries_fetched",
+    )
+
+
+@countries_router.get("/{iso2}/timezones", response_model=ResponseModel[list[CountryTimezoneOut]])
+async def list_country_timezones(db: DBSession, iso2: str):
+    """List all IANA timezones mapped to a country (cached)."""
+    timezones = await service.get_cached_country_timezones(db, iso2)
+    return ResponseModel.ok(
+        data=[CountryTimezoneOut(**tz) for tz in timezones],
+        module="users",
+        msg_key="timezones_fetched",
+    )

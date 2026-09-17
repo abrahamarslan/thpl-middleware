@@ -86,6 +86,38 @@ async def test_link_reset_flow_service(db, mocker):
     assert verify_password("N3wLinkPass!", user.password)
 
 
+async def test_forgot_password_response_shape_is_uniform_via_http(db, mocker):
+    """An unknown identifier must not be distinguishable by the response keys.
+
+    Regression: `expires_at` used to be omitted when no challenge was created,
+    which leaked account existence despite the deliberate HTTP 200.
+    """
+    await _tech_user(db)
+    _patch_emails(mocker)
+
+    async def _override_db():
+        yield db
+
+    app.dependency_overrides[get_db] = _override_db
+    try:
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            known = await client.post(
+                "/api/auth/forgot-password", json={"identifier": TECH, "reset_type": "code"}
+            )
+            unknown = await client.post(
+                "/api/auth/forgot-password",
+                json={"identifier": "nobody@example.com", "reset_type": "code"},
+            )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+    assert known.status_code == unknown.status_code == 200
+    assert set(known.json()["data"].keys()) == set(unknown.json()["data"].keys())
+    assert known.json()["data"]["expires_at"]
+    assert unknown.json()["data"]["expires_at"]
+
+
 async def test_wrong_code_rejected(db, mocker):
     await _tech_user(db)
     _patch_emails(mocker)
