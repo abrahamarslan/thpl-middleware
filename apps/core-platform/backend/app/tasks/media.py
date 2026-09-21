@@ -1,7 +1,8 @@
 """Media conversion tasks (queue: documents — CPU-bound, like PDF work).
 
 Pillow resizing is synchronous CPU work, so it runs directly in the worker;
-only the DB status update uses the async _run pattern (asyncpg-only stack).
+only the DB status update runs async, via ``run_async`` on the worker
+process's event loop (ADR‑3, app/tasks/_loop.py).
 """
 
 import asyncio
@@ -9,10 +10,9 @@ from pathlib import Path
 
 import structlog
 from celery import shared_task
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
-from app.core.conf import settings
+from app.database.db import async_session_factory
+from app.tasks._loop import run_async
 
 logger = structlog.get_logger("app.tasks.media")
 
@@ -42,30 +42,25 @@ def generate_conversions(self, media_id: int, conversions: dict[str, list[int]])
     from app.modules.media.storage import get_storage
 
     async def work() -> dict:
-        engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        try:
-            async with session_factory() as db:
-                media = await db.get(Media, media_id, execution_options={"include_deleted": True})
-                if media is None:
-                    return {"status": "missing"}
+        async with async_session_factory() as db:
+            media = await db.get(Media, media_id, execution_options={"include_deleted": True})
+            if media is None:
+                return {"status": "missing"}
 
-                storage = get_storage()
-                source = storage.local_path(media.file_name)
-                if source is None or not source.exists():
-                    logger.warning("media_source_unavailable", media_id=media_id, disk=media.disk)
-                    media.conversions = {**(media.conversions or {}), **{c: "skipped" for c in conversions}}
-                    await db.commit()
-                    return {"status": "skipped", "reason": "source_not_local"}
-
-                results = await asyncio.to_thread(_resize, source, conversions)
-                media.conversions = {**(media.conversions or {}), **results}
+            storage = get_storage()
+            source = storage.local_path(media.file_name)
+            if source is None or not source.exists():
+                logger.warning("media_source_unavailable", media_id=media_id, disk=media.disk)
+                media.conversions = {**(media.conversions or {}), **{c: "skipped" for c in conversions}}
                 await db.commit()
-                return {"status": "ok", "results": results}
-        finally:
-            await engine.dispose()
+                return {"status": "skipped", "reason": "source_not_local"}
 
-    out = asyncio.run(work())
+            results = await asyncio.to_thread(_resize, source, conversions)
+            media.conversions = {**(media.conversions or {}), **results}
+            await db.commit()
+            return {"status": "ok", "results": results}
+
+    out = run_async(work())
     if out.get("status") == "missing":
         # Enqueued before the upload transaction committed — retry shortly.
         raise self.retry(countdown=10)

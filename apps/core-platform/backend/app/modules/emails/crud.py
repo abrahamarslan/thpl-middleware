@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
 
+from app.modules.documents.model import Document
 from app.modules.emails.model import Email
 
 
@@ -20,7 +21,9 @@ async def get_email(db: AsyncSession, email_id: int) -> Email | None:
     stmt = (
         select(Email)
         .where(Email.id == email_id)
-        .options(selectinload(Email.documents))
+        # The response serialises each document's tags; a viewonly relationship
+        # cannot lazy-load in async, so the chain is loaded up front.
+        .options(selectinload(Email.documents).selectinload(Document.tags))
         .limit(1)
     )
     return await db.scalar(stmt)

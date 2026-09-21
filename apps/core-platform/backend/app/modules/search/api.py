@@ -1,6 +1,9 @@
 """Generic search endpoint (mounted at /api/search).
 
-    GET /api/search/zoho_organizations?q=acme&filter=address_country:India
+    GET /api/search/organizations?q=acme&filter=address_country:India
+
+Tenant isolation: the index holds every tenant's rows (CDC), so the caller's
+``tenant_id`` filter is ALWAYS added (and Postgres hydration is tenant-filtered too).
 
 Meilisearch ranks; Postgres hydrates (fresh rows, soft-delete filtered,
 relevance order preserved) — see builder.py. Only indexes registered in
@@ -47,6 +50,11 @@ async def search(
         raise NotFoundError(f"'{index_name}' is not a searchable index")
 
     builder = ScoutBuilder(entity.resolve_model(), q).limit(limit).offset(offset)
+    from app.database.tenancy import current_tenant_id
+
+    tenant_id = current_tenant_id()
+    if tenant_id is not None and "tenant_id" in entity.filterable:
+        builder.where("tenant_id", tenant_id)
     for pair in filter:
         field, sep, value = pair.partition(":")
         if not sep or not value:

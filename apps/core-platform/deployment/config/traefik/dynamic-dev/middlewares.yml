@@ -1,0 +1,27 @@
+# ==============================================================================
+# Traefik dynamic configuration — middlewares
+# ==============================================================================
+
+http:
+  middlewares:
+    security-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: same-origin
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        customResponseHeaders:
+          Server: ""
+          X-Powered-By: ""
+
+    gzip:
+      compress: {}
+
+    # Protects the Traefik dashboard AND Flower.
+    # Default credentials: admin / changeme — CHANGE BEFORE PRODUCTION:
+    #   htpasswd -nb admin 'NewPassword'   (or: openssl passwd -apr1)
+    dashboard-auth:
+      basicAuth:
+        users:
+          - "admin:$apr1$VxJqH8f4$l0C5P2czG8lEucBz3Do751"

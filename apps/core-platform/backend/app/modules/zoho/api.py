@@ -1,26 +1,26 @@
-"""HTTP endpoints for Zoho data (api layer — thin, delegates to service)."""
+"""HTTP endpoints for Zoho sync state (api layer — thin, delegates to service).
 
-from fastapi import APIRouter, Query
+`GET /items` and `GET /items/{id}` were REMOVED on 2026-09-18: they proxied
+Zoho on every cache miss, which makes Zoho a synchronous dependency of a user
+request (forbidden by the platform's prime directive) and spends the daily
+call budget per field rep. Item reads come from the local mirror once the
+items module lands; until then there is no item endpoint at all rather than a
+budget-burning one.
+
+See docs/zoho-sync-implementation/README.md (Phase 1) and
+docs/zoho-sync-platform-architecture.md §2.2 finding N11.
+"""
+
+from fastapi import APIRouter
 
 from app.common.exception.errors import NotFoundError
 from app.common.response.schema import ResponseModel
-from app.modules.users.deps import CurrentUser
 from app.database.db import DBSession
+from app.modules.users.deps import CurrentUser
 from app.modules.zoho import service
-from app.modules.zoho.schema import SyncStateOut, ZohoItem
+from app.modules.zoho.schema import SyncStateOut
 
 router = APIRouter()
-
-
-@router.get("/items", response_model=ResponseModel[list[ZohoItem]])
-async def list_items(_: CurrentUser, page: int = Query(1, ge=1)):
-    """Prices & stock for the sales app — served from short-TTL cache."""
-    return ResponseModel(data=await service.list_items(page=page))
-
-
-@router.get("/items/{item_id}", response_model=ResponseModel[ZohoItem])
-async def get_item(_: CurrentUser, item_id: str):
-    return ResponseModel(data=await service.get_item(item_id))
 
 
 @router.get("/sync/{entity}", response_model=ResponseModel[SyncStateOut])

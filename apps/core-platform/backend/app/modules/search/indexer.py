@@ -18,8 +18,8 @@ Guarantees:
     Meilisearch, so filtered queries never hit an unconfigured index.
 
 Configure topics via SEARCH_CDC_TOPICS (comma-separated); the topic's last
-dot-segment becomes the index name (zoho-mirror.public.zoho_organizations
--> index "zoho_organizations").
+dot-segment becomes the index name (zoho-mirror.org_management.organizations
+-> index "organizations").
 
 Runs via `python -m app.modules.search.indexer` (kept over `faststream run`
 so configure_logging() bootstraps first and no CLI extra is needed).

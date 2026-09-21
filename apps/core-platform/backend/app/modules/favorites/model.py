@@ -15,10 +15,10 @@ from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, TenantMixin, TimestampMixin
+from app.database.mixins import IntPKMixin, SoftDeleteMixin, TenantEntityMixin
 
 
-class Favorite(IntPKMixin, TenantMixin, TimestampMixin, Base):
+class Favorite(IntPKMixin, TenantEntityMixin, SoftDeleteMixin, Base):
     __tablename__ = "favorites"
 
     favorite_id: Mapped[uuid.UUID] = mapped_column(

@@ -13,12 +13,12 @@ from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, declared_attr, foreign, mapped_column, relationship, remote
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, TimestampMixin
+from app.database.mixins import IntPKMixin, TenantEntityMixin
 from app.database.soft_delete import SoftDeleteFilteredMixin
 from app.core.conf import settings
 
 
-class Media(IntPKMixin, TimestampMixin, SoftDeleteFilteredMixin, Base):
+class Media(IntPKMixin, TenantEntityMixin, SoftDeleteFilteredMixin, Base):
     __tablename__ = "media"
 
     uuid: Mapped[uuid_mod.UUID] = mapped_column(

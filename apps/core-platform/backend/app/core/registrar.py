@@ -45,8 +45,16 @@ async def lifespan(app: FastAPI):
     from app.database.redis import close_redis, redis_client
 
     await redis_client.ping()
+    # Zoho gauges on /metrics, copied from the planner's snapshot (never computed
+    # at scrape time). docs/zoho-sync-implementation/control-plane.md §7
+    import asyncio
+
+    from app.modules.zoho.control.metrics import refresh_forever
+
+    zoho_metrics_task = asyncio.create_task(refresh_forever(), name="zoho-metrics-refresher")
     logger.info("startup_complete", environment=settings.ENVIRONMENT, version=settings.VERSION)
     yield
+    zoho_metrics_task.cancel()
     from app.database.db import engine
 
     await close_redis()

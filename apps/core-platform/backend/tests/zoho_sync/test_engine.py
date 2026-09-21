@@ -8,9 +8,8 @@ registered guinea pig.
 
 import pytest
 
-from app.modules.zoho.organizations.model import ZohoOrganization
+from app.modules.organizations.model import Organization
 from app.modules.zoho.sync.engine import ZohoSyncEngine
-from app.modules.zoho.sync.mixins import SyncStatus
 from app.modules.zoho.sync.models import ZohoSyncStat
 from tests.zoho_sync.fake_client import FakeZohoClient, make_response
 
@@ -63,9 +62,9 @@ async def test_full_sync_creates_row_with_detail_payload(db):
     assert report.created == 1 and report.updated == 0 and report.errors == 0
 
     row = await db.scalar(
-        ZohoOrganization.__table__.select().with_only_columns(ZohoOrganization.id).limit(1)
+        Organization.__table__.select().with_only_columns(Organization.id).limit(1)
     )
-    org = await db.get(ZohoOrganization, row)
+    org = await db.get(Organization, row)
     # Mapped from the DETAIL payload (proves the N+1 fetch happened)
     assert org.zoho_id == "10229182"
     assert org.name == "Zillium Inc"
@@ -75,9 +74,10 @@ async def test_full_sync_creates_row_with_detail_payload(db):
     assert org.field_separator is None            # " " normalised to NULL
     assert org.custom_fields == {"cf_zone": "West"}  # hstore round-trip
     assert org.zoho_raw["organization_id"] == "10229182"
-    assert org.sync_status == SyncStatus.SYNCED.value
+    assert org.tenant_id is not None and org.hierarchy_path == f"/{org.uuid}/"   # a root node
     assert org.synced_at is not None
-    assert org.sync_logs and org.sync_logs[-1]["event"] == "inbound_upsert"
+    assert org.legal_name == "Zillium Inc" and org.org_code == "ZOHO-10229182"
+    assert org.created_by_name == "system" and org.app_version
 
     # The engine hit list first, then the detail endpoint
     paths = [c["path"] for c in engine.client.calls]
@@ -96,34 +96,55 @@ async def test_second_run_matches_identity_and_updates(db):
 
     assert report.created == 0 and report.updated == 1
     org = await db.scalar(
-        ZohoOrganization.__table__.select().with_only_columns(ZohoOrganization.name)
+        Organization.__table__.select().with_only_columns(Organization.name)
     )
     assert org == "Zillium Renamed"
 
 
-async def test_resync_revives_soft_deleted_row(db):
+async def test_resync_matches_a_locally_deleted_row_without_reviving_it(db):
     engine = ZohoSyncEngine(db, _client_with_org())
     await engine.run("organizations", "full")
     await db.commit()
 
     from sqlalchemy import select
 
-    org = await db.scalar(select(ZohoOrganization).limit(1))
-    org.soft_delete()
+    org = await db.scalar(select(Organization).limit(1))
+    org.soft_delete()                     # a USER deleted it locally
     await db.commit()
 
     # Gone from filtered queries...
-    assert await db.scalar(select(ZohoOrganization).limit(1)) is None
+    assert await db.scalar(select(Organization).limit(1)) is None
 
-    # ...but a re-sync matches it by zoho_id (include_deleted) — no duplicate.
+    # ...a re-sync matches it by zoho_id (include_deleted) — no duplicate — and
+    # a user's delete is not the sync's to undo (apply gate).
     report = await ZohoSyncEngine(db, _client_with_org()).run("organizations", "full")
     await db.commit()
-    assert report.created == 0 and report.updated == 1
+    assert report.created == 0
 
     all_rows = (
-        await db.scalars(select(ZohoOrganization).execution_options(include_deleted=True))
+        await db.scalars(select(Organization).execution_options(include_deleted=True))
     ).all()
-    assert len(all_rows) == 1
+    assert len(all_rows) == 1 and all_rows[0].deleted_at is not None
+
+
+async def test_resync_resurrects_a_sync_tombstone(db):
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    await ZohoSyncEngine(db, _client_with_org()).run("organizations", "full")
+    await db.commit()
+    org = await db.scalar(select(Organization).limit(1))
+    org.deleted_at = org.remote_deleted_at = datetime.now(UTC)    # the sync concluded "gone"
+    await db.commit()
+
+    # Zoho lists it again (orgs carry no modified time): it exists after all.
+    report = await ZohoSyncEngine(db, _client_with_org()).run("organizations", "full")
+    await db.commit()
+    assert report.resurrected == 1 and report.created == 0
+
+    await db.refresh(org)
+    assert org.deleted_at is None and org.remote_deleted_at is None
 
 
 async def test_stats_are_maintained_per_module(db):

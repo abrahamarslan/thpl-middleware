@@ -38,6 +38,7 @@ BASE
 PRODUCTION  (base + docker-compose.prod.yml; Let's Encrypt HTTP-01)
   prod               Build + up -d with the production overrides
   prod-stop          Stop production services
+  prod-down          Tear down production containers & networks (keeps volumes)
   prod-logs [svc]    Tail production logs
   prod-migrate       alembic upgrade head (production env)
   prod-build [svc]   Build image(s) with the production overrides
@@ -47,9 +48,10 @@ PRODUCTION  (base + docker-compose.prod.yml; Let's Encrypt HTTP-01)
 
 DEVELOPMENT  (adds pgAdmin, Redis Commander, MailHog, Vite HMR)
   dev                docker compose up with dev overrides
+  dev-stop           Stop dev services
+  dev-down           Tear down dev containers & networks (keeps volumes)
   dev-build          Tear down + wipe node_modules volume, rebuild images, start
   dev-prod           docker compose up (base/production, no dev overrides)
-  dev-stop           Stop dev services
   dev-logs           Tail dev logs
 
 EXEC HELPERS  (run commands inside a container)
@@ -176,6 +178,16 @@ env_check() {
     fi
 }
 
+check_dev_ssl() {
+    local cert_file="config/traefik/certs/local.pem"
+    local key_file="config/traefik/certs/local-key.pem"
+    if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
+        echo -e "${YELLOW}Development TLS certificates missing in config/traefik/certs/.${NC}"
+        echo -e "${CYAN}Generating local certificates via scripts/setup-ssl.sh...${NC}"
+        bash scripts/setup-ssl.sh "${APP_DOMAIN:-app.local}"
+    fi
+}
+
 COMMAND="${1:-help}"
 ARG1="${2:-}"
 
@@ -225,6 +237,9 @@ case "$COMMAND" in
         ;;
     prod-stop)
         prod_compose stop
+        ;;
+    prod-down)
+        prod_compose down --remove-orphans
         ;;
     prod-logs)
         if [ -n "$ARG1" ]; then
@@ -294,11 +309,13 @@ case "$COMMAND" in
 
     # -- Development --------------------------------------------------------------
     dev)
+        check_dev_ssl
         # --build: rebuilds only changed layers (fast via cache). Ensures the
         # correct node development image is always used — never a stale nginx.
         dev_compose up -d --build --remove-orphans
         ;;
     dev-build)
+        check_dev_ssl
         # Nuclear reset: tear down all containers + named volumes (wipes
         # node_modules, venv, etc.) then rebuild from scratch.
         dev_compose down --remove-orphans -v 2>/dev/null || true
@@ -310,6 +327,9 @@ case "$COMMAND" in
         ;;
     dev-stop)
         dev_compose stop
+        ;;
+    dev-down)
+        dev_compose down --remove-orphans
         ;;
     dev-logs)
         dev_compose logs -f --tail=100

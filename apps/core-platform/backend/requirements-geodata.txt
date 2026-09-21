@@ -1,0 +1,29 @@
+# ==============================================================================
+# Offline geodata tooling — NOT installed in the API or worker image.
+# ==============================================================================
+# These are for one-off and batch jobs run by hand or in a dedicated container:
+# importing LGD / Census boundary shapefiles into geo.admin_boundaries,
+# reconciling address datasets, spatial QA in a notebook.
+#
+# Why they are not in requirements.txt:
+#
+#   * geopandas pulls pandas, pyproj, fiona/pyogrio and GDAL — hundreds of
+#     megabytes of image for code no request path executes.
+#   * It is synchronous and CPU-bound. A DataFrame operation inside a FastAPI
+#     handler blocks the event loop for every other request on that worker.
+#   * PostGIS already does this work, in the database, against indexes, on the
+#     data's own side of the network. Reading a table into a DataFrame to
+#     filter it is a round trip in place of a WHERE clause.
+#
+# In-process geometry in the service uses shapely (already a runtime
+# dependency via geoalchemy2) and app/modules/geo/distance.py.
+#
+# Install into a throwaway environment, not the app venv:
+#     python -m venv .venv-geodata
+#     .venv-geodata/bin/pip install -r requirements-geodata.txt
+# ==============================================================================
+
+geopandas>=1.0          # boundary imports, bulk spatial joins
+pyogrio>=0.10           # fast shapefile / GeoPackage IO (replaces fiona)
+pyproj>=3.7             # CRS transforms for source datasets not in WGS84
+pandas>=2.2

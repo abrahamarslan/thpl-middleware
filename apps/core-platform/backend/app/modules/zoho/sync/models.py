@@ -21,10 +21,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, TimestampMixin
+from app.database.mixins import IntPKMixin, LedgerMixin, TimestampMixin
 
 
-class ZohoSyncStat(IntPKMixin, TimestampMixin, Base):
+class ZohoSyncStat(IntPKMixin, LedgerMixin, TimestampMixin, Base):
     """Table-level sync statistics — one row per registered module."""
 
     __tablename__ = "zoho_sync_stats"
@@ -56,7 +56,7 @@ class ZohoSyncStat(IntPKMixin, TimestampMixin, Base):
     extra: Mapped[dict | None] = mapped_column(JSONB)
 
 
-class ZohoQueueLog(IntPKMixin, TimestampMixin, Base):
+class ZohoQueueLog(IntPKMixin, LedgerMixin, TimestampMixin, Base):
     """Row-level queue journal — exactly when a record was queued, attempted
     and completed, and by which Celery task."""
 

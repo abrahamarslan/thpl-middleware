@@ -38,7 +38,7 @@ async function getToken(): Promise<string | null> {
  * Meilisearch ranks; the backend hydrates fresh rows from Postgres —
  * the CDC pipeline keeps the index ~1-3s behind writes.
  */
-export default function Search({ index = 'zoho_organizations' }: { index?: string }) {
+export default function Search({ index = 'organizations' }: { index?: string }) {
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<Hit[]>([])
   const [status, setStatus] = useState<'idle' | 'searching' | 'error' | 'unauthorized'>('idle')

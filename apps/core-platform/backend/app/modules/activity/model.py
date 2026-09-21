@@ -19,10 +19,10 @@ from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, TenantMixin
+from app.database.mixins import IntPKMixin, LedgerMixin
 
 
-class ActivityLog(IntPKMixin, TenantMixin, Base):
+class ActivityLog(IntPKMixin, LedgerMixin, Base):
     __tablename__ = "activity_logs"
 
     activity_id: Mapped[uuid.UUID] = mapped_column(

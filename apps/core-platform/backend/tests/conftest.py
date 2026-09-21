@@ -31,12 +31,44 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.core.conf import settings  # noqa: E402
+from tests.tenancy_fixtures import worlds  # noqa: E402,F401 — shared tenancy API fixture
 
 #: Tables integration tests write to — truncated between tests for isolation.
 _TEST_TABLES = (
+    "zoho_oauth_credentials",
+    "zoho_sync_runs",
+    "zoho_sync_cursors",
+    "zoho_quota_days",
+    "zoho_sync_events",
+    # zoho_retention_policies is NOT truncated: its defaults are seeded by the
+    # migration; tests that change a policy restore it themselves.
+    "setting_audit_logs",
+    "setting_values",
+    "setting_definitions",
+    "setting_groups",
+    "system_modules",
     "zoho_queue_logs",
     "zoho_sync_stats",
-    "zoho_organizations",
+    # Sync crosswalk: waiters before history before the crosswalk itself.
+    "sync.pending_references",
+    "sync.sync_payloads",
+    "sync.sync_records",
+    # Location hub: links before places before boundaries (FK order).
+    "geo.place_relationships",
+    "geo.place_links",
+    "geo.geofences",
+    "geo.geocode_api_calls",
+    "geo.places",
+    "geo.admin_boundaries",
+    # Currency: rates before the currency (FK order).
+    "currency.exchange_rates",
+    "currency.currencies",
+    "org_management.organizations",   # CASCADE: every tenant table references it
+    "roles",
+    "zoho_currencies",
+    "zoho_taxes",
+    "zoho_locations",
+    "zoho_users",
     "taggables",
     "tags",
     "email_events",
@@ -45,6 +77,11 @@ _TEST_TABLES = (
     "password_reset_tokens",
     "login_otp_tokens",
     "activity_logs",
+    # Documents: trail, links and files before the document (FK order). document_types
+    # is reference data seeded by the migration — NOT truncated.
+    "document_verification_logs",
+    "document_links",
+    "document_files",
     "documents",
     "media",
     "user_profiles",
@@ -71,7 +108,36 @@ async def db():
         # Hard isolation: truncate everything the tests touch.
         async with engine.begin() as conn:
             await conn.execute(text(f"TRUNCATE {', '.join(_TEST_TABLES)} CASCADE"))
+            # Tenants created by tests go; the migration's DEFAULT tenant stays
+            # (rows written without a tenant context land in it).
+            await conn.execute(
+                text("DELETE FROM org_management.tenants WHERE tenant_code <> :code"),
+                {"code": settings.DEFAULT_TENANT_CODE},
+            )
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_tenant_context():
+    """Tenancy context variables must never leak between tests."""
+    from app.database.tenancy import SYSTEM, _actor, _organization, _tenant
+
+    tokens = (_tenant.set(None), _organization.set(None), _actor.set(SYSTEM))
+    yield
+    _actor.reset(tokens[2])
+    _organization.reset(tokens[1])
+    _tenant.reset(tokens[0])
+
+
+@pytest.fixture(autouse=True)
+def _reset_zoho_config_cache():
+    """The config resolver caches overrides per process; tables are truncated
+    between tests, so a cached override must never leak into the next test."""
+    from app.modules.zoho.control.config import zoho_config
+
+    zoho_config.invalidate()
+    yield
+    zoho_config.invalidate()
 
 
 @pytest.fixture
@@ -81,6 +147,12 @@ async def redis_available():
     previous loop would otherwise break the next test)."""
     from app.database.redis import redis_client
 
+    # A test WITHOUT this fixture may have used the client too (the engine
+    # reads the config version), leaving connections bound to its closed loop.
+    try:
+        await redis_client.aclose()
+    except Exception:  # noqa: BLE001 — stale transports can fail to close; they are dropped anyway
+        pass
     try:
         await redis_client.ping()
     except Exception:

@@ -4,26 +4,23 @@ When an inline Authentik sync fails during a request, the user service enqueues
 one of these tasks so the mirror eventually catches up. They are the outer
 safety net for transient Authentik outages.
 
-Why a fresh engine + client per task
-------------------------------------
+Async in Celery (ADR‑3)
+-----------------------
 The stack is asyncpg-only (no sync DB driver), so these synchronous Celery tasks
-drive the async code via ``asyncio.run``. Each invocation gets its own event
-loop, so it also gets a throwaway ``NullPool`` engine and a fresh
-``AuthentikAdminClient`` — never the module-level singletons, whose connections
-would be bound to an already-closed loop.
+drive the async code via ``run_async`` on the worker process's single event
+loop (app/tasks/_loop.py): the pooled session factory is shared across tasks;
+the Authentik client stays per task (it is cheap and closed in ``finally``).
 """
 
-import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import structlog
 from celery import shared_task
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.security.authentik_client import AuthentikAdminClient, AuthentikError
-from app.core.conf import settings
+from app.database.db import async_session_factory
 from app.modules.users import authentik_sync, crud
 from app.modules.users.authentik_sync import SyncResult
 
@@ -39,22 +36,20 @@ _RETRY_KW = dict(
 
 
 def _run(fn: Callable[[AsyncSession, AuthentikAdminClient], Awaitable[Any]]) -> Any:
-    """Run ``fn`` with a throwaway async session + Authentik client (loop-safe)."""
+    """Run ``fn`` with a pooled async session + a task-scoped Authentik client."""
+    from app.tasks._loop import run_async
 
     async def _scope() -> Any:
-        engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
         client = AuthentikAdminClient()
         try:
-            async with session_factory() as db:
+            async with async_session_factory() as db:
                 result = await fn(db, client)
                 await db.commit()
                 return result
         finally:
             await client.aclose()
-            await engine.dispose()
 
-    return asyncio.run(_scope())
+    return run_async(_scope())
 
 
 @shared_task(bind=True, name="app.tasks.authentik.provision_user", **_RETRY_KW)

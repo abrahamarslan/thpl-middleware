@@ -19,6 +19,7 @@ from app.common.exception.errors import AuthError, NotFoundError
 from app.core.conf import settings
 from app.modules.activity.recorder import record_activity
 from app.modules.documents.crud import attach_documents_to_entity
+from app.modules.documents.mixins import linkable_type_of
 from app.modules.emails import crud, schema
 from app.modules.emails.model import Email, EmailEvent
 from app.modules.emails.templates import RenderedEmail, render_email
@@ -89,16 +90,21 @@ async def compose_and_queue_email(
                 detail="RESEND_API_KEY is empty; the queued email will fail delivery",
             )
 
-    # Attach existing documents; inline metadata (CID) rides on the document.
+    # Attach existing documents. Inline metadata (CID) rides on the LINK, not the
+    # document: the same file can be inline in one email and a plain attachment
+    # in another. A missing document fails the request — an email must not go
+    # out silently without the file it promised.
     if email_in.attachments:
-        await attach_documents_to_entity(
-            db, "Email", str(email.id),
-            [a.document_id for a in email_in.attachments],
-            metadata_by_id={
+        wanted = [a.document_id for a in email_in.attachments]
+        docs = await attach_documents_to_entity(
+            db, linkable_type_of(Email), email.id, wanted,
+            context_by_id={
                 a.document_id: {"is_inline": a.is_inline, "content_id": a.content_id}
                 for a in email_in.attachments
             },
         )
+        if missing := set(wanted) - {d.uuid for d in docs}:
+            raise NotFoundError(f"Attachment documents not found: {sorted(str(i) for i in missing)}")
 
     await record_activity(
         db, action="email.queued", actor_id=actor_id,

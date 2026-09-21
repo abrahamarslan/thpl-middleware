@@ -8,8 +8,8 @@ export default function App() {
   const [health, setHealth] = useState<string>('checking…')
 
   useEffect(() => {
-    // /health lives at the root (not under /api) — probe endpoint
-    fetch('/health')
+    // Health endpoint is routed via API prefix (/api/health)
+    fetch(`${API_URL}/health`)
       .then((r) => r.json())
       .then((d) => setHealth(`${d.status} (v${d.version})`))
       .catch(() => setHealth('backend unreachable'))

@@ -1,7 +1,7 @@
 """ScoutBuilder — Laravel-Scout-style search with Postgres hydration.
 
     rows = await (
-        ScoutBuilder(ZohoOrganization, "acme")
+        ScoutBuilder(Organization, "acme")
         .where("address_country", "India")
         .limit(10)
         .get(db)

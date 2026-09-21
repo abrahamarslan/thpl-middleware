@@ -51,11 +51,14 @@ class SearchableEntity:
 
 #: index name -> config. Extend when a new mirror table becomes searchable.
 SEARCHABLE_ENTITIES: dict[str, SearchableEntity] = {
-    "zoho_organizations": SearchableEntity(
-        index_name="zoho_organizations",
-        model_path=("app.modules.zoho.organizations.model", "ZohoOrganization"),
-        schema_path=("app.modules.zoho.organizations.schema", "OrganizationOut"),
+    "organizations": SearchableEntity(
+        index_name="organizations",
+        model_path=("app.modules.organizations.model", "Organization"),
+        schema_path=("app.modules.organizations.schema", "OrganizationOut"),
         searchable=[
+            "legal_name",
+            "trading_name",
+            "org_code",
             "name",
             "contact_name",
             "email",
@@ -66,15 +69,17 @@ SEARCHABLE_ENTITIES: dict[str, SearchableEntity] = {
             "address_country",
         ],
         filterable=[
+            "tenant_id",
+            "org_type",
+            "status",
             "address_country",
             "address_state",
             "address_city",
             "industry_type",
             "is_org_active",
             "currency_code",
-            "sync_status",
         ],
-        sortable=["name", "account_created_date"],
+        sortable=["legal_name", "org_code", "account_created_date"],
     ),
 }
 

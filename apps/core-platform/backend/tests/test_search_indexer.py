@@ -13,7 +13,7 @@ from faststream.kafka import TestKafkaBroker
 from app.modules.search import indexer
 from app.modules.search.registry import SEARCHABLE_ENTITIES, ensure_index_settings
 
-TOPIC = "zoho-mirror.public.zoho_organizations"
+TOPIC = "zoho-mirror.org_management.organizations"
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -103,17 +103,17 @@ async def test_consumer_index_name_derived_from_topic(meili_index, mocker):
     client = indexer.get_meili()
     async with TestKafkaBroker(broker) as br:
         await br.publish_batch({"id": 5, "name": "X"}, topic=TOPIC)
-    client.index.assert_called_with("zoho_organizations")
+    client.index.assert_called_with("organizations")
 
 
 # ── Registry / index-settings bootstrap ───────────────────────────────────────
 
 
 def test_registry_entities_resolve():
-    entity = SEARCHABLE_ENTITIES["zoho_organizations"]
+    entity = SEARCHABLE_ENTITIES["organizations"]
     model = entity.resolve_model()
     schema = entity.resolve_schema()
-    assert model.__tablename__ == "zoho_organizations"
+    assert model.__tablename__ == "organizations"
     assert hasattr(schema, "model_validate")
     # Every filterable/searchable attribute must exist on the model — a typo
     # here would surface as an opaque Meilisearch error in production.
@@ -131,7 +131,7 @@ async def test_ensure_index_settings_applies_all(mocker):
 
     await ensure_index_settings(client)
 
-    entity = SEARCHABLE_ENTITIES["zoho_organizations"]
+    entity = SEARCHABLE_ENTITIES["organizations"]
     index.update_searchable_attributes.assert_awaited_with(entity.searchable)
     index.update_filterable_attributes.assert_awaited_with(entity.filterable)
     index.update_sortable_attributes.assert_awaited_with(entity.sortable)

@@ -110,6 +110,12 @@ services:
     ports:
       - "${AUTHENTIK_PORT:-9010}:9000"
 
+  # --- Reverse proxy: dev TLS (mkcert) ---
+  traefik:
+    volumes:
+      - ./config/traefik/dynamic-dev:/etc/traefik/dynamic:ro
+      - ./config/traefik/certs:/etc/traefik/certs:ro
+
   # --- Dev mail catcher (Authentik email defaults point here) ---
   mailhog:
     image: mailhog/mailhog:v1.0.1

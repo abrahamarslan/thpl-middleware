@@ -26,13 +26,13 @@ from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, TimestampMixin
+from app.database.mixins import IntPKMixin, LedgerMixin, TenantEntityMixin, TimestampMixin
 from app.database.soft_delete import SoftDeleteFilteredMixin
 from app.modules.documents.mixins import HasDocumentsMixin
 from app.modules.tags.mixins import HasTagsMixin
 
 
-class Email(IntPKMixin, TimestampMixin, SoftDeleteFilteredMixin, HasDocumentsMixin, HasTagsMixin, Base):
+class Email(IntPKMixin, TenantEntityMixin, SoftDeleteFilteredMixin, HasDocumentsMixin, HasTagsMixin, Base):
     __tablename__ = "emails"
 
     # Analytics/time-window queries filter on created_at (stats, list date
@@ -140,7 +140,7 @@ class Email(IntPKMixin, TimestampMixin, SoftDeleteFilteredMixin, HasDocumentsMix
         self.status_history = history[-50:]
 
 
-class EmailEvent(IntPKMixin, TimestampMixin, Base):
+class EmailEvent(IntPKMixin, LedgerMixin, TimestampMixin, Base):
     __tablename__ = "email_events"
 
     uuid: Mapped[uuid_mod.UUID] = mapped_column(PgUUID(as_uuid=True), default=uuid_mod.uuid4, unique=True)
@@ -162,7 +162,7 @@ class EmailEvent(IntPKMixin, TimestampMixin, Base):
     email: Mapped[Email] = relationship(back_populates="events")
 
 
-class EmailLink(IntPKMixin, TimestampMixin, Base):
+class EmailLink(IntPKMixin, LedgerMixin, TimestampMixin, Base):
     __tablename__ = "email_links"
 
     uuid: Mapped[uuid_mod.UUID] = mapped_column(PgUUID(as_uuid=True), default=uuid_mod.uuid4, unique=True)

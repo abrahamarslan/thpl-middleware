@@ -1,0 +1,88 @@
+# Import contracts — the platform's dependency rules
+# (docs/zoho-sync-implementation/package-by-feature.md §3, docs/tenancy/README.md §8).
+# Run:  .venv/bin/lint-imports      (also enforced by tests/test_import_contracts.py)
+#
+# Layers:
+#   tenancy core   app.modules.tenants · organizations · roles (+ users) — everyone may depend on it
+#   Zoho platform  app.modules.zoho                                    — entity-agnostic engine
+#   Zoho masters   app.modules.zoho_currencies · taxes · locations · zoho_users
+
+[importlinter]
+root_package = app
+
+[importlinter:contract:zoho-platform-entity-agnostic]
+name = The Zoho platform never imports a Zoho master module (they register by string)
+type = forbidden
+source_modules =
+    app.modules.zoho
+forbidden_modules =
+    app.modules.zoho_currencies
+    app.modules.taxes
+    app.modules.locations
+    app.modules.zoho_users
+
+[importlinter:contract:features-never-call-zoho-directly]
+name = Features never import the Zoho transport (reads = local mirror, writes = outbox)
+type = forbidden
+source_modules =
+    app.modules.organizations
+    app.modules.currencies
+    app.modules.zoho_currencies
+    app.modules.taxes
+    app.modules.locations
+    app.modules.zoho_users
+    app.modules.tenants
+    app.modules.roles
+    app.modules.geo
+forbidden_modules =
+    app.modules.zoho.core.transport
+    app.modules.zoho.core.client
+allow_indirect_imports = True
+
+[importlinter:contract:features-independent]
+name = Zoho master modules are independent of each other (link by zoho id, not import)
+type = independence
+modules =
+    app.modules.zoho_currencies
+    app.modules.taxes
+    app.modules.locations
+    app.modules.zoho_users
+
+[importlinter:contract:location-hub-below-masters]
+name = The location hub never imports a Zoho master (locations projects INTO geo, not the reverse)
+type = forbidden
+source_modules =
+    app.modules.geo
+forbidden_modules =
+    app.modules.zoho_currencies
+    app.modules.taxes
+    app.modules.locations
+    app.modules.zoho_users
+
+[importlinter:contract:tenancy-core-below-masters]
+name = The tenancy core never imports a Zoho master module (they depend on it, not the reverse)
+type = forbidden
+source_modules =
+    app.modules.tenants
+    app.modules.organizations
+    app.modules.roles
+forbidden_modules =
+    app.modules.zoho_currencies
+    app.modules.taxes
+    app.modules.locations
+    app.modules.zoho_users
+
+[importlinter:contract:sync-core-is-source-neutral]
+name = The sync core never imports a source connector or a feature (the engine imports IT)
+type = forbidden
+source_modules =
+    app.modules.sync
+forbidden_modules =
+    app.modules.zoho
+    app.modules.organizations
+    app.modules.currencies
+    app.modules.zoho_currencies
+    app.modules.taxes
+    app.modules.locations
+    app.modules.zoho_users
+    app.modules.geo

@@ -65,6 +65,10 @@ x-backend-env: &backend-env
   # CORS
   CORS_ORIGINS: ${CORS_ORIGINS}
   CORS_CREDENTIALS: ${CORS_CREDENTIALS:-true}
+  # Tenancy (docs/tenancy/README.md): rows written without a tenant context go here
+  DEFAULT_TENANT_CODE: ${DEFAULT_TENANT_CODE:-default}
+  # Platform administrators (manage tenants), comma-separated emails
+  PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
   # Zoho
   ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID}
   ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET}
@@ -72,10 +76,20 @@ x-backend-env: &backend-env
   ZOHO_ACCOUNTS_URL: ${ZOHO_ACCOUNTS_URL:-https://accounts.zoho.in}
   ZOHO_API_BASE_URL: ${ZOHO_API_BASE_URL:-https://www.zohoapis.in/books/v3}
   ZOHO_ORGANIZATION_ID: ${ZOHO_ORGANIZATION_ID}
+  # Tenant owning this deployment's Zoho connection (empty = DEFAULT_TENANT_CODE)
+  ZOHO_TENANT_CODE: ${ZOHO_TENANT_CODE:-}
+  ZOHO_CONNECTION_PROBE_AFTER_SECONDS: ${ZOHO_CONNECTION_PROBE_AFTER_SECONDS:-900}
+  ZOHO_CONNECTION_PROBE_CACHE_SECONDS: ${ZOHO_CONNECTION_PROBE_CACHE_SECONDS:-60}
+  # Debug: log each Zoho request/response (bodies truncated) as zoho.transport.http_exchange
+  ZOHO_HTTP_LOG_BODIES: ${ZOHO_HTTP_LOG_BODIES:-false}
+  ZOHO_HTTP_LOG_BODY_MAX: ${ZOHO_HTTP_LOG_BODY_MAX:-2000}
   # Zoho OAuth flow (must match the Zoho Connected App registration exactly)
   ZOHO_OAUTH_URL: ${ZOHO_OAUTH_URL:-https://accounts.zoho.in/oauth/v2/auth}
   ZOHO_ACCESS_TOKEN_URL: ${ZOHO_ACCESS_TOKEN_URL:-https://accounts.zoho.in/oauth/v2/token}
   ZOHO_REDIRECT_URL: ${ZOHO_REDIRECT_URL:-}
+  # browser landing page AFTER connecting Zoho (not the callback above); empty = JSON
+  ZOHO_AUTH_RETURN_URL: ${ZOHO_AUTH_RETURN_URL:-}
+  ZOHO_AUTH_RETURN_HOSTS: ${ZOHO_AUTH_RETURN_HOSTS:-}
   ZOHO_SCOPE: ${ZOHO_SCOPE:-ZohoBooks.fullaccess.all}
   ZOHO_ACCESS_TYPE: ${ZOHO_ACCESS_TYPE:-offline}
   ZOHO_PROMPT: ${ZOHO_PROMPT:-Consent}
@@ -85,6 +99,33 @@ x-backend-env: &backend-env
   ZOHO_CALLBACK_REQUIRE_USER: ${ZOHO_CALLBACK_REQUIRE_USER:-false}
   # HMAC key for inbound Zoho webhooks (empty = signature check skipped, dev only)
   ZOHO_WEBHOOK_KEY_INCOMING: ${ZOHO_WEBHOOK_KEY_INCOMING:-}
+  ZOHO_INVENTORY_API_URL: ${ZOHO_INVENTORY_API_URL:-https://www.zohoapis.in/inventory/v1}
+  # Refresh token at rest: encrypted (pgcrypto) in zoho_oauth_credentials.
+  # Persistence stays off until a key is set. docs/zoho-sync-implementation/auth.md
+  ZOHO_TOKEN_PERSISTENCE_ENABLED: ${ZOHO_TOKEN_PERSISTENCE_ENABLED:-false}
+  ZOHO_TOKEN_ENCRYPTION_KEY: ${ZOHO_TOKEN_ENCRYPTION_KEY:-}
+  # Governor: daily quota ceiling + per-minute rate + org-wide concurrency for
+  # every Zoho call. docs/zoho-sync-implementation/governor.md
+  ZOHO_GOVERNOR_ENABLED: ${ZOHO_GOVERNOR_ENABLED:-true}
+  ZOHO_CONTRACT_DAILY_LIMIT: ${ZOHO_CONTRACT_DAILY_LIMIT:-45000}
+  ZOHO_DAILY_HARD_LIMIT: ${ZOHO_DAILY_HARD_LIMIT:-45000}
+  ZOHO_RATE_LIMIT_PER_MINUTE: ${ZOHO_RATE_LIMIT_PER_MINUTE:-80}
+  ZOHO_MAX_CONCURRENT_REQUESTS: ${ZOHO_MAX_CONCURRENT_REQUESTS:-6}
+  ZOHO_QUOTA_DAY_TIMEZONE: ${ZOHO_QUOTA_DAY_TIMEZONE:-Asia/Kolkata}
+  # Zoho control plane (docs/zoho-sync-implementation/control-plane.md, apply-gate.md)
+  # operators allowed on /api/zoho/admin (comma-separated); empty = nobody in prod
+  ZOHO_OPERATOR_EMAILS: ${ZOHO_OPERATOR_EMAILS:-}
+  ZOHO_PLANNER_ENABLED: ${ZOHO_PLANNER_ENABLED:-true}
+  ZOHO_PLANNER_MAX_CONCURRENT_RUNS: ${ZOHO_PLANNER_MAX_CONCURRENT_RUNS:-2}
+  # never delete local rows because one scan missed them
+  ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING: ${ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING:-false}
+  # slice budget; keep below Celery's 540 s soft limit
+  ZOHO_SYNC_MAX_RUN_SECONDS: ${ZOHO_SYNC_MAX_RUN_SECONDS:-240}
+  ZOHO_SYNC_MAX_PAGES_PER_RUN: ${ZOHO_SYNC_MAX_PAGES_PER_RUN:-0}
+  ZOHO_SYNC_MAX_RECORDS_PER_RUN: ${ZOHO_SYNC_MAX_RECORDS_PER_RUN:-0}
+  # background lanes yield above this CDC lag
+  ZOHO_WRITE_PRESSURE_MAX_SLOT_LAG_MB: ${ZOHO_WRITE_PRESSURE_MAX_SLOT_LAG_MB:-512}
+  ZOHO_WRITE_PRESSURE_MAX_QUEUE_DEPTH: ${ZOHO_WRITE_PRESSURE_MAX_QUEUE_DEPTH:-5000}
   # Email (Resend) — reusable transactional layer
   EMAIL_PROVIDER: ${EMAIL_PROVIDER:-resend}
   EMAIL_ENABLED: ${EMAIL_ENABLED:-true}
@@ -144,7 +185,7 @@ services:
   #  INFRASTRUCTURE — Traefik Reverse Proxy
   # ============================================================================
   traefik:
-    image: traefik:v3.6.11
+    image: traefik:v3.7.13
     container_name: traefik
     restart: unless-stopped
     ports:
@@ -161,7 +202,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./config/traefik/dynamic:/etc/traefik/dynamic:ro
-      - ./config/traefik/certs:/etc/traefik/certs:ro
       - traefik_certs:/letsencrypt
     networks:
       - app-frontend
@@ -564,7 +604,7 @@ services:
       OTEL_SERVICE_NAME: core-platform-search-indexer
       MEILISEARCH_URL: http://meilisearch:7700
       MEILISEARCH_MASTER_KEY: ${MEILISEARCH_KEY}
-      SEARCH_CDC_TOPICS: ${SEARCH_CDC_TOPICS:-zoho-mirror.public.zoho_organizations}
+      SEARCH_CDC_TOPICS: ${SEARCH_CDC_TOPICS:-zoho-mirror.org_management.organizations}
     depends_on:
       kafka:
         condition: service_healthy

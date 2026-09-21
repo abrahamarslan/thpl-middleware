@@ -6,8 +6,8 @@ and retry pacing. It speaks only to the provider-neutral layer
 Retries are DB-driven (attempts / max_attempts on the row) layered under
 Celery's backoff; the email row is always the source of truth for its state.
 
-Async-in-Celery: same _run pattern as app/tasks/zoho_sync.py (asyncpg-only
-stack; throwaway NullPool engine per task).
+Async-in-Celery: ``run_async`` on the worker process's event loop with the
+pooled session factory (ADR‑3, app/tasks/_loop.py).
 """
 
 import asyncio
@@ -15,54 +15,68 @@ from datetime import UTC, datetime
 
 import structlog
 from celery import shared_task
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
 from app.core.conf import settings
+from app.database.db import async_session_factory
+from app.tasks._loop import run_async
 
 logger = structlog.get_logger("app.tasks.emails")
 
 
 async def _load_attachments(db, email) -> list:
-    """Documents -> provider-neutral ``EmailAttachment`` objects (raw bytes).
+    """Files of the documents attached to the email -> provider-neutral
+    ``EmailAttachment`` objects (raw bytes).
 
-    Local-disk backed documents are read directly; S3 documents are skipped
-    with a loud log until the S3 client lands (attachment metadata carries
-    everything needed to extend this).
+    An email's documents are the ones LINKED to it in the ``attachment`` role;
+    each file (page) of a document becomes one attachment. Local-disk files are
+    read directly; object-store files are skipped with a loud log until the S3
+    client lands (the file row carries everything needed to extend this).
+    Soft-deleted documents, files and links are never sent.
     """
     from sqlalchemy import select
 
-    from app.modules.documents.model import Document
+    from app.modules.documents.enums import DocumentLinkRole, FileStorageProvider
+    from app.modules.documents.mixins import linkable_type_of
+    from app.modules.documents.model import Document, DocumentFile, DocumentLink
+    from app.modules.emails.model import Email
     from app.modules.emails.provider import EmailAttachment
 
-    docs = (
-        await db.scalars(
-            select(Document).where(
-                Document.documentable_type == "Email",
-                Document.documentable_id == str(email.id),
+    rows = (
+        await db.execute(
+            select(DocumentFile, DocumentLink.context)
+            .join(DocumentLink, DocumentLink.document_id == DocumentFile.document_id)
+            .join(Document, Document.id == DocumentFile.document_id)
+            .where(
+                DocumentLink.linkable_type == linkable_type_of(Email),
+                DocumentLink.linkable_id == email.id,
+                DocumentLink.link_role == DocumentLinkRole.ATTACHMENT.value,
+                DocumentLink.deleted_at.is_(None),
+                DocumentFile.deleted_at.is_(None),
+                Document.deleted_at.is_(None),
             )
+            .order_by(DocumentLink.sort_order, DocumentFile.document_id, DocumentFile.page_index)
         )
     ).all()
 
     attachments: list[EmailAttachment] = []
-    for doc in docs:
+    for file, context in rows:
         content: bytes | None = None
-        meta = doc.metadata_ or {}
-        local_path = meta.get("local_path")  # documents registered from local pipelines
-        if local_path:
+        if file.file_storage_provider == FileStorageProvider.LOCAL_DISK.value:
             try:
-                content = await asyncio.to_thread(lambda p=local_path: open(p, "rb").read())
+                content = await asyncio.to_thread(lambda p=file.file_key: open(p, "rb").read())
             except OSError as e:
-                logger.error("email_attachment_read_failed", document_id=str(doc.id), error=str(e))
-        elif doc.s3_key:
-            logger.warning("email_attachment_s3_skipped", document_id=str(doc.id), s3_key=doc.s3_key)
+                logger.error("email_attachment_read_failed", document_file_id=str(file.uuid), error=str(e))
+        else:
+            logger.warning("email_attachment_remote_skipped", document_file_id=str(file.uuid),
+                           provider=file.file_storage_provider, file_key=file.file_key)
         if content is None:
             continue
+        context = context or {}
         attachments.append(
             EmailAttachment(
-                filename=doc.file_name,
+                filename=file.file_name,
                 content=content,
-                content_id=meta.get("content_id") if meta.get("is_inline") else None,
+                content_id=context.get("content_id") if context.get("is_inline") else None,
             )
         )
     return attachments
@@ -74,76 +88,71 @@ def send_email(self, email_id: int) -> dict:
     from app.modules.emails.provider import get_email_provider
 
     async def work() -> dict:
-        engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        try:
-            async with session_factory() as db:
-                email = await db.get(Email, email_id)
-                if email is None:
-                    return {"status": "missing"}
-                if email.status not in ("pending", "queued"):
-                    return {"status": "already_processed", "current": email.status}
+        async with async_session_factory() as db:
+            email = await db.get(Email, email_id)
+            if email is None:
+                return {"status": "missing"}
+            if email.status not in ("pending", "queued"):
+                return {"status": "already_processed", "current": email.status}
 
-                # Master switch: record the intent, never touch the network.
-                if not settings.EMAIL_ENABLED:
-                    email.push_status("suppressed", "outbound email disabled (EMAIL_ENABLED=false)")
-                    await db.commit()
-                    logger.warning("email_suppressed_disabled", email_id=email_id)
-                    return {"status": "suppressed"}
-
-                email.push_status("processing")
-                email.attempts = (email.attempts or 0) + 1
+            # Master switch: record the intent, never touch the network.
+            if not settings.EMAIL_ENABLED:
+                email.push_status("suppressed", "outbound email disabled (EMAIL_ENABLED=false)")
                 await db.commit()
+                logger.warning("email_suppressed_disabled", email_id=email_id)
+                return {"status": "suppressed"}
 
-                # Dev: persist + mark sent without a provider call (no key/network).
-                if settings.EMAIL_LOG_ONLY:
-                    email.push_status("sent", "EMAIL_LOG_ONLY=true (not delivered)")
-                    email.sent_at = datetime.now(UTC)
-                    await db.commit()
-                    logger.info("email_log_only", email_id=email_id)
-                    return {"status": "sent", "log_only": True}
+            email.push_status("processing")
+            email.attempts = (email.attempts or 0) + 1
+            await db.commit()
 
-                from app.modules.emails.provider import OutboundEmail
-
-                message = OutboundEmail(
-                    to=email.email_to or [],
-                    cc=email.email_cc or [],
-                    bcc=email.email_bcc or [],
-                    sender=email.email_from,
-                    reply_to=email.reply_to,
-                    subject=email.subject or "",
-                    html=email.body_html,
-                    text=email.body_text,
-                )
-                message.attachments = await _load_attachments(db, email)
-
-                try:
-                    result = await get_email_provider().send(message)
-                except Exception as e:  # noqa: BLE001 — classified below
-                    email.error_message = str(e)[:2000]
-                    if (email.attempts or 0) >= (email.max_attempts or settings.EMAIL_MAX_ATTEMPTS):
-                        email.push_status("failed", "max attempts reached")
-                        email.failed_at = datetime.now(UTC)
-                        await db.commit()
-                        logger.error("email_send_failed_final", email_id=email_id, error=str(e))
-                        return {"status": "failed", "error": str(e)[:200]}
-                    email.push_status("pending", "retry scheduled")
-                    await db.commit()
-                    return {"status": "retry", "error": str(e)[:200]}
-
-                email.push_status("sent")
-                email.provider = result.provider
-                email.provider_message_id = result.message_id
-                email.provider_response = result.raw
+            # Dev: persist + mark sent without a provider call (no key/network).
+            if settings.EMAIL_LOG_ONLY:
+                email.push_status("sent", "EMAIL_LOG_ONLY=true (not delivered)")
                 email.sent_at = datetime.now(UTC)
-                email.error_message = None
                 await db.commit()
-                logger.info("email_sent", email_id=email_id, provider_message_id=result.message_id)
-                return {"status": "sent", "provider_message_id": result.message_id}
-        finally:
-            await engine.dispose()
+                logger.info("email_log_only", email_id=email_id)
+                return {"status": "sent", "log_only": True}
 
-    out = asyncio.run(work())
+            from app.modules.emails.provider import OutboundEmail
+
+            message = OutboundEmail(
+                to=email.email_to or [],
+                cc=email.email_cc or [],
+                bcc=email.email_bcc or [],
+                sender=email.email_from,
+                reply_to=email.reply_to,
+                subject=email.subject or "",
+                html=email.body_html,
+                text=email.body_text,
+            )
+            message.attachments = await _load_attachments(db, email)
+
+            try:
+                result = await get_email_provider().send(message)
+            except Exception as e:  # noqa: BLE001 — classified below
+                email.error_message = str(e)[:2000]
+                if (email.attempts or 0) >= (email.max_attempts or settings.EMAIL_MAX_ATTEMPTS):
+                    email.push_status("failed", "max attempts reached")
+                    email.failed_at = datetime.now(UTC)
+                    await db.commit()
+                    logger.error("email_send_failed_final", email_id=email_id, error=str(e))
+                    return {"status": "failed", "error": str(e)[:200]}
+                email.push_status("pending", "retry scheduled")
+                await db.commit()
+                return {"status": "retry", "error": str(e)[:200]}
+
+            email.push_status("sent")
+            email.provider = result.provider
+            email.provider_message_id = result.message_id
+            email.provider_response = result.raw
+            email.sent_at = datetime.now(UTC)
+            email.error_message = None
+            await db.commit()
+            logger.info("email_sent", email_id=email_id, provider_message_id=result.message_id)
+            return {"status": "sent", "provider_message_id": result.message_id}
+
+    out = run_async(work())
     if out.get("status") == "missing":
         raise self.retry(countdown=10)  # enqueued before the compose txn committed
     if out.get("status") == "retry":

@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.modules.documents.model import Document
+from app.modules.documents.model import Document, DocumentType
 from app.modules.tags import crud, schema, service
 from app.modules.tags.model import Tag, Taggable
 
@@ -44,9 +44,10 @@ async def test_sync_validates_tag_ids(db):
         )
 
 
-async def test_has_tags_mixin_eager_loads_across_uuid_pk(db):
-    """Document has a UUID PK — the cast(id, String) join must still work."""
-    doc = Document(file_name="a.pdf", file_type="pdf", file_size=10)
+async def test_has_tags_mixin_eager_loads_on_documents(db):
+    """Documents are taggable: the cast(id, String) join must resolve their BigInteger pk."""
+    general = await db.scalar(select(DocumentType).where(DocumentType.code == "GENERAL"))
+    doc = Document(document_type_id=general.id, document_purpose="other")
     db.add(doc)
     await db.flush()
 

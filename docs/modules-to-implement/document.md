@@ -1,3 +1,5 @@
+> **Superseded (2026-09-20).** This is the original single-table spec. The module now follows the catalog / logical-document / files / links design — see [docs/documents/README.md](../documents/README.md). Kept for the reasoning behind the mixin and the computed `*_formatted` fields.
+
 This is a fantastic candidate for modernization. The original Laravel implementation is comprehensive, but it contains a few classic anti-patterns for database design (like storing computed `*_formatted` values directly in the database) and synchronous S3 logic.
 
 Here is the **Enterprise Async FastAPI implementation** of the Document module.

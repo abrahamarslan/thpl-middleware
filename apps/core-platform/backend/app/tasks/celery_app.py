@@ -13,11 +13,15 @@ Queues:
 
 Scaling rule: one worker container per queue class once load grows, e.g.
   celery -A app.tasks.celery_app worker -Q documents -c 2
+
+Async tasks: every worker process owns ONE event loop (app/tasks/_loop.py,
+ADR‑3) — run the prefork pool (the default). ``-P threads`` / ``gevent``
+would share a loop between concurrent tasks and is not supported.
 """
 
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import setup_logging, worker_process_init
+from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
 
 from app.core.conf import settings
 
@@ -26,7 +30,6 @@ celery_app = Celery(
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
     include=[
-        "app.tasks.zoho",
         "app.tasks.zoho_sync",
         "app.tasks.documents",
         "app.tasks.emails",
@@ -50,7 +53,6 @@ celery_app.conf.update(
     # Routing
     task_default_queue="default",
     task_routes={
-        "app.tasks.zoho.*": {"queue": "integrations"},
         "app.tasks.zoho_sync.*": {"queue": "integrations"},
         "app.tasks.emails.*": {"queue": "integrations"},
         "app.tasks.documents.*": {"queue": "documents"},
@@ -61,31 +63,37 @@ celery_app.conf.update(
     task_send_sent_event=True,
     # Periodic schedule (Celery Beat)
     beat_schedule={
-        "zoho-sync-items": {
-            "task": "app.tasks.zoho.sync_items",
-            "schedule": crontab(minute="*/15"),
-        },
-        "zoho-sync-contacts": {
-            "task": "app.tasks.zoho.sync_contacts",
-            "schedule": crontab(minute="5", hour="*/2"),
-        },
+        # NOTE: `zoho-sync-items` (*/15) and `zoho-sync-contacts` (2 h) were
+        # REMOVED on 2026-09-18 together with app/tasks/zoho.py. They paginated
+        # whole catalogues only to log a row count — at 5k items that is ~1,700
+        # wasted Zoho calls a day against a 45,000/day contract, with no data
+        # written. See docs/zoho-sync-implementation/README.md (Phase 1).
         "cleanup-old-media": {
             "task": "app.tasks.maintenance.cleanup_old_media",
             "schedule": crontab(minute="30", hour="3"),
         },
-        # Sync-engine dispatcher: config-driven — every 5 min it enqueues an
-        # incremental run for each registered module whose
-        # sync_interval_minutes elapsed (no per-module beat entries needed).
-        "zoho-sync-dispatcher": {
-            "task": "app.tasks.zoho_sync.sync_all_due",
-            "schedule": crontab(minute="*/5"),
+        # The Zoho planner is the ONLY Zoho scheduler. It replaced
+        # `zoho-sync-dispatcher` (every 5 min, no running guard → overlapping
+        # runs) and `zoho-full-sync-weekly` (every module forced to a full scan
+        # at the same instant). Each module's interval and the weekly full slot
+        # are planner lanes; exclusion is a DB lease, not a schedule.
+        # docs/zoho-sync-implementation/control-plane.md
+        "zoho-planner": {
+            "task": "app.tasks.zoho_sync.planner_tick",
+            "schedule": 60.0,
+            "options": {"expires": 55},          # a late tick is useless; never pile up
         },
-        # Weekly full-sync safety net for every registered module (catches
-        # records that incremental windows can miss: merges, hard deletes).
-        "zoho-full-sync-weekly": {
-            "task": "app.tasks.zoho_sync.sync_all_due",
-            "schedule": crontab(minute="0", hour="3", day_of_week="sunday"),
-            "kwargs": {"force_mode": "full", "force": True},
+        # Nightly: sync-event partitions ahead, expired partitions dropped,
+        # retention policies applied. 21:15 UTC = 02:45 IST (quiet hours).
+        "zoho-retention": {
+            "task": "app.tasks.zoho_sync.retention_maintenance",
+            "schedule": crontab(minute="15", hour="21"),
+        },
+        # Daily: verified documents past their expiry_date become `expired`
+        # (docs/documents/README.md). 21:30 UTC = 03:00 IST.
+        "documents-expiry": {
+            "task": "app.tasks.documents.expire_due_documents",
+            "schedule": crontab(minute="30", hour="21"),
         },
     },
 )
@@ -104,3 +112,18 @@ def _init_worker_otel(**_kwargs) -> None:
     from app.core.observability import setup_otel_celery
 
     setup_otel_celery()
+
+
+@worker_process_init.connect
+def _init_worker_loop(**_kwargs) -> None:
+    """Fresh event loop per forked child; drop inherited pool state (ADR‑3)."""
+    from app.tasks._loop import reset_after_fork
+
+    reset_after_fork()
+
+
+@worker_process_shutdown.connect
+def _shutdown_worker_loop(**_kwargs) -> None:
+    from app.tasks._loop import shutdown
+
+    shutdown()

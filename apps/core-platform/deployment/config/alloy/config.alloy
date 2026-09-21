@@ -115,6 +115,13 @@ prometheus.exporter.unix "default" {
   procfs_path = "/host/proc"
   sysfs_path  = "/host/sys"
   rootfs_path = "/host/root"
+
+  disable_collectors = [
+    "arp",
+    "netdev",
+    "netstat",
+    "softnet",
+  ]
 }
 
 prometheus.scrape "integrations" {

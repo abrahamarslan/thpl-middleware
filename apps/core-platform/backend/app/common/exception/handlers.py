@@ -23,6 +23,28 @@ def _envelope(request: Request, *, status_code: int, code: str, msg: str, data=N
     )
 
 
+def _serializable_errors(errors: list[dict]) -> list[dict]:
+    """Make Pydantic's error list safe to serialise.
+
+    A validator that raises ``ValueError`` (the documented way to reject a
+    value) leaves the exception OBJECT in ``ctx['error']``. orjson cannot
+    encode it, so the 422 turned into a 500 — the clear message replaced by an
+    opaque server error. ``msg`` already carries the text, so the object is
+    reduced to its string.
+    """
+    cleaned = []
+    for error in errors:
+        item = dict(error)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v))
+                           for k, v in ctx.items()}
+        if isinstance(item.get("input"), (bytes, bytearray)):
+            item["input"] = "<binary>"
+        cleaned.append(item)
+    return cleaned
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
@@ -36,7 +58,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="validation_error",
             msg="Request validation failed",
-            data=exc.errors(),
+            data=_serializable_errors(exc.errors()),
         )
 
     @app.exception_handler(StarletteHTTPException)

@@ -6,7 +6,9 @@ Local apps (FSA, Delivery) talk ONLY to our FastAPI; the engine reconciles
 with Zoho in the background through Celery.
 
 Code: `app/modules/zoho/sync/` (framework) + one package per entity
-(`app/modules/zoho/organizations/`, …). Celery drivers:
+(`app/modules/organizations/` — each feature owns its Zoho adapter in
+`app/modules/<feature>/zoho/` since Phase 5, see
+`docs/zoho-sync-implementation/package-by-feature.md`). Celery drivers:
 `app/tasks/zoho_sync.py`. Admin API: `/api/zoho/sync-engine/*`.
 
 ```
@@ -191,7 +193,7 @@ queue logs appear automatically.
 
 ## 9. Worked example: organizations
 
-`app/modules/zoho/organizations/` mirrors
+`app/modules/organizations/` (adapter in `zoho/`) mirrors
 [docs/zoho-docs-md/organizations.md](zoho-docs-md/organizations.md):
 
 - **FULL + inline detail** (tiny dataset; the list payload is a thin index;

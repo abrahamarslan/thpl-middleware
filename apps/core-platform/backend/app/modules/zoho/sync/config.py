@@ -31,6 +31,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.conf import settings
+from app.modules.sync.contract import SyncContract
 
 
 class SyncDirection(str, Enum):
@@ -120,6 +121,19 @@ class GlobalSyncDefaults(BaseModel):
     modified_since_param: str | None = "last_modified_time"
     sort_column: str | None = "last_modified_time"
     soft_delete_missing: bool = False   # full sync soft-deletes vanished rows
+    # ── "When to stop" — every run is a bounded slice (0 = no limit) ────────
+    # A run that hits a budget ends YIELDED, keeps its page/cursor, and the
+    # planner resumes it on the next tick (docs/zoho-sync-implementation/
+    # apply-gate.md §4).
+    max_run_seconds: int = Field(default=240, ge=0, le=3600)
+    max_pages_per_run: int = Field(default=0, ge=0)
+    max_records_per_run: int = Field(default=0, ge=0)
+    # Planner: include this module in the weekly full-reconcile lane.
+    weekly_full_enabled: bool = True
+    # Apply gate: payload keys (glob, any depth) ignored by the no-op hash.
+    hash_volatile_keys: list[str] = Field(
+        default_factory=lambda: ["*_formatted", "page_context", "instrumentation"]
+    )
 
 
 class ModuleSyncConfig(GlobalSyncDefaults):
@@ -128,10 +142,20 @@ class ModuleSyncConfig(GlobalSyncDefaults):
     module: str                       # registry key, e.g. "organizations"
     endpoint: str                     # list endpoint, e.g. "/organizations"
     zoho_id_attr: str                 # PK attribute in Zoho payloads
+    api: Literal["books", "inventory"] = "books"   # which Zoho product serves the endpoint
+    # False for list endpoints that return everything in one response WITHOUT
+    # page_context (e.g. /settings/currencies) — the transport would otherwise
+    # treat the missing page_context as a contract violation.
+    paginated: bool = True
     detail_endpoint: str | None = None  # default: f"{endpoint}/{zoho_id}"
     list_params: dict[str, Any] = Field(default_factory=dict)
     field_map: list[FieldMapping] = Field(default_factory=list)
     nested: list[NestedEntityRule] = Field(default_factory=list)
+    #: How the result is STORED (the part SAP reuses verbatim): canonical table,
+    #: match key, whether gate state lives on the crosswalk. The default has
+    #: ``crosswalk=False``, so a module that declares nothing keeps today's
+    #: in-place mirror behaviour exactly.
+    contract: SyncContract = SyncContract()
 
     @field_validator("endpoint")
     @classmethod
@@ -151,6 +175,12 @@ def _env_defaults() -> GlobalSyncDefaults:
         sync_interval_minutes=settings.ZOHO_SYNC_INTERVAL_MINUTES,
         wait_between_calls=settings.ZOHO_SYNC_WAIT_BETWEEN_CALLS,
         retry_limit=settings.ZOHO_SYNC_RETRY_LIMIT,
+        max_run_seconds=settings.ZOHO_SYNC_MAX_RUN_SECONDS,
+        max_pages_per_run=settings.ZOHO_SYNC_MAX_PAGES_PER_RUN,
+        max_records_per_run=settings.ZOHO_SYNC_MAX_RECORDS_PER_RUN,
+        hash_volatile_keys=[
+            key.strip() for key in settings.ZOHO_SYNC_HASH_VOLATILE_KEYS.split(",") if key.strip()
+        ],
     )
 
 

@@ -18,10 +18,10 @@ from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, SoftDeleteMixin, TenantMixin, TimestampMixin
+from app.database.mixins import IntPKMixin, SoftDeleteMixin, TenantEntityMixin
 
 
-class FileEntity(IntPKMixin, TenantMixin, TimestampMixin, SoftDeleteMixin, Base):
+class FileEntity(IntPKMixin, TenantEntityMixin, SoftDeleteMixin, Base):
     __tablename__ = "files"
 
     file_id: Mapped[uuid.UUID] = mapped_column(

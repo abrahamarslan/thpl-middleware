@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from geoalchemy2 import Geography
 from sqlalchemy import (
     BigInteger,
+    ForeignKeyConstraint,
     Boolean,
     CheckConstraint,
     Date,
@@ -40,14 +41,29 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.db import Base
-from app.database.mixins import BigIntPKWithUUIDMixin, TimestampMixin
+from app.database.mixins import (
+    AppMetaMixin,
+    BigIntPKWithUUIDMixin,
+    DeactivationMixin,
+    LedgerMixin,
+    RowVersionMixin,
+    SoftDeleteMixin,
+    TenantEntityMixin,
+    TenantScopedMixin,
+    TimestampMixin,
+)
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class User(Base):
+class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, Base):
+    """A person who signs in. Belongs to ONE tenant (``tenant_id``) and optionally a
+    primary organization (``organization_id``); holds a role OF THAT TENANT
+    (composite FK ``(tenant_id, role_id)`` → ``roles``). ``email`` stays globally
+    unique so sign-in needs no tenant picker (docs/tenancy/README.md §6)."""
+
     __tablename__ = "users"
 
     # == Core (base migration) ==
@@ -71,7 +87,7 @@ class User(Base):
     api_token = mapped_column(String(80), nullable=True, unique=True, comment="Unique token for API authentication")
 
     # == Status, Roles & Type ==
-    role_id = mapped_column(Integer, nullable=True, default=-1, comment="Foreign key referencing the roles table")
+    role_id = mapped_column(BigInteger, nullable=True, comment="roles.id of the user's tenant (composite FK)")
     user_type = mapped_column(String(50), nullable=True, comment="Broad classification of the user (e.g., Employee, Customer, Admin)")
     status = mapped_column(String(25), nullable=True, default="active", comment="General status indicator (e.g., active, inactive, pending)")
     user_status = mapped_column(String(255), nullable=True, default="active", comment="Detailed user status (e.g., active, suspended, onboarding)")
@@ -79,6 +95,9 @@ class User(Base):
     is_deactivated = mapped_column(Boolean, nullable=True, default=False, comment="Flag indicating if the user account is deactivated")
     deactivation_date = mapped_column(DateTime(timezone=True), nullable=True, comment="Timestamp when the user account was deactivated")
     deactivation_reason = mapped_column(Text, nullable=True, comment="Reason provided for account deactivation")
+    deactivated_by = mapped_column(BigInteger, nullable=True, comment="users.id who deactivated the account")
+    is_verified = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"),
+                                comment="Identity verified (KYC / admin check)")
     confirmation_status = mapped_column(SmallInteger, nullable=True, default=0, comment="Confirmation status (0 = Not Confirmed, 1 = Confirmed)")
 
     # == Moderation: ban (hard) & throttle (soft) ==
@@ -297,11 +316,14 @@ class User(Base):
 
     # == Audit & Timestamps ==
     created_by = mapped_column(BigInteger, nullable=True, comment="ID of the user who created this record")
+    created_by_name = mapped_column(String(255), nullable=True, comment="Creator display name at the time")
     updated_by = mapped_column(BigInteger, nullable=True, comment="ID of the user who last updated this record")
+    updated_by_name = mapped_column(String(255), nullable=True, comment="Last updater display name at the time")
     deleted_by = mapped_column(BigInteger, nullable=True, comment="ID of the user who soft-deleted this record")
     created_at = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
     deleted_at = mapped_column(DateTime(timezone=True), nullable=True, comment="Soft-delete timestamp")
+    deleted_reason = mapped_column(Text, nullable=True, comment="Why the account was deleted")
 
     __table_args__ = (
         Index("users_first_last_name_index", "first_name", "last_name"),
@@ -329,6 +351,8 @@ class User(Base):
         Index("users_deleted_at_index", "deleted_at"),
         Index("ix_users_is_banned", "is_banned"),
         Index("ix_users_is_throttled", "is_throttled"),
+        ForeignKeyConstraint(["tenant_id", "role_id"], ["roles.tenant_id", "roles.id"],
+                             name="fk_users_tenant_role", ondelete="RESTRICT"),
     )
 
     @property
@@ -339,8 +363,16 @@ class User(Base):
     def is_active(self) -> bool:
         return self.deleted_at is None and not self.is_deactivated and not self.is_banned
 
+    def deactivate(self, *, reason: str | None = None, by: int | None = None) -> None:
+        super().deactivate(reason=reason, by=by)
+        self.is_deactivated = True
 
-class PasswordResetToken(Base):
+    def reactivate(self) -> None:
+        super().reactivate()
+        self.is_deactivated = False
+
+
+class PasswordResetToken(LedgerMixin, Base):
     """Port of Laravel's password_reset_tokens table, hardened for OTP resets.
 
     One *active* reset per email (email is the PK). The one-time code is stored
@@ -365,7 +397,7 @@ class PasswordResetToken(Base):
     created_at = mapped_column(DateTime(timezone=True), nullable=True, default=_utcnow)
 
 
-class LoginOtpToken(Base):
+class LoginOtpToken(LedgerMixin, Base):
     """One-time login code challenge (passwordless email OTP).
 
     One active challenge per email. The code is stored only as a keyed HMAC;
@@ -451,7 +483,7 @@ class CountryTimezone(Base):
     )
 
 
-class UserProfile(BigIntPKWithUUIDMixin, Base):
+class UserProfile(BigIntPKWithUUIDMixin, TenantEntityMixin, SoftDeleteMixin, Base):
     """User profile localization preferences: auto-unless-overridden timezone logic."""
 
     __tablename__ = "user_profiles"

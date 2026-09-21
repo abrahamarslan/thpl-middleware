@@ -26,8 +26,6 @@ This module is imported for its side effect (listener registration) from
 app/database/db.py, so it is active in the API, Celery workers and tests.
 """
 
-from datetime import UTC, datetime
-
 from sqlalchemy import event
 from sqlalchemy.orm import Session, with_loader_criteria
 
@@ -38,13 +36,9 @@ class SoftDeleteFilteredMixin(SoftDeleteMixin):
     """Soft delete + automatic ``deleted_at IS NULL`` on every SELECT.
 
     Inherit this (instead of SoftDeleteMixin) to opt into global filtering.
+    ``soft_delete(reason=, by=)`` / ``restore()`` come from SoftDeleteMixin
+    (they also record deleted_by / deleted_reason).
     """
-
-    def soft_delete(self) -> None:
-        self.deleted_at = datetime.now(UTC)
-
-    def restore(self) -> None:
-        self.deleted_at = None
 
 
 @event.listens_for(Session, "do_orm_execute")

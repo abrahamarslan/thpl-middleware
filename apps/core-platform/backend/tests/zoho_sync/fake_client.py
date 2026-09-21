@@ -67,9 +67,10 @@ class FakeZohoClient:
         return await self._resolve("DELETE", path, params=params)
 
     async def paginate(
-        self, path: str, *, params: dict | None = None, per_page: int = 200, max_pages: int | None = None
+        self, path: str, *, params: dict | None = None, per_page: int = 200, max_pages: int | None = None,
+        start_page: int = 1,
     ) -> AsyncIterator[ZohoResponse]:
-        page = 1
+        page = start_page
         while True:
             response = await self.get(path, params={**(params or {}), "page": page, "per_page": per_page})
             yield response

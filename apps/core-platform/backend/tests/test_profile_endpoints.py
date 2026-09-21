@@ -213,7 +213,7 @@ def test_zoho_auth_initiate_json_endpoint(mocker):
 
 def test_zoho_auth_status_endpoint(mocker):
     mock_token = mocker.patch(
-        "app.modules.zoho.core.token_manager.zoho_token_manager.get_refresh_token",
+        "app.modules.zoho.core.auth.zoho_token_manager.get_refresh_token",
         new_callable=AsyncMock,
         return_value="ref_token_abc",
     )

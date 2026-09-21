@@ -68,6 +68,20 @@ class Settings(BaseSettings):
                 return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
+    # --- Tenancy (docs/tenancy/README.md) ---
+    # Rows written outside any tenant context (seeders, system tasks, the
+    # single-tenant default) belong to this tenant. Created by the migration.
+    DEFAULT_TENANT_CODE: str = "default"
+    # Platform administrators (manage tenants): comma-separated emails.
+    # Empty = nobody in production, any authenticated user when DEBUG=true.
+    PLATFORM_ADMIN_EMAILS: str = ""
+
+    # --- Documents (docs/documents/README.md) ---
+    # pgcrypto passphrase for documents.document_number_full_encrypted (only
+    # for types with allows_full_number_storage). Empty = FAIL CLOSED: the full
+    # number is never stored, only the masked form. Generate: openssl rand -base64 48
+    DOCUMENT_NUMBER_ENCRYPTION_KEY: str = ""
+
     # --- CORS ---
     CORS_ORIGINS: list[str] = []
     CORS_CREDENTIALS: bool = True
@@ -123,6 +137,44 @@ class Settings(BaseSettings):
     # --- Rate limiting ---
     RATE_LIMIT_PER_MINUTE: int = 60
 
+    # --- Geocoding & routing (app/modules/geo/geocoding, docs/geo/geocoding.md) ---
+    # Off by default: no deployment should start making paid third-party calls
+    # because a key happened to be present in the environment.
+    GEOCODING_ENABLED: bool = False
+    GEOCODING_PROVIDER: str = ""              # google | mapbox | nominatim | pelias
+    GEOCODING_FALLBACK_PROVIDERS: str = ""    # comma-separated, tried in order
+    GEOCODING_DEFAULT_COUNTRY: str = "IN"     # ISO alpha-2 bias; "" = worldwide
+    GEOCODING_DEFAULT_LANGUAGE: str = "en"
+    # Licence ceiling for cached payloads. Google permits 30 days for geocodes
+    # (place_id indefinitely); self-hosted instances impose no limit.
+    GEOCODING_CACHE_DAYS: int = 30
+    GEOCODING_ROUTING_CACHE_DAYS: int = 1     # roads are slow to change, traffic is not
+    GEOCODING_TIMEOUT_SECONDS: float = 8.0
+    GEOCODING_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    GEOCODING_MAX_ATTEMPTS: int = 3
+    GEOCODING_RETRY_BACKOFF_SECONDS: float = 0.5
+    # Local spend guard. A provider's own published policy is a ceiling this
+    # cannot raise (public Nominatim allows ~1 req/s).
+    GEOCODING_MAX_CALLS_PER_MINUTE: int = 60
+    # Circuit breaker: N consecutive transient failures within the window open
+    # the circuit for the recovery period. Fails OPEN when Redis is down.
+    GEOCODING_CB_FAILURES: int = 5
+    GEOCODING_CB_WINDOW_SECONDS: int = 120
+    GEOCODING_CB_RECOVERY_SECONDS: int = 60
+    # Provider credentials and endpoints
+    GOOGLE_MAPS_API_KEY: str = ""
+    MAPBOX_ACCESS_TOKEN: str = ""
+    GEOCODING_MAPBOX_BASE_URL: str = ""       # "" = Mapbox Geocoding v6
+    GEOCODING_NOMINATIM_BASE_URL: str = ""    # "" = the public OSM instance
+    # Nominatim rejects anonymous traffic; its policy asks for contact details.
+    GEOCODING_NOMINATIM_USER_AGENT: str = ""
+    GEOCODING_PELIAS_BASE_URL: str = ""
+    GEOCODING_PELIAS_API_KEY: str = ""
+    # Routing. "" = straight-line distances computed locally, no durations.
+    # Valhalla is a ROUTING engine and cannot geocode; pair it with Pelias.
+    ROUTING_PROVIDER: str = ""                # valhalla | google | mapbox | haversine
+    ROUTING_VALHALLA_BASE_URL: str = ""
+
     # --- Zoho Books ---
     ZOHO_CLIENT_ID: str = ""
     ZOHO_CLIENT_SECRET: str = ""
@@ -130,10 +182,28 @@ class Settings(BaseSettings):
     ZOHO_ACCOUNTS_URL: str = "https://accounts.zoho.in"
     ZOHO_API_BASE_URL: str = "https://www.zohoapis.in/books/v3"
     ZOHO_ORGANIZATION_ID: str = ""
-    ZOHO_TIMEOUT_SECONDS: float = 30.0
+    # Tenant that owns this deployment's Zoho connection (empty = DEFAULT_TENANT_CODE).
+    # Mirror rows are written into it, attached to the organization node whose
+    # zoho_id = ZOHO_ORGANIZATION_ID.
+    ZOHO_TENANT_CODE: str = ""
+    # Connection readiness (GET /api/zoho/auth/connection): with no successful
+    # Zoho call for this long, ?probe=auto makes ONE live org-scoped call.
+    ZOHO_CONNECTION_PROBE_AFTER_SECONDS: int = 900
+    ZOHO_CONNECTION_PROBE_CACHE_SECONDS: int = 60
+    ZOHO_TIMEOUT_SECONDS: float = 30.0      # read timeout per attempt
+    # Debug: log every Zoho request/response (URL, query, bodies — truncated) as
+    # `zoho.transport.http_exchange`. Bodies carry business and personal data:
+    # dev or short diagnoses only. The OAuth token is a header and never logged.
+    ZOHO_HTTP_LOG_BODIES: bool = False
+    ZOHO_HTTP_LOG_BODY_MAX: int = 2000
+    ZOHO_CONNECT_TIMEOUT_SECONDS: float = 5.0  # fail fast when Zoho is unreachable
     # Zoho guard rails (see app/modules/zoho/core/)
-    ZOHO_RATE_LIMIT_PER_MINUTE: int = 90      # Zoho Books allows ~100/min/org
-    ZOHO_MAX_CONCURRENT_REQUESTS: int = 8     # Zoho allows ~10 concurrent
+    # Both are enforced org-wide by the governor (app/modules/zoho/core/governor.py);
+    # exceeding Zoho's 100/min returns code 44 and BLOCKS the organization, so the
+    # defaults keep headroom. Bounds are validated in GovernorConfig.
+    ZOHO_RATE_LIMIT_PER_MINUTE: int = 80      # Zoho Books/Inventory allow 100/min/org
+    ZOHO_RATE_BURST: int = 10                 # token-bucket capacity (short bursts)
+    ZOHO_MAX_CONCURRENT_REQUESTS: int = 6     # Zoho allows ~10 concurrent (soft)
     ZOHO_TOKEN_REFRESH_MARGIN: int = 120      # refresh this many secs early
     # Circuit breaker — time-based sliding window (ZSET); see
     # app/modules/zoho/core/circuit_breaker.py
@@ -142,7 +212,8 @@ class Settings(BaseSettings):
     ZOHO_CB_FAILURE_RATE: float = 0.5         # trip when >=50% of calls fail
     ZOHO_CB_SLOW_RATE: float = 0.5            # trip when >=50% of calls are slow
     ZOHO_CB_SLOW_SECONDS: float = 8.0         # a call slower than this is "slow"
-    ZOHO_CB_RECOVERY_SECONDS: int = 30        # open-circuit cool-down
+    ZOHO_CB_RECOVERY_SECONDS: int = 30        # first open-circuit cool-down
+    ZOHO_CB_RECOVERY_MAX_SECONDS: int = 300   # cap after repeated trips (doubling)
     ZOHO_CB_FAILURE_THRESHOLD: int = 5        # DEPRECATED (count-based breaker); kept for env compat
 
     # --- Zoho core — OAuth + Inventory endpoints (not yet wired into client.py/token_manager.py) ---
@@ -153,19 +224,58 @@ class Settings(BaseSettings):
     ZOHO_API_VERSION_INVENTORY: str = "v1"
     ZOHO_OAUTH_URL: str = "https://accounts.zoho.in/oauth/v2/auth"
     ZOHO_ACCESS_TOKEN_URL: str = "https://accounts.zoho.in/oauth/v2/token"
+    # Zoho's OAuth redirect_uri — OUR callback endpoint (/api/zoho/auth/callback).
+    # Must match the redirect URI registered in the Zoho API console exactly.
     ZOHO_REDIRECT_URL: str = ""
-    ZOHO_SCOPE: str = "ZohoBooks.fullaccess.all"
+    # Where the BROWSER lands after a successful connect (a frontend page).
+    # Not the callback above — redirecting there loops (ERRORS E31). Empty =
+    # the callback answers with JSON. ``?return_url=`` on /initiate overrides it.
+    ZOHO_AUTH_RETURN_URL: str = ""
+    # Extra hosts a ``?return_url=`` may point at (comma-separated). The hosts of
+    # FRONTEND_URL, ZOHO_AUTH_RETURN_URL and ZOHO_REDIRECT_URL are always allowed;
+    # anything else is refused (open-redirect protection).
+    ZOHO_AUTH_RETURN_HOSTS: str = ""
+    ZOHO_SCOPE: str = "ZohoBooks.fullaccess.all,ZohoInventory.FullAccess.all"
     ZOHO_ACCESS_TYPE: str = "offline"
     ZOHO_PROMPT: str = "Consent"
     ZOHO_RATE_DECAY: int = 60
     ZOHO_WEBHOOK_KEY_INCOMING: str = ""
+    # Persist the refresh token in zoho_oauth_credentials (encrypted with
+    # pgcrypto). Requires ZOHO_TOKEN_ENCRYPTION_KEY — without it the manager
+    # refuses to write and falls back to ZOHO_REFRESH_TOKEN (never plaintext
+    # in the database). See docs/zoho-sync-implementation/auth.md.
     ZOHO_TOKEN_PERSISTENCE_ENABLED: bool = False
+    ZOHO_TOKEN_ENCRYPTION_KEY: str = ""
     ZOHO_AUTH_REQUIRE_USER: bool = True
     # /callback is hit by a browser redirect from Zoho, which cannot attach an
     # Authorization header. It must therefore be JWT-free by default; provenance
     # is verified via the one-time CSRF `state` stored in Redis instead. Flip
     # this on only if /callback is reached from a client that can send a token.
     ZOHO_CALLBACK_REQUIRE_USER: bool = False
+
+    # --- Zoho governor (daily quota + rate + concurrency; ONE gate) ---
+    # docs/zoho-sync-implementation/governor.md. The daily ceiling is the
+    # binding constraint (Zoho plans cap calls per DAY, not per minute); when it
+    # is reached the engine suspends and resumes at the next quota day.
+    ZOHO_GOVERNOR_ENABLED: bool = True
+    # The contracted limit. No runtime override may raise the ceiling above it.
+    ZOHO_CONTRACT_DAILY_LIMIT: int = 45_000
+    ZOHO_DAILY_HARD_LIMIT: int = 45_000       # engine ceiling (≤ contract limit)
+    ZOHO_QUOTA_SOFT_PCT: float = 0.80         # → CONSERVE: reconcile/reports stop
+    ZOHO_QUOTA_ESSENTIAL_PCT: float = 0.93    # → ESSENTIAL: change feeds stop
+    ZOHO_QUOTA_HARD_PCT: float = 0.978        # → RESERVED_ONLY: interactive/critical only
+    ZOHO_QUOTA_RESERVE_CALLS: int = 1_000     # reserve above the hard threshold
+    # Zoho's own reset schedule is unverified; correct these once observed.
+    ZOHO_QUOTA_DAY_TIMEZONE: str = "Asia/Kolkata"
+    ZOHO_QUOTA_DAY_START: str = "00:00"
+    ZOHO_QUOTA_SAFETY_LAG_MINUTES: int = 30   # delay resume past the boundary
+    # Background pacing so a morning backfill cannot starve the evening.
+    ZOHO_PACING_CURVE: str = "business"       # none | linear | business
+    ZOHO_BUSINESS_HOURS: str = "07:00-21:00"
+    ZOHO_PACING_BUSINESS_SHARE: float = 0.7
+    ZOHO_PACING_CARRY_PCT: float = 0.05
+    ZOHO_GOVERNOR_LEASE_TTL_SECONDS: float = 40.0   # > read timeout; crashed holders expire
+    ZOHO_GOVERNOR_EXPECTED_PROCESSES: int = 8       # degraded (Redis-down) fallback divisor
 
     # --- Zoho Sync Engine (fleet-wide defaults; modules override per-module —
     #     see app/modules/zoho/sync/config.py) ---
@@ -174,6 +284,47 @@ class Settings(BaseSettings):
     ZOHO_SYNC_INTERVAL_MINUTES: int = 15      # default per-module cadence
     ZOHO_SYNC_WAIT_BETWEEN_CALLS: float = 0.0 # pacing for inline N+1 detail calls
     ZOHO_SYNC_RETRY_LIMIT: int = 5
+    # Deleting local rows because they were absent from one list scan is unsafe:
+    # Zoho's default item list omits INACTIVE items, a partial scan looks like a
+    # mass deletion, and v1 built a NOT IN with every id (asyncpg's 32,767
+    # bind-parameter limit). Off by default; when on, a mass-delete guard applies.
+    # docs/zoho-sync-implementation/control-plane.md §6
+    ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING: bool = False
+    ZOHO_SYNC_MASS_DELETE_MIN: int = 50         # absolute floor for the guard
+    ZOHO_SYNC_MASS_DELETE_PCT: float = 0.02     # …or this share of live rows
+    # "When to stop": every run is a bounded slice that resumes from its cursor.
+    # MAX_RUN_SECONDS must stay well below Celery's task_soft_time_limit (540 s)
+    # or a long scan is killed mid-page. 0 = no limit for pages/records.
+    ZOHO_SYNC_MAX_RUN_SECONDS: int = 240
+    ZOHO_SYNC_MAX_PAGES_PER_RUN: int = 0
+    ZOHO_SYNC_MAX_RECORDS_PER_RUN: int = 0
+    # Apply gate: payload keys ignored when hashing for the no-op check
+    # (glob patterns, any depth). Modules can add their own.
+    ZOHO_SYNC_HASH_VOLATILE_KEYS: str = "*_formatted,page_context,instrumentation"
+
+    # --- Zoho control plane (planner, leases, events, retention, operator API) ---
+    # docs/zoho-sync-implementation/control-plane.md
+    ZOHO_PLANNER_ENABLED: bool = True
+    ZOHO_PLANNER_MAX_CONCURRENT_RUNS: int = 2   # running pull runs across all modules
+    ZOHO_RUN_LEASE_SECONDS: int = 720           # > Celery task_time_limit (600 s)
+    ZOHO_WEEKLY_FULL_WEEKDAY: int = 6           # 0=Mon … 6=Sun (org timezone)
+    ZOHO_WEEKLY_FULL_HOUR: int = 3
+    ZOHO_SYNC_EVENTS_ENABLED: bool = True
+    ZOHO_SYNC_EVENTS_SAMPLE_UNCHANGED: float = 0.0   # share of no-op applies to log
+    ZOHO_SYNC_EVENTS_PARTITION_DAYS_AHEAD: int = 7
+    ZOHO_SWITCH_CACHE_SECONDS: float = 5.0
+    ZOHO_CONFIG_CACHE_SECONDS: float = 10.0     # runtime module-config overrides
+    # A yielded slice (budget hit) is resumed on the next tick; one refused by
+    # the governor or a switch waits this long before the planner retries it.
+    ZOHO_CONTINUATION_BACKOFF_SECONDS: int = 300
+    # Write-pressure gate: background lanes yield while CDC or the broker lag.
+    # 0 disables a check.
+    ZOHO_WRITE_PRESSURE_MAX_SLOT_LAG_MB: int = 512
+    ZOHO_WRITE_PRESSURE_MAX_QUEUE_DEPTH: int = 5000
+    # Interim operator authorisation until RBAC exists: comma-separated emails
+    # allowed to use /api/zoho/admin. Empty = nobody in production, any
+    # authenticated user when DEBUG=true.
+    ZOHO_OPERATOR_EMAILS: str = ""
 
     # --- Email (Resend) — the reusable transactional-email layer ---
     # Provider adapters live in app/modules/emails/provider.py (registry key =
@@ -246,7 +397,7 @@ class Settings(BaseSettings):
     MEILISEARCH_URL: str = "http://meilisearch:7700"
     MEILISEARCH_MASTER_KEY: str = ""
     # Debezium CDC topics consumed by the search indexer (comma-separated).
-    SEARCH_CDC_TOPICS: str = ""               # e.g. "zoho-mirror.public.zoho_organizations"
+    SEARCH_CDC_TOPICS: str = ""               # e.g. "zoho-mirror.org_management.organizations"
     SEARCH_CDC_GROUP_ID: str = "meilisearch-indexer"
     SEARCH_INDEX_BATCH_SIZE: int = 500
 

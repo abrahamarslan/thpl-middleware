@@ -30,6 +30,10 @@ class Base(DeclarativeBase):
 # filter for models inheriting SoftDeleteFilteredMixin (see the module doc).
 from app.database import soft_delete as _soft_delete  # noqa: E402,F401
 
+# Also for its side effect: tenant filter + tenant/actor/app-version stamping
+# on every session (docs/tenancy/README.md §4).
+from app.database import tenancy as _tenancy  # noqa: E402,F401
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with async_session_factory() as session:

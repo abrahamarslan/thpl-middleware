@@ -230,7 +230,7 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `outbox.py` | Transactional outbox: journal + Celery push; create back-fills the Zoho-generated id; update escalates to create when never pushed. |
 | `api.py` / `schemas.py` | Admin surface `/api/zoho/sync-engine/*`: list modules + stats, trigger runs, browse queue logs. |
 
-#### `app/modules/zoho/organizations/` — Organizations module (worked example)
+#### `app/modules/organizations/` — Organizations module (worked example; Zoho adapter in `zoho/spec.py` + `zoho/fields.py` since Phase 5)
 
 | File | Purpose / usage |
 |---|---|

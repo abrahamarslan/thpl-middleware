@@ -12,10 +12,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
-from app.database.mixins import IntPKMixin, TimestampMixin
+from app.database.mixins import IntPKMixin, LedgerMixin, SoftDeleteMixin, TenantEntityMixin, TimestampMixin
 
 
-class Tag(IntPKMixin, TimestampMixin, Base):
+class Tag(IntPKMixin, TenantEntityMixin, SoftDeleteMixin, Base):
     __tablename__ = "tags"
 
     name: Mapped[dict] = mapped_column(JSONB, nullable=False, comment='Locale map, e.g. {"en": "Urgent"}')
@@ -24,7 +24,7 @@ class Tag(IntPKMixin, TimestampMixin, Base):
     order_column: Mapped[int | None] = mapped_column(Integer, default=0)
 
 
-class Taggable(TimestampMixin, Base):
+class Taggable(LedgerMixin, TimestampMixin, Base):
     __tablename__ = "taggables"
 
     tag_id: Mapped[int] = mapped_column(

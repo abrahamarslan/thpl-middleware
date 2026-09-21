@@ -3,7 +3,8 @@
 
 Runs all domain seeders in topological dependency order:
   1. users.reference (Countries, Timezones, Country-Timezone mappings)
-  2. Future seeders (Roles, Permissions, System Defaults)
+  2. documents.types (the document-type catalog; never overwrites edited rows)
+  3. Future seeders (Roles, Permissions, System Defaults)
 
 Usage:
   python scripts/seed.py
@@ -21,12 +22,13 @@ backend_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(backend_dir))
 
 from sqlalchemy import create_engine
+from app.modules.documents.seed import seed_document_types
 from app.modules.users.seeders.reference import run_seed_reference
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Master seeder orchestrator.")
-    parser.add_argument("--only", choices=["users.reference"], help="Run a specific seeder only")
+    parser.add_argument("--only", choices=["users.reference", "documents.types"], help="Run a specific seeder only")
     parser.add_argument("--database-url", default=None, help="Database URL")
     args = parser.parse_args()
 
@@ -42,13 +44,19 @@ def main() -> None:
 
     print("=== Running Seeders ===")
     if not args.only or args.only == "users.reference":
-        print("[1/1] Seeding reference data (countries & timezones)...")
+        print("[1/2] Seeding reference data (countries & timezones)...")
         json_file = str(backend_dir / "data" / "countries" / "countries.json")
         if not os.path.exists(json_file):
             json_file = str(backend_dir / "data" / "countries.json")
         zone_file = str(backend_dir / "data" / "timezones" / "zone1970.tab")
         results = run_seed_reference(engine, json_path=json_file, zone_path=zone_file)
         print(f"      ✓ {results['countries']} countries, {results['timezones']} timezones, {results['mappings']} mappings seeded.")
+
+    if not args.only or args.only == "documents.types":
+        print("[2/2] Seeding the document-type catalog...")
+        with engine.begin() as conn:
+            added = seed_document_types(conn)
+        print(f"      ✓ {added} document types added (existing rows are never overwritten).")
 
     print("=== All Seeders Executed Successfully ===")
 

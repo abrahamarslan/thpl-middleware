@@ -38,8 +38,15 @@ def test_module_routers_registered():
         "/api/users/{user_id}/throttle",
         "/api/users/{user_id}/unthrottle",
         "/api/users/{user_id}/moderation",
-        "/api/zoho/items",
-        "/api/zoho/organizations",
+        # /api/zoho/items was removed on 2026-09-18 — no request path may call
+        # Zoho synchronously (docs/zoho-sync-implementation/README.md, Phase 1).
+        "/api/zoho/sync/{entity}",
+        "/api/organizations",
+        "/api/organizations/tree",
+        "/api/tenants",
+        "/api/tenants/current",
+        "/api/roles",
+        "/api/zoho/auth/connection",
         "/api/zoho/sync-engine/modules",
         "/api/zoho/auth/revoke",
         "/api/zoho/auth/status",

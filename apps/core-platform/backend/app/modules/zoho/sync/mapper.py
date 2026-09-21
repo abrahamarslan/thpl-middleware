@@ -97,7 +97,25 @@ TRANSFORMS: dict[str, Callable[[Any], Any]] = {
     "decimal": _to_decimal,
     "zoho_datetime": parse_zoho_datetime,
     "zoho_date": parse_zoho_date,
+    "month_index": lambda value: _month_index(value),
 }
+
+
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july", "august",
+           "september", "october", "november", "december")
+
+
+def _month_index(value: Any) -> int | None:
+    """0-based month from an int (documented) or a name (what the live API sends: 'april')."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if 0 <= value <= 11 else None
+    text_value = str(value).strip().lower()
+    if text_value.isdigit():
+        return _month_index(int(text_value))
+    for index, name in enumerate(_MONTHS):
+        if text_value in (name, name[:3]):
+            return index
+    return None
 
 
 def register_transform(name: str, fn: Callable[[Any], Any]) -> None:
