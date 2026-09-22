@@ -224,7 +224,7 @@ async def test_a_tenant_without_an_organization_is_told_so(db):
     await db.flush()
 
     with tenant_scope(bare.id):
-        with pytest.raises(CurrencyRuleError, match="no organization"):
+        with pytest.raises(CurrencyRuleError, match="No organization for this request"):
             await require_organization(db)
 
 
@@ -246,9 +246,20 @@ async def test_the_database_keeps_one_live_code_per_tenant(worlds, db):
 
 
 async def test_service_requires_an_organization_and_hides_unknowns(db):
+    from app.modules.tenants.model import Tenant
+
     with pytest.raises(NotFoundError):
         await service.get_currency(db, "NOPE")
-    # No tenant/organization context and no organizations exist: a usable 422,
-    # not a raw IntegrityError from the NOT NULL organization_id.
-    with pytest.raises(CurrencyRuleError):
-        await service.create_currency(db, CurrencyCreate(currency_code="INR", currency_name="Indian Rupee"))
+
+    # A tenant with no organization: a usable 422, not a raw IntegrityError
+    # from the NOT NULL organization_id. It takes a bare tenant to reach this
+    # now — a migrated database always gives the DEFAULT tenant an
+    # organization, so the deployment default resolves for everyone else.
+    bare = Tenant(tenant_code="BARE-CUR", name="Bare Ltd",
+                  primary_contact_email="ops@bare.example", status="active")
+    db.add(bare)
+    await db.flush()
+    with tenant_scope(bare.id):
+        with pytest.raises(CurrencyRuleError):
+            await service.create_currency(
+                db, CurrencyCreate(currency_code="INR", currency_name="Indian Rupee"))

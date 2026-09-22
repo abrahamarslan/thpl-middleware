@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.core.conf import settings  # noqa: E402
+from app.database.tenancy import clear_default_cache  # noqa: E402
 from tests.tenancy_fixtures import worlds  # noqa: E402,F401 — shared tenancy API fixture
 
 #: Tables integration tests write to — truncated between tests for isolation.
@@ -153,6 +154,12 @@ async def db():
                 {"code": settings.DEFAULT_TENANT_CODE},
             )
             await _restore_default_organization(conn)
+        # The restored organization is a NEW row with a NEW id, and
+        # `tenancy.default_organization_id_sync` caches (tenant, code) -> id for
+        # the life of the process. Without this, the next test's flush stamps a
+        # freshly-created row with the id of an organization the truncate
+        # removed, and fails on fk_<table>_tenant_org.
+        clear_default_cache()
     await engine.dispose()
 
 

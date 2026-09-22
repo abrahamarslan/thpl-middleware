@@ -257,10 +257,22 @@ async def test_an_alias_target_must_exist(worlds, db):
 
 
 async def test_create_brand_requires_an_organization(db):
-    # No tenant/organization context and no organizations exist: a usable 422,
-    # not a raw IntegrityError from the NOT NULL organization_id.
-    with pytest.raises(CoreRuleError):
-        await brand_service.create_brand(db, BrandCreate(name="No Org"))
+    """A tenant with no organization gets a usable 422, not a raw IntegrityError
+    from the NOT NULL organization_id.
+
+    It takes a bare tenant to reach this: a migrated database always gives the
+    DEFAULT tenant an organization, so `app/database/scope.py` resolves the
+    deployment default for every ordinary caller.
+    """
+    from app.modules.tenants.model import Tenant
+
+    bare = Tenant(tenant_code="BARE-BRAND", name="Bare Ltd",
+                  primary_contact_email="ops@bare.example", status="active")
+    db.add(bare)
+    await db.flush()
+    with tenant_scope(bare.id):
+        with pytest.raises(CoreRuleError):
+            await brand_service.create_brand(db, BrandCreate(name="No Org"))
 
 
 # ── integration: the database guards exist ──────────────────────────────────

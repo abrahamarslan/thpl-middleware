@@ -159,7 +159,7 @@ async def test_stale_payload_is_ignored_and_journalled(db):
     await db.commit()
     assert result.outcome is Outcome.STALE_IGNORED
 
-    org = await db.scalar(select(Organization))
+    org = await db.scalar(select(Organization).where(Organization.zoho_id == "10229182"))
     assert org.name == "Zillium Renamed"
     stale = (await db.scalars(select(ZohoSyncEvent).where(ZohoSyncEvent.event_type == "stale_ignored"))).all()
     assert len(stale) == 1 and stale[0].message == "older_than_stored"
@@ -176,7 +176,7 @@ async def test_thin_payload_never_overwrites_the_detail_document(db):
     await db.commit()
     assert report.updated == 1
 
-    org = await db.scalar(select(Organization))
+    org = await db.scalar(select(Organization).where(Organization.zoho_id == "10229182"))
     assert org.name == "Zillium Renamed"                        # mapped columns follow the newer version
     assert org.address_city == "Palo Alto"                      # missing keys never null a column
 
@@ -190,7 +190,7 @@ async def test_thin_payload_never_overwrites_the_detail_document(db):
 async def test_version_and_bookkeeping_columns(db):
     await ZohoSyncEngine(db, client_for(ORG)).run("organizations", "full")
     await db.commit()
-    org = await db.scalar(select(Organization))
+    org = await db.scalar(select(Organization).where(Organization.zoho_id == "10229182"))
     assert org.uuid is not None and org.row_version >= 1
     record = await db.scalar(select(SyncRecord).where(SyncRecord.module == "organizations"))
     # index_then_detail writes twice: the listed row, then the detail over it.

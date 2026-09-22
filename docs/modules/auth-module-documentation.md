@@ -75,16 +75,26 @@ Own-account endpoints (JWT-protected, `me_router`, also mirrored under
 
 | Method | Path | Body | Effect |
 |---|---|---|---|
-| GET | `/api/me/profile` | — | Localization profile (country / timezone / source) |
-| PATCH | `/api/me/profile` | `{country?, timezone?}` | Set country (auto-timezone) or lock timezone to manual |
+| GET | `/api/me/profile` | — | Full self view (`UserOut` + `timezone_source` + primary `address`), including email/username |
+| PATCH | `/api/me/profile` | allowlisted profile fields + optional `{address}` | Update own profile; `country_code`/`timezone` route through the localization profile; `address` is written through the location hub |
 | PATCH | `/api/me/location` | `{latitude, longitude, accuracy_m?, …}` | Record one position fix |
 | GET | `/api/me/location` | — | Last known position, or `null` |
 | GET | `/api/users/{id}/location` | — | Another user's last known position (dispatch) |
 
+`PATCH /api/me/profile` accepts only an explicit self-service allowlist
+(`UserSelfUpdate`) — never `role_id`, `status`, `user_type`, `is_deactivated`
+or the other admin/lifecycle fields (an attempt is a 422). `email` and
+`username` are read-only here: changing them is a login/verification flow. The
+optional `address` block (postal fields + `latitude`/`longitude`) becomes a
+`geo.places` row linked to the user via `geo.place_links`
+(`owner_type=user`, default `link_type=current`, primary) — the profile
+endpoint is a facade over the address book, never a second address store.
+
 A fix writes `user_live_locations` (upsert) and `user_location_pings` (append)
 and touches no column on `users` except `is_location_set` — that isolation is
-why the tables exist. **Addresses are not part of this module**: they go through
-the platform-wide address book (`/api/addresses` with `owner_type=user`).
+why the tables exist. **Addresses are not stored in this module**: they go
+through the platform-wide address book (`/api/addresses` with
+`owner_type=user`), which the profile endpoint above delegates to.
 
 Moderation (JWT-protected, `/api/users/{id}/*`):
 

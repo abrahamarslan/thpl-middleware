@@ -17,7 +17,10 @@ async def test_soft_deleted_rows_hidden_from_selects(db):
     org.soft_delete()
     await db.flush()
 
-    assert (await db.scalars(select(Organization))).all() == []
+    # Scoped to this row: a migrated database always has the deployment's own
+    # organization, so "every organization" is never an empty list.
+    live = (await db.scalars(select(Organization).where(Organization.id == org.id))).all()
+    assert live == []
     # db.get is filtered too — once the identity map no longer short-circuits
     # the SELECT (an in-session instance is always returned as-is by the ORM).
     db.expunge_all()
@@ -56,5 +59,5 @@ async def test_partial_unique_index_allows_reuse_after_soft_delete(db):
     db.add(second)
     await db.flush()  # would raise IntegrityError without the partial index
 
-    live = (await db.scalars(select(Organization))).all()
+    live = (await db.scalars(select(Organization).where(Organization.zoho_id == "dup-1"))).all()
     assert [o.name for o in live] == ["Two"]

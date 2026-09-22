@@ -56,6 +56,21 @@ def _client_with_org(detail: dict = DETAIL_ORG) -> FakeZohoClient:
     return client
 
 
+async def _synced_org(db, *, include_deleted: bool = False):
+    """The organization THIS sync created, named explicitly.
+
+    Not "the only organization": a migrated database always carries the
+    deployment's own organization (the DEFAULT tenant's), so an unfiltered
+    ``select(Organization).limit(1)`` picks whichever row comes first.
+    """
+    from sqlalchemy import select
+
+    stmt = select(Organization).where(Organization.zoho_id == "10229182")
+    if include_deleted:
+        stmt = stmt.execution_options(include_deleted=True)
+    return await db.scalar(stmt)
+
+
 async def test_full_sync_creates_row_with_detail_payload(db):
     engine = ZohoSyncEngine(db, _client_with_org())
     report = await engine.run("organizations", "full")
@@ -66,10 +81,7 @@ async def test_full_sync_creates_row_with_detail_payload(db):
     # the detail document — one create and one update for one record.
     assert report.created == 1 and report.updated == 1 and report.errors == 0
 
-    row = await db.scalar(
-        Organization.__table__.select().with_only_columns(Organization.id).limit(1)
-    )
-    org = await db.get(Organization, row)
+    org = await _synced_org(db)
     # Mapped from the DETAIL payload (proves the second phase ran)
     assert org.zoho_id == "10229182"               # the identity echo
     assert org.name == "Zillium Inc"
@@ -106,10 +118,7 @@ async def test_second_run_matches_identity_and_updates(db):
     await db.commit()
 
     assert report.created == 0 and report.updated >= 1
-    org = await db.scalar(
-        Organization.__table__.select().with_only_columns(Organization.name)
-    )
-    assert org == "Zillium Renamed"
+    assert (await _synced_org(db)).name == "Zillium Renamed"
 
 
 async def test_resync_matches_a_locally_deleted_row_without_reviving_it(db):
@@ -119,12 +128,12 @@ async def test_resync_matches_a_locally_deleted_row_without_reviving_it(db):
 
     from sqlalchemy import select
 
-    org = await db.scalar(select(Organization).limit(1))
+    org = await _synced_org(db)
     org.soft_delete()                     # a USER deleted it locally
     await db.commit()
 
     # Gone from filtered queries...
-    assert await db.scalar(select(Organization).limit(1)) is None
+    assert await _synced_org(db) is None
 
     # ...a re-sync matches it by zoho_id (include_deleted) — no duplicate — and
     # a user's delete is not the sync's to undo (apply gate).
@@ -133,7 +142,9 @@ async def test_resync_matches_a_locally_deleted_row_without_reviving_it(db):
     assert report.created == 0
 
     all_rows = (
-        await db.scalars(select(Organization).execution_options(include_deleted=True))
+        await db.scalars(select(Organization)
+                         .where(Organization.zoho_id == "10229182")
+                         .execution_options(include_deleted=True))
     ).all()
     assert len(all_rows) == 1 and all_rows[0].deleted_at is not None
 
@@ -145,7 +156,7 @@ async def test_resync_resurrects_a_sync_tombstone(db):
 
     await ZohoSyncEngine(db, _client_with_org()).run("organizations", "full")
     await db.commit()
-    org = await db.scalar(select(Organization).limit(1))
+    org = await _synced_org(db)
     now = datetime.now(UTC)
     org.deleted_at = now                       # the entity side of a tombstone
     await db.execute(                          # ...and the sync's own evidence

@@ -44,9 +44,9 @@ from app.modules.users.schema import (
     TokenPair,
     UserCreate,
     UserListFilters,
+    UserMeOut,
     UserOut,
-    UserProfileOut,
-    UserProfileUpdate,
+    UserSelfUpdate,
     UserUpdate,
 )
 
@@ -280,28 +280,33 @@ async def unthrottle_user(db: DBSession, current: CurrentUser, user_id: int):
 
 # ════════════════════════════════ ME / PROFILE ═══════════════════════════════
 
-@me_router.get("/profile", response_model=ResponseModel[UserProfileOut])
-@auth_router.get("/me/profile", response_model=ResponseModel[UserProfileOut])
+@me_router.get("/profile", response_model=ResponseModel[UserMeOut])
+@auth_router.get("/me/profile", response_model=ResponseModel[UserMeOut])
 async def get_my_profile(db: DBSession, user: CurrentUser):
-    """Retrieve the authenticated user's localization profile."""
-    profile = await service.get_or_create_profile(db, user.id)
-    return ResponseModel.ok(
-        data=UserProfileOut.model_validate(profile),
-        module="users",
-        msg_key="profile_fetched",
-    )
+    """The authenticated user's full self view.
+
+    This is ``GET /api/auth/me`` plus the localization source and the primary
+    address — the address is a ``geo.place_links`` row, not a users column.
+    """
+    data = await service.get_my_profile_view(db, user)
+    return ResponseModel.ok(data=data, module="users", msg_key="profile_fetched")
 
 
-@me_router.patch("/profile", response_model=ResponseModel[UserProfileOut])
-@auth_router.patch("/me/profile", response_model=ResponseModel[UserProfileOut])
-async def update_my_profile(db: DBSession, user: CurrentUser, body: UserProfileUpdate):
-    """Update user country (auto-timezone) and/or timezone (locks source to 'manual')."""
-    profile = await service.update_user_profile(db, user, body)
-    return ResponseModel.ok(
-        data=UserProfileOut.model_validate(profile),
-        module="users",
-        msg_key="profile_updated",
-    )
+@me_router.patch("/profile", response_model=ResponseModel[UserMeOut])
+@auth_router.patch("/me/profile", response_model=ResponseModel[UserMeOut])
+async def update_my_profile(
+    db: DBSession, user: CurrentUser, body: UserSelfUpdate, client: ClientInfoDep,
+):
+    """Update the authenticated user's own profile.
+
+    Accepts an explicit allowlist of personal/preference fields (never
+    ``role_id``/``status``/... — those are admin-only) plus an optional
+    ``address`` that is written through the location hub. ``email`` and
+    ``username`` are read-only here: changing them is a login/verification flow,
+    not a profile edit.
+    """
+    data = await service.update_my_profile(db, user, body, client=client)
+    return ResponseModel.ok(data=data, module="users", msg_key="profile_updated")
 
 
 # ════════════════════════════════ ME / LOCATION ══════════════════════════════

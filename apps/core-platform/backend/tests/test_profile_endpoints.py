@@ -13,7 +13,7 @@ from app.database.scope import Scope
 from app.main import app
 from app.modules.users.deps import get_current_user
 from app.modules.users.model import TimezoneSource, User, UserProfile
-from app.modules.users.schema import UserOut
+from app.modules.users.schema import ProfileAddressIn, UserMeOut, UserSelfUpdate
 
 
 def test_countries_endpoint(mocker):
@@ -66,7 +66,10 @@ def test_country_timezones_endpoint(mocker):
 
 
 def test_get_my_profile_endpoint(mocker):
-    mock_user = User(id=1, email="test@example.com", name="Test User")
+    mock_user = User(
+        id=1, email="test@example.com", name="Test User", username="tester",
+        country_code="IN", timezone="Asia/Kolkata",
+    )
     mock_profile = UserProfile(
         id=101,
         uuid=uuid.uuid4(),
@@ -82,6 +85,11 @@ def test_get_my_profile_endpoint(mocker):
         new_callable=AsyncMock,
         return_value=mock_profile,
     )
+    mocker.patch(
+        "app.modules.geo.service.list_addresses",
+        new_callable=AsyncMock,
+        return_value=[],
+    )
 
     app.dependency_overrides[get_current_user] = lambda: mock_user
     app.dependency_overrides[get_db] = lambda: AsyncMock()
@@ -93,47 +101,114 @@ def test_get_my_profile_endpoint(mocker):
         body = response.json()
         assert body["code"] == "ok"
         assert body["msg"] == "Profile retrieved successfully."
-        assert body["data"]["user_id"] == 1
-        assert body["data"]["country_iso2"] == "IN"
-        assert body["data"]["timezone_name"] == "Asia/Kolkata"
+        assert body["data"]["id"] == 1
+        # GET /me/profile returns the full self view, including email + username.
+        assert body["data"]["email"] == "test@example.com"
+        assert body["data"]["username"] == "tester"
         assert body["data"]["timezone_source"] == "auto"
-        assert "uuid" in body["data"]
+        assert body["data"]["address"] is None
     finally:
         app.dependency_overrides.clear()
 
 
 def test_patch_my_profile_endpoint(mocker):
-    mock_user = User(id=1, email="test@example.com", name="Test User")
-    mock_profile = UserProfile(
-        id=101,
-        uuid=uuid.uuid4(),
-        user_id=1,
-        country_iso2="US",
-        timezone_name="America/New_York",
-        timezone_source=TimezoneSource.auto,
-        updated_at=datetime.now(UTC),
+    result = UserMeOut(
+        id=1, email="test@example.com", username="tester",
+        country_code="US", timezone="America/New_York", timezone_source="auto",
     )
 
-    mocker.patch(
-        "app.modules.users.service.update_user_profile",
+    mock_update = mocker.patch(
+        "app.modules.users.service.update_my_profile",
         new_callable=AsyncMock,
-        return_value=mock_profile,
+        return_value=result,
     )
 
-    app.dependency_overrides[get_current_user] = lambda: mock_user
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
     app.dependency_overrides[get_db] = lambda: AsyncMock()
 
     try:
         client = TestClient(app)
-        response = client.patch("/api/me/profile", json={"country": "US"})
+        response = client.patch("/api/me/profile", json={"country_code": "US"})
         assert response.status_code == 200
         body = response.json()
         assert body["code"] == "ok"
         assert body["msg"] == "Your profile has been updated successfully."
-        assert body["data"]["country_iso2"] == "US"
-        assert body["data"]["timezone_name"] == "America/New_York"
+        assert body["data"]["country_code"] == "US"
+        assert body["data"]["timezone"] == "America/New_York"
+        mock_update.assert_awaited_once()
     finally:
         app.dependency_overrides.clear()
+
+
+def test_patch_my_profile_rejects_privileged_fields(mocker):
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
+    app.dependency_overrides[get_db] = lambda: AsyncMock()
+
+    try:
+        client = TestClient(app)
+        # role_id / status / is_deactivated are NOT in the self-update allowlist.
+        response = client.patch("/api/me/profile", json={"role_id": 1, "status": "active"})
+        assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_update_my_profile_recomposes_full_name(mocker):
+    from app.modules.users import service
+
+    mock_user = User(id=1, email="test@example.com", name="Old Name")
+    mock_update = mocker.patch("app.modules.users.service.update_user", new_callable=AsyncMock)
+    mocker.patch(
+        "app.modules.users.service.get_or_create_profile",
+        new_callable=AsyncMock,
+        return_value=UserProfile(
+            id=101, uuid=uuid.uuid4(), user_id=1, country_iso2="IN",
+            timezone_name="Asia/Kolkata", timezone_source=TimezoneSource.auto,
+            updated_at=datetime.now(UTC),
+        ),
+    )
+    mocker.patch("app.modules.geo.service.list_addresses", new_callable=AsyncMock, return_value=[])
+
+    await service.update_my_profile(
+        AsyncMock(), mock_user, UserSelfUpdate(first_name="Jane", last_name="Doe"),
+    )
+
+    sent = mock_update.await_args.args[2]
+    assert sent.name == "Jane Doe"
+
+
+@pytest.mark.asyncio
+async def test_update_my_profile_writes_address_through_geo(mocker):
+    from app.modules.users import service
+
+    mock_user = User(id=7, email="test@example.com", name="Test User")
+    mocker.patch(
+        "app.modules.users.service.get_or_create_profile",
+        new_callable=AsyncMock,
+        return_value=UserProfile(
+            id=101, uuid=uuid.uuid4(), user_id=7, country_iso2="IN",
+            timezone_name="Asia/Kolkata", timezone_source=TimezoneSource.auto,
+            updated_at=datetime.now(UTC),
+        ),
+    )
+    mocker.patch("app.modules.geo.service.list_addresses", new_callable=AsyncMock, return_value=[])
+    mock_attach = mocker.patch("app.modules.geo.service.attach_address", new_callable=AsyncMock)
+
+    body = UserSelfUpdate(address=ProfileAddressIn(
+        street="1 Main Road", city="Pune", postal_code="411001",
+        latitude=18.5204, longitude=73.8567,
+    ))
+    await service.update_my_profile(AsyncMock(), mock_user, body)
+
+    assert mock_attach.await_count == 1
+    address = mock_attach.await_args.args[1]
+    assert address.owner_type == "user"
+    assert address.owner_id == 7
+    assert address.is_primary is True
+    assert address.new_place.latitude == 18.5204
+    assert address.new_place.longitude == 73.8567
+    assert address.new_place.city == "Pune"
 
 
 def test_register_returns_friendly_message(mocker):

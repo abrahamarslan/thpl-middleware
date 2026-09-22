@@ -35,7 +35,8 @@ from app.modules.users.schema import (
     TokenPair,
     UserCreate,
     UserListFilters,
-    UserProfileUpdate,
+    UserMeOut,
+    UserSelfUpdate,
     UserUpdate,
 )
 from app.modules.users.security import hash_password, verify_password
@@ -735,18 +736,134 @@ async def set_user_timezone_manually(db: AsyncSession, profile: UserProfile, tim
     return profile
 
 
-async def update_user_profile(
-    db: AsyncSession, user: User, body: UserProfileUpdate
-) -> UserProfile:
-    """Update user profile country and/or timezone."""
+# ── Self-service profile (GET/PATCH /api/auth/me/profile) ─────────────────────
+
+def _compose_full_name(user: User, overrides: dict) -> str:
+    """Rebuild ``users.name`` from its parts when first/middle/last change.
+
+    ``name`` is NOT NULL, so a user who edits their name parts must not be left
+    with a stale display name. Mirrors ``authentik_sync._authentik_name``.
+    """
+    parts = (
+        overrides.get("first_name", user.first_name),
+        overrides.get("middle_name", user.middle_name),
+        overrides.get("last_name", user.last_name),
+    )
+    full = " ".join(p for p in parts if p).strip()
+    return full or user.name or user.username or user.email
+
+
+def _address_out(link: Any) -> Any:
+    """Shape a ``geo.place_links`` row (+ its place) as ``UserAddressOut``."""
+    from app.modules.users.schema import UserAddressOut
+
+    place = getattr(link, "place", None)
+    return UserAddressOut(
+        uuid=link.uuid,
+        link_type=link.link_type,
+        label=link.label,
+        is_primary=link.is_primary,
+        is_verified=link.is_verified,
+        latitude=float(place.latitude) if place is not None and place.latitude is not None else None,
+        longitude=float(place.longitude) if place is not None and place.longitude is not None else None,
+        place_uuid=place.uuid if place is not None else None,
+        **{
+            field: getattr(place, field, None)
+            for field in (
+                "attention", "formatted_address", "building_name", "street", "street2",
+                "landmark", "sub_locality", "locality", "city", "district", "taluka",
+                "state", "state_code", "postal_code", "country", "country_code",
+            )
+            if place is not None
+        },
+    )
+
+
+async def get_my_profile_view(db: AsyncSession, user: User) -> UserMeOut:
+    """The full self view: user fields + localization source + primary address."""
     profile = await get_or_create_profile(db, user.id)
-    if body.country:
-        profile = await set_user_country(db, profile, body.country)
-    if body.timezone:
-        profile = await set_user_timezone_manually(db, profile, body.timezone)
-    await db.commit()
-    await db.refresh(profile)
-    return profile
+
+    from app.modules.geo import service as geo_service
+
+    links = await geo_service.list_addresses(
+        db, owner_type="user", owner_id=user.id, current_only=True,
+    )
+    primary = next((link for link in links if link.is_primary), links[0] if links else None)
+
+    out = UserMeOut.model_validate(user)
+    out.timezone_source = profile.timezone_source.value if profile.timezone_source else None
+    out.country_iso2 = profile.country_iso2
+    out.timezone_name = profile.timezone_name
+    out.address = _address_out(primary) if primary is not None else None
+    return out
+
+
+async def _attach_user_residence(db: AsyncSession, user: User, body: Any) -> None:
+    """Write a residential address through the location hub.
+
+    A new ``current`` link auto-closes the one it supersedes (effective dating),
+    the geo layer audits it and re-points ``users.primary_place_id`` — the users
+    module never writes an address of its own.
+    """
+    from app.modules.geo import service as geo_service
+    from app.modules.geo.enums import PlaceKind
+    from app.modules.geo.schema import AddressCreate, PlaceCreate
+
+    postal = body.model_dump(exclude={"latitude", "longitude", "link_type", "label"}, exclude_none=True)
+    new_place = PlaceCreate(
+        kind=PlaceKind.ADDRESS, latitude=body.latitude, longitude=body.longitude, **postal,
+    )
+    await geo_service.attach_address(
+        db,
+        AddressCreate(
+            owner_type="user",
+            owner_id=user.id,
+            link_type=body.link_type,
+            purpose="home",
+            label=body.label or "Home",
+            is_primary=True,
+            new_place=new_place,
+        ),
+        actor_id=user.id,
+    )
+
+
+async def update_my_profile(
+    db: AsyncSession, user: User, body: UserSelfUpdate, *, client: ClientInfo | None = None,
+) -> UserMeOut:
+    """Self-service PATCH: apply the allowlisted fields, localization and address.
+
+    Reuses ``update_user`` for the user row so conflict checks, the masked diff,
+    the ``user.profile.updated`` audit and the Authentik profile mirror all apply
+    exactly as they do for an admin edit — the only difference is that the actor
+    is the subject and the schema is an allowlist.
+    """
+    sent = body.model_dump(exclude_unset=True)
+    sent.pop("address", None)
+    country_code = sent.pop("country_code", None)
+    timezone = sent.pop("timezone", None)
+
+    if ("first_name" in sent or "middle_name" in sent or "last_name" in sent) and "name" not in sent:
+        sent["name"] = _compose_full_name(user, sent)
+
+    if sent:
+        await update_user(
+            db, user.id, UserUpdate(**sent),
+            updated_by=user.id, actor_label=user.email, client=client,
+        )
+
+    if country_code or timezone:
+        profile = await get_or_create_profile(db, user.id)
+        if country_code:
+            await set_user_country(db, profile, country_code)
+        if timezone:
+            await set_user_timezone_manually(db, profile, timezone)
+
+    if body.address is not None:
+        await _attach_user_residence(db, user, body.address)
+
+    await db.flush()
+    return await get_my_profile_view(db, user)
 
 
 # ── Reference Data Caching (L1 In-Memory + L2 Redis DB 0) ────────────────────

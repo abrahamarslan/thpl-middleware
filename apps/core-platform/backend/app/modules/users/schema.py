@@ -12,8 +12,10 @@ from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
+from app.modules.geo.enums import LinkType
+from app.modules.geo.schema import PostalFields
 from app.modules.users.password_policy import PasswordStr
 
 
@@ -382,25 +384,172 @@ class CountryTimezoneOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class UserProfileUpdate(BaseModel):
-    """Update payload for user localization preferences."""
+# ── Self-service profile (GET/PATCH /api/auth/me/profile) ────────────────────
+#
+# The address is NOT a column on the users row. A residential address is a
+# ``geo.places`` row (the only place coordinates are stored) plus a
+# ``geo.place_links`` row with ``owner_type='user'`` — the profile endpoint is a
+# convenience facade that writes through the location hub, never a second
+# address store. See docs/geo/README.md §3.
 
-    country: str | None = Field(None, min_length=2, max_length=2, description="ISO2 country code, e.g. IN, US")
-    timezone: str | None = Field(None, description="IANA timezone name, e.g. Asia/Kolkata")
+class ProfileAddressIn(PostalFields):
+    """Residential address: the postal block plus a point and link intent.
+
+    ``link_type`` defaults to ``current`` because ``current``/``permanent`` are
+    the effective-dated, single-valued link types: a new one auto-closes the
+    one it supersedes, so an address change keeps its history.
+    """
+
+    latitude: float | None = Field(None, ge=-90, le=90)
+    longitude: float | None = Field(None, ge=-180, le=180)
+    link_type: LinkType = LinkType.CURRENT
+    label: str | None = Field(None, max_length=100, description='User-facing label, e.g. "Home"')
+
+    @model_validator(mode="after")
+    def _coordinates_come_in_pairs(self) -> "ProfileAddressIn":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be given together")
+        return self
 
 
-class UserProfileOut(BaseModel):
-    """User profile localization output."""
+class UserAddressOut(BaseModel):
+    """The user's current primary address (a ``geo.place_links`` row + its place)."""
 
-    id: int
     uuid: UUID
-    user_id: int
+    link_type: str
+    label: str | None = None
+    is_primary: bool = False
+    is_verified: bool = False
+    latitude: float | None = None
+    longitude: float | None = None
+    place_uuid: UUID | None = None
+    attention: str | None = None
+    formatted_address: str | None = None
+    building_name: str | None = None
+    street: str | None = None
+    street2: str | None = None
+    landmark: str | None = None
+    sub_locality: str | None = None
+    locality: str | None = None
+    city: str | None = None
+    district: str | None = None
+    taluka: str | None = None
+    state: str | None = None
+    state_code: str | None = None
+    postal_code: str | None = None
+    country: str | None = None
+    country_code: str | None = None
+
+
+class UserSelfUpdate(BaseModel):
+    """Fields a user may change about THEMSELVES.
+
+    An explicit allowlist — deliberately NOT ``UserUpdate``. The admin schema
+    carries ``role_id``, ``status``, ``user_type``, ``is_deactivated`` and the
+    rest of the privilege/lifecycle surface; accepting it here would let a user
+    escalate their own role. ``extra="forbid"`` turns any such attempt into a
+    422 instead of a silently applied change.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Identification
+    name: str | None = None
+    salutation: str | None = None
+    first_name: str | None = None
+    middle_name: str | None = None
+    last_name: str | None = None
+
+    # Contact
+    phone: str | None = None
+    contact: str | None = None
+
+    # Personal
+    gender: str | None = None
+    is_married: bool | None = None
+    citizenship: str | None = None
+    blood_group: str | None = None
+    pan: str | None = None
+    gstin: str | None = None
+    tax_preference: str | None = None
+    gst_treatment: str | None = None
+    languages_known: list | None = None
+    social_links: dict | None = None
+    emergency_contact: dict | None = None
+    medical_history: dict | None = None
+    insurance_details: dict | None = None
+
+    # Parent / family
+    parent_one_gender: str | None = None
+    parent_two_gender: str | None = None
+    parent_one_contact: str | None = None
+    parent_two_contact: str | None = None
+    family_details: dict | None = None
+
+    # Professional / education
+    occupation: str | None = None
+    designation: str | None = None
+    department: str | None = None
+    education_qualification: str | None = None
+    education_specialization: str | None = None
+    education_history: list | dict | None = None
+    work_history: list | dict | None = None
+    reference_details: dict | None = None
+    communication_preferences: dict | None = None
+
+    # Company
+    company_name: str | None = None
+    company_address: str | None = None
+    company_email: str | None = None
+    company_phone: str | None = None
+    company_website: str | None = None
+    company_gstin: str | None = None
+    company_pan: str | None = None
+    company_cin: str | None = None
+    company_tan: str | None = None
+    date_of_joining: datetime | None = None
+
+    # Profile customization
+    image: str | None = None
+    avatar: str | None = None
+    thumbnail: str | None = None
+    preview_image: str | None = None
+
+    # Preferences
+    language: str | None = None
+    default_language: str | None = None
+    timezone: str | None = None
+    date_format: str | None = None
+    time_format: str | None = None
+    currency: str | None = None
+    currency_symbol: str | None = None
+    thousand_separator: str | None = None
+    decimal_separator: str | None = None
+    locale_settings: dict | None = None
+    online_status_preference: int | None = None
+    application_settings: dict | None = None
+
+    # Location cache (ISO2; routed through the localization profile)
+    country_code: str | None = Field(None, max_length=2)
+
+    # Misc
+    other_details: dict | None = None
+    other_information: dict | None = None
+
+    # Residential address — written through the location hub
+    address: ProfileAddressIn | None = None
+
+
+class UserMeOut(UserOut):
+    """What GET/PATCH ``/me/profile`` returns: the full self view.
+
+    ``UserOut`` plus the localization source and the user's primary address.
+    """
+
+    timezone_source: str | None = None
     country_iso2: str | None = None
     timezone_name: str | None = None
-    timezone_source: str
-    updated_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
+    address: UserAddressOut | None = None
 
 
 # ── Location telemetry ────────────────────────────────────────────────────────
