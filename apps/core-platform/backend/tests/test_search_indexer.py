@@ -131,7 +131,14 @@ async def test_ensure_index_settings_applies_all(mocker):
 
     await ensure_index_settings(client)
 
-    entity = SEARCHABLE_ENTITIES["organizations"]
-    index.update_searchable_attributes.assert_awaited_with(entity.searchable)
-    index.update_filterable_attributes.assert_awaited_with(entity.filterable)
-    index.update_sortable_attributes.assert_awaited_with(entity.sortable)
+    # "applies ALL" — so assert every entity's settings were applied, not just
+    # the last call's. assert_awaited_with only checks the MOST RECENT await,
+    # which silently made this a test of whichever entity happened to be
+    # registered last; it broke the day one was added after organizations.
+    for entity in SEARCHABLE_ENTITIES.values():
+        if entity.searchable:
+            index.update_searchable_attributes.assert_any_await(entity.searchable)
+        if entity.filterable:
+            index.update_filterable_attributes.assert_any_await(entity.filterable)
+        if entity.sortable:
+            index.update_sortable_attributes.assert_any_await(entity.sortable)

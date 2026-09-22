@@ -72,9 +72,50 @@ class Settings(BaseSettings):
     # Rows written outside any tenant context (seeders, system tasks, the
     # single-tenant default) belong to this tenant. Created by the migration.
     DEFAULT_TENANT_CODE: str = "default"
+    # Organization new rows belong to when no organization context is set.
+    # Matched by org_code WITHIN the row's tenant. Empty = tenant-wide rows
+    # (organization_id stays NULL). Point this at the seeded root organization
+    # (scripts/seed.py / app/modules/tenants/seed.py) for a single-org setup.
+    DEFAULT_ORGANIZATION_CODE: str = ""
     # Platform administrators (manage tenants): comma-separated emails.
     # Empty = nobody in production, any authenticated user when DEBUG=true.
     PLATFORM_ADMIN_EMAILS: str = ""
+
+    # --- Seeded tenant + root organization (app/modules/tenants/seed.py) ---
+    # `scripts/seed.py` creates this tenant and its root organization
+    # idempotently from the values below. Point DEFAULT_TENANT_CODE /
+    # DEFAULT_ORGANIZATION_CODE at COMPANY_TENANT_CODE / COMPANY_ORGANIZATION_CODE
+    # so every row written without a context is scoped to them.
+    COMPANY_TENANT_CODE: str = "THPL"
+    COMPANY_TENANT_NAME: str = "Tarrina Health Private Limited"
+    COMPANY_TIMEZONE: str = "Asia/Kolkata"
+    COMPANY_LOCALE: str = "en-IN"
+    COMPANY_ORGANIZATION_CODE: str = "THPL"
+    COMPANY_LEGAL_NAME: str = "Tarrina Health Private Limited"
+    # Trading / display name (defaults to COMPANY_LEGAL_NAME when empty).
+    COMPANY_TRADING_NAME: str = "Tarrina Health"
+    COMPANY_NAME: str = "Tarrina Health Private Limited"
+    COMPANY_ADDRESS_LINE_ONE: str = ""
+    COMPANY_ADDRESS_LINE_TWO: str = ""
+    COMPANY_COUNTRY: str = "India"
+    COMPANY_GSTIN: str = ""
+    COMPANY_PHONE_ONE: str = ""
+    COMPANY_PHONE_TWO: str = ""
+    COMPANY_BANK_NAME: str = ""
+    COMPANY_ACCOUNT_NUMBER: str = ""
+    COMPANY_IFSC_CODE: str = ""
+    COMPANY_PHONE: str = ""
+    COMPANY_EMAIL: str = ""
+    COMPANY_WEBSITE: str = ""
+    # Seeded admin user for the root organization (idempotent). It is bound to
+    # the system role COMPANY_ADMIN_ROLE (owner | admin | member). Empty
+    # COMPANY_ADMIN_PASSWORD = skip the user (the tenant/organization still seed).
+    # Empty COMPANY_ADMIN_EMAIL = COMPANY_EMAIL.
+    COMPANY_ADMIN_NAME: str = "Tarrina Health Admin"
+    COMPANY_ADMIN_EMAIL: str = ""
+    COMPANY_ADMIN_USERNAME: str = ""
+    COMPANY_ADMIN_PASSWORD: str = ""
+    COMPANY_ADMIN_ROLE: str = "owner"
 
     # --- Documents (docs/documents/README.md) ---
     # pgcrypto passphrase for documents.document_number_full_encrypted (only

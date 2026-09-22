@@ -154,8 +154,17 @@ GLOBAL_TABLES = {
     "setting_values": "context-scoped (GLOBAL / TENANT / USER) by design",
     "setting_audit_logs": "audit of the context-scoped settings",
     "zoho_retention_policies": "platform-wide retention policy",
+    "data_retention_schedules": (
+        "application data-retention rules (DPDP) — one authoritative rule per data category for "
+        "every tenant; reference data like countries, unrelated to zoho_retention_policies"
+    ),
     "document_types": "platform-wide catalog of document kinds (AADHAAR, DRIVING_LICENSE, …) — reference "
                       "data like countries; a per-tenant catalog would need tenant_id and a new code uniqueness",
+    "core.entity_types": "platform-wide catalogue of polymorphic entity type codes (brand, manufacturer, …)",
+    "tax.gst_treatment_types": (
+        "CBIC-defined GST treatment vocabulary (business_gst, consumer, overseas, …), identical for "
+        "every tenant — reference data like countries; provenance is the nullable owner_type/owner_id pair"
+    ),
     "geo.admin_boundaries": (
         "administrative reference geometry (states, districts, PIN codes) — not one tenant's "
         "data, and a per-tenant copy would duplicate multi-megabyte polygons. Tenant-drawn "
@@ -163,7 +172,7 @@ GLOBAL_TABLES = {
     ),
 }
 DEACTIVATABLE = {
-    "users", "org_management.organizations", "zoho_currencies", "zoho_taxes",
+    "users", "org_management.organizations", "tax.tax_components",
     "geo.places", "geo.place_links", "geo.geofences", "documents",
 }
 #: The organization tree IS the organization: parent_id + fk_organizations_parent replace organization_id.

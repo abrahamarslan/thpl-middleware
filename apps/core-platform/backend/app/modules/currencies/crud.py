@@ -118,11 +118,22 @@ async def get_exchange_rate(db: AsyncSession, currency_id: int, rate_uuid: uuid_
     )
 
 
-async def get_rate_for_date(db: AsyncSession, currency_id: int, effective_date: dt.date) -> ExchangeRate | None:
-    """One rate per currency per business date (live rows)."""
+async def get_rate_for_date(
+    db: AsyncSession, currency_id: int, effective_date: dt.date, rate_source: str,
+) -> ExchangeRate | None:
+    """The live rate for one currency, business date AND source.
+
+    The source is part of the lookup because it is part of
+    ``uq_exchange_rates_currency_date``: two sources may quote the same day, and
+    matching on the date alone would let one silently overwrite the other.
+    """
     return await db.scalar(
         select(ExchangeRate)
-        .where(ExchangeRate.currency_id == currency_id, ExchangeRate.effective_date == effective_date)
+        .where(
+            ExchangeRate.currency_id == currency_id,
+            ExchangeRate.effective_date == effective_date,
+            ExchangeRate.rate_source == rate_source,
+        )
         .limit(1)
     )
 

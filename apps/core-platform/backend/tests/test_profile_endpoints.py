@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.common.client_info import get_client_info
 from app.database.db import get_db
+from app.database.scope import Scope
 from app.main import app
 from app.modules.users.deps import get_current_user
 from app.modules.users.model import TimezoneSource, User, UserProfile
@@ -319,6 +320,8 @@ async def test_register_assigns_country_and_timezone_from_geoip(mocker):
     mock_create.return_value = created_user
 
     mocker.patch("app.modules.users.service.get_or_create_profile", new_callable=AsyncMock)
+    mocker.patch("app.modules.users.service.resolve_user_organization",
+                 new_callable=AsyncMock, return_value=Scope(tenant_id=1, organization_id=1))
 
     # Mock Country lookup for US
     us_country = Country(iso2="US", iso3="USA", name="United States", currency_code="USD")
@@ -342,7 +345,7 @@ async def test_register_assigns_country_and_timezone_from_geoip(mocker):
     # Verify that GeoIP country and timezone were properly assigned to user record
     mock_create.assert_awaited_once()
     create_args = mock_create.await_args.args[1]
-    assert create_args["country"] == "United States"
     assert create_args["country_code"] == "US"
     assert create_args["timezone"] == "America/New_York"
     assert create_args["currency"] == "USD"
+    assert create_args["organization_id"] == 1

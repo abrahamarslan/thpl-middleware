@@ -532,6 +532,62 @@ feature module. Moving `apply.py` / `mapper.py` / `config.py` down into
 `app/modules/sync/` is **deliberately out of scope** — it churns five working modules for
 no functional gain and belongs in the PR that lands the second source.
 
+### 3.5a The translation layer — the boundary, in both directions
+
+No module reads a source payload directly, and no module hand-builds one. That is
+the **Translator** of the classic anti-corruption layer (façade + adapter + translator:
+the adapter owns HTTP, auth and retries; the translator owns meaning, nothing else —
+[AWS](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/acl.html),
+[Azure](https://learn.microsoft.com/en-us/azure/architecture/patterns/anti-corruption-layer)),
+and equally EIP's [Message Translator](https://www.enterpriseintegrationpatterns.com/patterns/messaging/MessageTranslator.html)
+sitting either side of a [Canonical Data Model](https://www.enterpriseintegrationpatterns.com/patterns/messaging/CanonicalDataModel.html):
+`currency.currencies` is the canonical model and each source gets a translator, never
+its own table.
+
+**The rule the whole design turns on: the write direction is never the inverted read
+direction.** It is tempting to declare one field map and run it backwards. Zoho's own
+contract forbids it:
+
+| field | direction | why |
+|---|---|---|
+| `currency_id` | in | Zoho's id — sending it back is an error |
+| `currency_name` | in | Zoho **computes** it (`"AUD- Australian Dollar"`) from the code |
+| `is_base_currency` | in | organization settings derive it, not this endpoint |
+| `exchange_rate` | in | written through `/exchangerates`, not the currency body |
+| `currency_format` | **both** | *required* on create, optional on update |
+
+This is not a Zoho quirk; it is the general case, and the industry names it — a read
+mapping "can have a separate `encoding_write` for the write direction, never derived by
+inverting the read decoder, per the read/write asymmetry". So a `FieldSpec` declares a
+`direction` (IN / OUT / BOTH) and a `Codec` whose `decode` and `encode` are written
+separately.
+
+Two more axes fall out of the same observation:
+
+* **Shape** (`INDEX` / `DETAIL` / `NESTED` / `WEBHOOK`) — reads differ in completeness.
+  The translator's contract is that a key the source did not send is *skipped*, never
+  decoded to NULL, so a thin index row can never erase what a detail document filled.
+  The engine derives the shape from its own provenance string, so index and full syncs
+  go through one path.
+* **Intent** (`CREATE` / `UPDATE`) — writes differ in required arguments. A create
+  missing `currency_format` is refused *here*, with the field named, rather than spent
+  as an API call Zoho will reject.
+
+**Failure doctrine is asymmetric too, on purpose.** Decoding never raises: a field that
+cannot be translated is dropped and reported in `Decoded.warnings`, because one
+malformed attribute must not cost us the record. Encoding *does* raise: we are about to
+make an outbound call, and a payload we already know is invalid is a bug worth stopping
+for.
+
+**One type, not two.** `FieldSpec` lives in `app/modules/sync/translation.py` and
+`FieldMapping` is now an alias of it, accepting the legacy keyword spellings
+(`zoho=`, `transform=`, `outbound=`, `outbound_key=`) so the four unconverted modules
+keep working untouched while new modules use the richer vocabulary.
+
+**Derived, not hand-listed.** `ZOHO_OWNED_CURRENCY_FIELDS` is
+`frozenset(CURRENCY_TRANSLATOR.readable)` — the columns the sync writes *are* the columns
+a user may not edit, so the guard and the field rules cannot drift apart.
+
 ### 3.6 Retention must be generalised, not "registered" (review finding 5)
 
 Rev 1 said `sync_payloads` is "one more table name in the same machinery, one more policy
@@ -737,8 +793,10 @@ hashes match ⇒ the backfill was faithful). Then delete `app/modules/zoho_curre
 | 1 | ✅ **`sync` schema + package.** M1 (`b8d31c7f4a52`); `SyncRecord`/`SyncPayload`/`PendingReference`; `SyncContract` (`crosswalk=False` default); `crosswalk.py` upsert + lookup; `_OWNED_SCHEMAS`, `_PARTITIONED_PARENTS`, `_TEST_TABLES`, `.importlinter` | **done.** Conformance passes; DDL verified on PG18 (LIST/RANGE strategies, partition routing, unique index on every partition, lz4); guarded upsert rejects an older payload with no lost update; migration round-trips; 9 crosswalk tests |
 | 2 | ✅ **Retention generalised.** `PartitionedTable` + `MAINTAINED`; `run_maintenance` covers both tables; policy seed `c41e9b7d2f60` | **done.** The 6 existing retention tests pass **unchanged**; 11 new tests cover monthly partitions, the `sync` schema, outcome→class mapping and the `last_day_held` rule (mutation-checked) |
 | 3 | ✅ **Engine two-model path.** `apply_payload` split into a dispatcher over `_apply_in_place` (untouched) and `_apply_crosswalk`; join-loader (§2.7), guarded upsert (§2.6), history append, `ModuleSyncConfig.contract`, registry contract validation, `_tombstone_crosswalk` writing both sides | **done.** All 319 pre-existing zoho tests pass with the engine changed — parity is structural, since the old body is byte-for-byte intact. 7 new crosswalk tests, mutation-checked (removing either `include_deleted`, the upsert guard, or the write-only-history rule turns them red) |
-| 4 | **Currency adapter.** M2, `currencies/zoho/`, ownership guard, rate projection | adapter tests against saved payloads, no network |
+| 4 | ✅ **Currency adapter + the translation layer.** `app/modules/sync/translation.py` (§3.5a); `FieldMapping` collapsed into `FieldSpec`; M2 (`d52a6f0bc318`); `currencies/zoho/` (fields, translator, hooks, spec); owned-field guard; `to_zoho_payload`; rate projection; `zoho_currencies` unregistered | **done.** 34 translation tests (pure) + 9 adapter tests + the end-to-end master sync. 552 pass overall |
 | 5 | **Backfill + cutover.** M3, M4, M5 | post-cutover sync reports all-`unchanged`; `zoho_currencies` gone |
+| 4b | ✅ **`index_then_detail`, identity echo, taxes converted.** Two-phase apply; `SyncContract.identity_echo`; `tax.taxes` canonical master (`f84b5c2e60a7`) replacing the `zoho_taxes` mirror; `organizations` converted to the crosswalk; `fk_organizations_currency` repointed (`e73c4a1d9f25`) | **done.** Database rebuilt from migration zero; three modules sync clean with full Zoho field coverage. See [`docs/SYNC_ARCHITECTURE.md`](../SYNC_ARCHITECTURE.md) |
+| 4c | ✅ **Tax schema.** `tax.taxes` replaced by six `tax.*` tables (`62303d9097fe`): components + groups in one table, group members, exemptions, organization grants, defaults, treatment vocabulary. No `zoho_id` echo — the first module to run without one, which surfaced (and the engine now handles) the in-page duplicate case the echo's unique index used to catch | **done.** See [`adapters/taxes.md`](../zoho-sync-implementation/adapters/taxes.md). Groups are registered disabled until a list source exists; `default_taxes` / `gst_treatments` have tables but no adapter (undocumented endpoints) |
 | 6 | **Resolver.** `ReferenceRule`, batched resolve, `STUB`/`FETCH`/`DEFER`, budget, `pending_references` drain lane | a fixture invoice payload links 6 references in 1 query; budget exhaustion degrades instead of hammering |
 | 7 | **Planner ordering.** `depends_on` → `ModuleView` → topological rank → `plan()` suppression + rank-major sort (§4.3) | planner table tests cover "dependent waits for a dependency's first full sync" |
 | 8 | **Convert the other four masters**, one PR each (organizations, taxes, locations, zoho_users) | each module's post-cutover report is all-`unchanged` |

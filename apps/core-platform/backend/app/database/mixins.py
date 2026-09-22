@@ -81,6 +81,29 @@ class BigIntPKWithUUIDMixin(IntPKMixin):
     )
 
 
+class BigIntPKWithUUIDv7Mixin(IntPKMixin):
+    """``BigIntPKWithUUIDMixin`` with a database-generated, time-ordered UUID.
+
+    PostgreSQL 18 ``uuidv7()`` puts the timestamp in the high bits, so the
+    unique index on ``uuid`` is appended to instead of scattered across the
+    tree (uuid4's problem at scale). The value comes from the server default,
+    so there is no Python-side ``default``: a row inserted by raw SQL or a
+    Core statement gets one too, and the ORM reads it back through RETURNING.
+
+    Opt-in — existing tables keep uuid4 so no migration has to rewrite them.
+    Needs PG >= 18 (the deployment image and the scratch test image both are).
+    """
+
+    uuid: Mapped[PyUUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        server_default=text("uuidv7()"),
+        unique=True,
+        index=True,
+        nullable=False,
+        comment="Time-ordered public reference id (PG18 uuidv7())",
+    )
+
+
 class TimestampMixin:
     """DB-authoritative created/updated timestamps (timezone-aware, UTC)."""
 
@@ -464,6 +487,7 @@ __all__ = [
     "AuditMixin",
     "AuditUserMixin",
     "BigIntPKWithUUIDMixin",
+    "BigIntPKWithUUIDv7Mixin",
     "DeactivationMixin",
     "HashGuardMixin",
     "IntPKMixin",

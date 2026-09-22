@@ -5,7 +5,6 @@
 # Layers:
 #   tenancy core   app.modules.tenants · organizations · roles (+ users) — everyone may depend on it
 #   Zoho platform  app.modules.zoho                                    — entity-agnostic engine
-#   Zoho masters   app.modules.zoho_currencies · taxes · locations · zoho_users
 
 [importlinter]
 root_package = app
@@ -16,7 +15,6 @@ type = forbidden
 source_modules =
     app.modules.zoho
 forbidden_modules =
-    app.modules.zoho_currencies
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
@@ -27,7 +25,6 @@ type = forbidden
 source_modules =
     app.modules.organizations
     app.modules.currencies
-    app.modules.zoho_currencies
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
@@ -43,7 +40,6 @@ allow_indirect_imports = True
 name = Zoho master modules are independent of each other (link by zoho id, not import)
 type = independence
 modules =
-    app.modules.zoho_currencies
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
@@ -54,7 +50,6 @@ type = forbidden
 source_modules =
     app.modules.geo
 forbidden_modules =
-    app.modules.zoho_currencies
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
@@ -67,7 +62,6 @@ source_modules =
     app.modules.organizations
     app.modules.roles
 forbidden_modules =
-    app.modules.zoho_currencies
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
@@ -81,7 +75,6 @@ forbidden_modules =
     app.modules.zoho
     app.modules.organizations
     app.modules.currencies
-    app.modules.zoho_currencies
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users

@@ -11,14 +11,13 @@ MUMBAI = {"latitude": 19.0760, "longitude": 72.8777}
 
 
 async def _org(db, world) -> Organization:
-    """Each world's tenant needs one organization: geo rows require one."""
-    with tenant_scope(world.tenant.id):
-        org = Organization(org_code=f"{world.tenant.tenant_code}-HQ",
-                           legal_name=f"{world.tenant.name} HQ", tenant_id=world.tenant.id)
-        db.add(org)
-        await db.flush()
-    await db.commit()
-    return org
+    """The world's organization — geo rows require one.
+
+    ``worlds`` builds it now (users are organization-scoped, so every world has
+    an HQ); creating a second one here would collide on
+    ``uq_organizations_code_active``.
+    """
+    return world.organization
 
 
 def _place(**kw) -> dict:

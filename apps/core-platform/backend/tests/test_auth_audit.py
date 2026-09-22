@@ -28,6 +28,7 @@ async def _make_user(db, **overrides) -> User:
         name=overrides.pop("name", "Audit"),
         email=overrides.pop("email", f"audit-{suffix}@example.com"),
         password=hash_password(PASSWORD),
+        organization_id=(await service.resolve_user_organization(db)).organization_id,
         **overrides,
     )
     db.add(user)
@@ -58,7 +59,7 @@ async def test_profile_update_records_field_level_diff(db):
     actor = await _make_user(db, name="Admin")
 
     await service.update_user(
-        db, user.id, UserUpdate(city="Ahmedabad", phone="+919999999999"),
+        db, user.id, UserUpdate(country_code="AE", phone="+919999999999"),
         updated_by=actor.id, actor_label=actor.email,
     )
 
@@ -69,8 +70,8 @@ async def test_profile_update_records_field_level_diff(db):
     ).first()
     assert row is not None
     assert row.actor_id == actor.id
-    assert set(row.changes.keys()) == {"city", "phone"}
-    assert row.changes["city"] == {"old": None, "new": "Ahmedabad"}
+    assert set(row.changes.keys()) == {"country_code", "phone"}
+    assert row.changes["country_code"] == {"old": None, "new": "AE"}
     assert row.changes["phone"] == {"old": None, "new": "+919999999999"}
 
 

@@ -117,9 +117,18 @@ def decide(row: RowState | None, incoming: Incoming) -> Decision:
                 return Decision(Outcome.UNCHANGED, reason="same_hash")
             if incoming.rank < provenance_rank(row.sync_source):
                 return Decision(Outcome.UNCHANGED, reason="richer_payload_stored")
-    elif row.zoho_raw_hash is not None and row.zoho_raw_hash == incoming.payload_hash:
-        # Undated modules (e.g. organizations): the hash alone proves nothing changed.
-        return Decision(Outcome.UNCHANGED, reason="same_hash")
+    else:
+        if row.zoho_raw_hash is not None and row.zoho_raw_hash == incoming.payload_hash:
+            # Undated modules (e.g. organizations): the hash alone proves nothing changed.
+            return Decision(Outcome.UNCHANGED, reason="same_hash")
+        if incoming.modified is None and incoming.rank < provenance_rank(row.sync_source):
+            # An UNDATED payload that is strictly thinner than what we hold
+            # carries no evidence: its hash differs only because it is missing
+            # keys, not because anything changed. Without this, a thin list row
+            # with no last_modified_time rewrites the row on every single scan
+            # for as long as the record exists — and the richer payload that
+            # follows it (detail fetch) is what actually carries the change.
+            return Decision(Outcome.UNCHANGED, reason="thinner_and_undated")
 
     write_raw = incoming.rank >= provenance_rank(row.sync_source)
     return Decision(Outcome.UPDATED, write_raw=write_raw)

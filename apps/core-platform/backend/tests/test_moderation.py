@@ -29,6 +29,7 @@ async def _user(db, **overrides) -> User:
         name="Mod Tester",
         email=overrides.pop("email", f"mod-{suffix}@example.com"),
         password=hash_password(PASSWORD),
+        organization_id=(await service.resolve_user_organization(db)).organization_id,
         **overrides,
     )
     db.add(user)

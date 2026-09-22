@@ -35,7 +35,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.security.authentik_client import (
     AuthentikAdminClient,
-    AuthentikError,
     authentik_admin_client,
 )
 from app.core.conf import settings

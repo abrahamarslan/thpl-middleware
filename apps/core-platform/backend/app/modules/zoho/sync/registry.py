@@ -17,12 +17,14 @@ routers register once in app/router.py.
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import cached_property
 from importlib import import_module
 from typing import Any
 
 import structlog
 
 from app.common.exception.errors import NotFoundError
+from app.modules.sync.translation import CODECS, FieldTranslator, Translator
 from app.modules.zoho.sync.config import ModuleSyncConfig
 
 logger = structlog.get_logger("app.zoho.sync.registry")
@@ -31,7 +33,9 @@ logger = structlog.get_logger("app.zoho.sync.registry")
 #: Order matters only for readability — dependencies are declared by specs.
 _ADAPTER_PACKAGES = [
     "app.modules.organizations.zoho",
-    "app.modules.zoho_currencies.zoho",
+    # currencies writes the canonical currency.currencies; the zoho_currencies
+    # mirror module and its table are gone.
+    "app.modules.currencies.zoho",
     "app.modules.taxes.zoho",
     "app.modules.locations.zoho",
     "app.modules.zoho_users.zoho",
@@ -62,12 +66,21 @@ class ZohoModuleDefinition:
     model: type                      # SQLAlchemy model with the Identity + Mirror columns
     pre_upsert: PreUpsertHook | None = None
     post_upsert: PostUpsertHook | None = None
+    #: The anti-corruption boundary for this module. Left unset, a declarative
+    #: one is built from ``config.field_map`` — so every module gets
+    #: translation for free, and a module with irreducible logic supplies its
+    #: own subclass instead of growing the spec language.
+    translator: Translator | None = None
     #: Extra searchable summary shown by the admin API.
     tags: list[str] = field(default_factory=list)
 
     @property
     def name(self) -> str:
         return self.config.module
+
+    @cached_property
+    def resolved_translator(self) -> Translator:
+        return self.translator or FieldTranslator(self.name, self.config.field_map)
 
 
 class SyncRegistry:
@@ -156,6 +169,10 @@ class SyncRegistry:
                 unknown_owned = sorted(contract.owned_fields - columns)
                 if unknown_owned:
                     problems.append(f"{name}: contract.owned_fields names unknown columns {unknown_owned}")
+                unknown_echo = sorted(set(contract.identity_echo) - columns)
+                if unknown_echo:
+                    problems.append(f"{name}: contract.identity_echo names unknown columns "
+                                    f"{unknown_echo}")
             else:
                 missing_gate = [c for c in _GATE_COLUMNS if c not in columns]
                 if missing_gate:
@@ -167,9 +184,22 @@ class SyncRegistry:
                 ):
                     problems.append(f"{name}: {table.name} needs a unique (partial) index on (tenant_id, zoho_id)")
 
+            if cfg.index_then_detail and not cfg.detail_required:
+                problems.append(f"{name}: index_then_detail needs detail_required "
+                                "(there is no detail phase to run)")
             unknown = sorted({m.local for m in cfg.field_map} - columns)
             if unknown:
                 problems.append(f"{name}: field map targets unknown columns {unknown}")
+            # An unknown codec degrades to passing the raw value through, which
+            # is invisible until someone reads a month name out of an integer
+            # column. Fail the boot instead.
+            bad_codecs = sorted({
+                spec.codec for spec in cfg.field_map
+                if spec.codec is not None and spec.codec not in CODECS
+            })
+            if bad_codecs:
+                problems.append(f"{name}: field map uses unregistered codecs {bad_codecs} "
+                                f"(known: {sorted(CODECS)})")
             for rule in cfg.nested:
                 if rule.module not in self._modules:
                     problems.append(f"{name}: nested rule '{rule.attr}' → unregistered module '{rule.module}'")

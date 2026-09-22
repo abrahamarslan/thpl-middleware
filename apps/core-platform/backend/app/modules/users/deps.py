@@ -37,10 +37,21 @@ async def get_current_user(
     db: DBSession,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     x_organization_id: Annotated[str | None, Header(alias="X-Organization-Id")] = None,
+    x_organization_code: Annotated[str | None, Header(alias="X-Organization-Code")] = None,
 ) -> User:
     user = await _authenticate(db, credentials)
-    await _bind_tenancy(db, user, x_organization_id)
+    await _bind_tenancy(db, user, org_uuid=x_organization_id, org_code=x_organization_code)
     return user
+
+
+OrganizationCode = Annotated[
+    str | None,
+    Header(
+        alias="X-Organization-Code",
+        description="Organization code (e.g. THPL) this request acts on. "
+                    "Omitted: the deployment default (DEFAULT_ORGANIZATION_CODE).",
+    ),
+]
 
 
 async def _authenticate(db, credentials: HTTPAuthorizationCredentials | None) -> User:
@@ -64,27 +75,34 @@ async def _authenticate(db, credentials: HTTPAuthorizationCredentials | None) ->
     return user
 
 
-async def _bind_tenancy(db, user: User, organization_header: str | None) -> None:
-    from sqlalchemy import select
+async def _bind_tenancy(
+    db, user: User, *, org_uuid: str | None = None, org_code: str | None = None,
+) -> None:
+    """Bind the request to the organization it acts on.
 
+    An authenticated caller may name a *different* organization — a branch they
+    also work in — but only one of **their own tenant**: both lookups are
+    confined by ``for_tenant``, so neither header can reach across tenants.
+    Naming nothing binds the user's own organization.
+    """
+    from app.database import scope
     from app.database.tenancy import bind_user
-    from app.modules.organizations.model import Organization
     from app.modules.tenants import service as tenants
 
     if user.tenant_id is not None and not tenants.can_sign_in(await tenants.tenant_status(db, user.tenant_id)):
         raise ForbiddenError("Your organization's account is suspended or closed; contact your administrator")
 
     organization_id = None
-    if organization_header:
+    if org_uuid:
         try:
-            org_uuid = uuid.UUID(organization_header)
+            uuid.UUID(org_uuid)
         except ValueError:
             raise ForbiddenError("X-Organization-Id must be an organization uuid") from None
-        organization_id = await db.scalar(
-            select(Organization.id).where(Organization.uuid == org_uuid, Organization.tenant_id == user.tenant_id)
+    if org_code or org_uuid:
+        chosen = await scope.resolve(
+            db, org_code=org_code, org_uuid=org_uuid, for_tenant=user.tenant_id,
         )
-        if organization_id is None:
-            raise ForbiddenError("X-Organization-Id is not an organization of your tenant")
+        organization_id = chosen.organization_id if chosen else None
     bind_user(user, organization_id=organization_id)
 
 

@@ -1,5 +1,10 @@
-"""Shared fixtures for tenancy API tests: two tenants with real users and JWTs."""
+"""Shared fixtures for tenancy API tests: two tenants with real users and JWTs.
 
+Every user is organization-scoped, so each world gets an organization and its
+system roles are seeded per organization (roles are org-scoped now).
+"""
+
+import uuid
 from dataclasses import dataclass
 
 import httpx
@@ -8,6 +13,7 @@ import pytest
 from app.common.security.jwt import create_access_token
 from app.database.tenancy import tenant_scope
 from app.main import app
+from app.modules.organizations.model import Organization
 from app.modules.roles.service import seed_system_roles
 from app.modules.tenants.model import Tenant
 from app.modules.users.model import User
@@ -16,6 +22,7 @@ from app.modules.users.model import User
 @dataclass
 class TenantWorld:
     tenant: Tenant
+    organization: Organization
     admin: User
     member: User
 
@@ -29,15 +36,21 @@ async def build_world(db, code: str) -> TenantWorld:
     db.add(tenant)
     await db.flush()
     with tenant_scope(tenant.id):
-        roles = {r.code: r for r in await seed_system_roles(db)}
+        org = Organization(
+            tenant_id=tenant.id, org_code=f"{code}-HQ", legal_name=f"{code} HQ",
+            org_type="solo", uuid=uuid.uuid4(),
+        )
+        db.add(org)
+        await db.flush()
+        roles = {r.code: r for r in await seed_system_roles(db, org.id)}
         admin = User(name=f"{code} Admin", email=f"admin@{code.lower()}.example", password="x",
-                     role_id=roles["admin"].id)
+                     role_id=roles["admin"].id, organization_id=org.id)
         member = User(name=f"{code} Member", email=f"member@{code.lower()}.example", password="x",
-                      role_id=roles["member"].id)
+                      role_id=roles["member"].id, organization_id=org.id)
         db.add_all([admin, member])
         await db.flush()
     await db.commit()
-    return TenantWorld(tenant, admin, member)
+    return TenantWorld(tenant, org, admin, member)
 
 
 @pytest.fixture

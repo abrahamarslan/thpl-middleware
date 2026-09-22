@@ -1,7 +1,14 @@
-"""Taxes — Zoho taxes mirror (O1 master, package-by-feature).
+"""Taxes — the ``tax`` schema (canonical masters, package-by-feature).
 
-    model.py schema.py crud.py service.py api.py   the feature (read-only)
-    zoho/  spec.py fields.py                        the Zoho adapter
+    enums.py  model.py                      vocabularies; single import surface for the tables
+    component.py    TaxComponent (tax | compound_tax | tax_group) · TaxGroupMember
+    exemption.py    TaxExemption           org-defined exemption reasons (P2 fields)
+    org_tax.py      OrganizationTaxComponent   organization ↔ component grants (M:N)
+    preference.py   OrgDefaultTaxPreference    default component per organization + inter/intra
+    reference.py    GstTreatmentType       global treatment vocabulary
+    mappings.py     lineage catalog of every Zoho leaf path (tests keep it honest)
+    schema.py crud.py service.py api.py     the read side
+    zoho/           the Zoho adapter: taxes · tax_groups (disabled) · tax_exemptions
 
-HTTP: /api/zoho/taxes. Docs: docs/zoho-sync-implementation/adapters/taxes.md
+HTTP: /api/taxes. Docs: docs/zoho-sync-implementation/adapters/taxes.md
 """

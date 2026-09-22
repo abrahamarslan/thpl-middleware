@@ -11,14 +11,17 @@ from app.common.exception.errors import AuthError
 from app.core.conf import settings
 from app.database.db import get_db
 from app.main import app
-from app.modules.users import auth_emails, crud, login_otp
+from app.modules.users import auth_emails, crud, login_otp, service
 from app.modules.users.model import User
 from app.modules.users.security import hash_one_time_code
 from app.modules.users.service import hash_password
 
 
 async def _make_user(db, email: str, *, username: str | None = None) -> User:
-    user = User(name="OTP Tester", email=email, username=username, password=hash_password("0ldPassw0rd"))
+    user = User(
+        name="OTP Tester", email=email, username=username, password=hash_password("0ldPassw0rd"),
+        organization_id=(await service.resolve_user_organization(db)).organization_id,
+    )
     db.add(user)
     await db.flush()
     return user

@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.conf import settings
 from app.modules.sync.contract import SyncContract
+from app.modules.sync.translation import FieldSpec
 
 
 class SyncDirection(str, Enum):
@@ -51,33 +52,12 @@ class SyncStrategyName(str, Enum):
     INDEX = "index"              # list endpoint only — never N+1 detail calls
 
 
-class FieldMapping(BaseModel):
-    """One Zoho-attribute -> local-column mapping.
-
-    ``zoho`` is a dotted path into the payload (``"address.city"``).
-    ``transform`` names a registered coercion in mapper.TRANSFORMS.
-    ``default`` is applied only when the key is present-but-null or when
-    ``apply_default_when_missing`` is set; otherwise missing keys are skipped
-    entirely so a partial payload can never null-out existing data.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    zoho: str
-    local: str
-    transform: str | None = None
-    default: Any = None
-    apply_default_when_missing: bool = False
-    # Outbound behaviour
-    outbound: bool = True                 # include in payloads pushed to Zoho
-    outbound_key: str | None = None       # override the Zoho key on writes
-
-    @field_validator("zoho", "local")
-    @classmethod
-    def _not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("mapping paths must not be blank")
-        return v
+#: One external-attribute <-> local-column rule. The type now lives in the
+#: source-neutral translation layer (app/modules/sync/translation.py), which
+#: added the direction/codec vocabulary; this alias keeps every existing module
+#: spec (``FieldMapping(zoho=..., transform=..., outbound=False)``) working
+#: unchanged, because those spellings are accepted keyword aliases there.
+FieldMapping = FieldSpec
 
 
 class NestedEntityRule(BaseModel):
@@ -110,6 +90,17 @@ class GlobalSyncDefaults(BaseModel):
     # inline  — fetch details in the same task (respects wait_between_calls)
     # queued  — fan out one Celery task per record (max parallel throughput)
     detail_dispatch: Literal["inline", "queued"] = "inline"
+    # Two-phase apply for detail_required modules: write the INDEX row first,
+    # then fetch /{endpoint}/{id} and upsert the detail over it.
+    #
+    # The row therefore exists as soon as it is listed, which matters because
+    # (a) a detail call that fails, is rate-limited or is queued no longer
+    # leaves a hole where a record should be, and (b) anything resolving a
+    # reference to this record finds it immediately. The apply gate makes the
+    # second write safe and the steady state free: the detail payload outranks
+    # the index one (provenance), and once a row already holds the detail
+    # document of the listed version, neither phase spends a call or a write.
+    index_then_detail: bool = False
     batch_size: int = Field(default=200, ge=1, le=200)   # Zoho page cap is 200
     # Above this many records an incremental run escalates to a full run
     full_sync_threshold: int = 25_000
@@ -130,6 +121,14 @@ class GlobalSyncDefaults(BaseModel):
     max_records_per_run: int = Field(default=0, ge=0)
     # Planner: include this module in the weekly full-reconcile lane.
     weekly_full_enabled: bool = True
+    # Reference resolution (redesign §4.1 step 5): the ceiling on UNPLANNED
+    # detail calls one run may spend chasing masters a document names. "Fetch
+    # it and insert it first" is right per record and ruinous per page — a page
+    # of 200 documents naming 200 unsynced contacts would trip the rate limiter
+    # and spend the run's whole quota on references. Over budget, FETCH
+    # degrades to STUB: the row still links, to a provisional entity the owning
+    # module's own sync fills in. 0 = never fetch (everything degrades).
+    max_reference_fetches_per_run: int = Field(default=50, ge=0)
     # Apply gate: payload keys (glob, any depth) ignored by the no-op hash.
     hash_volatile_keys: list[str] = Field(
         default_factory=lambda: ["*_formatted", "page_context", "instrumentation"]

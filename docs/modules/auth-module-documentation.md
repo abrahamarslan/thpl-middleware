@@ -70,6 +70,22 @@ hierarchy: `AuthError` → 401 `unauthorized`, `ForbiddenError` → 403
 User administration (JWT-protected) lives on the same module: `GET/POST
 /api/users`, `GET/PUT/DELETE /api/users/{id}`, `POST /api/users/{id}/restore`.
 
+Own-account endpoints (JWT-protected, `me_router`, also mirrored under
+`/api/auth/me/*`):
+
+| Method | Path | Body | Effect |
+|---|---|---|---|
+| GET | `/api/me/profile` | — | Localization profile (country / timezone / source) |
+| PATCH | `/api/me/profile` | `{country?, timezone?}` | Set country (auto-timezone) or lock timezone to manual |
+| PATCH | `/api/me/location` | `{latitude, longitude, accuracy_m?, …}` | Record one position fix |
+| GET | `/api/me/location` | — | Last known position, or `null` |
+| GET | `/api/users/{id}/location` | — | Another user's last known position (dispatch) |
+
+A fix writes `user_live_locations` (upsert) and `user_location_pings` (append)
+and touches no column on `users` except `is_location_set` — that isolation is
+why the tables exist. **Addresses are not part of this module**: they go through
+the platform-wide address book (`/api/addresses` with `owner_type=user`).
+
 Moderation (JWT-protected, `/api/users/{id}/*`):
 
 | Method | Path | Body | Effect |
@@ -94,10 +110,16 @@ three becomes a valid login identifier.
 `POST /api/auth/register` → `service.register`:
 1. Reject duplicate email/username (`ConflictError`).
 2. Validate the password against the configured policy.
-3. Hash with bcrypt, create the `User` (`last_password_change_at = now`) with the
+3. Resolve the organization the user belongs to (`resolve_user_organization`):
+   the request's organization when one is bound, else the tenant's root.
+   `users.organization_id` is NOT NULL and registration is unauthenticated, so
+   there is nothing for the tenancy listener to stamp from — **every** creation
+   path (register, admin-create, Authentik JIT, dev-token) calls this, and a new
+   one that forgets to fails with a NOT NULL violation, not a readable error.
+4. Hash with bcrypt, create the `User` (`last_password_change_at = now`) with the
    optional `username`/`phone` (blank → `null`) that can later be used to log in.
-4. Best-effort mirror into Authentik (retry enqueued on failure).
-5. Best-effort **welcome** email (never fails registration).
+5. Best-effort mirror into Authentik (retry enqueued on failure).
+6. Best-effort **welcome** email (never fails registration).
 
 ### 3.2 Password login
 `service.login`: resolve identifier → lockout check → verify bcrypt →

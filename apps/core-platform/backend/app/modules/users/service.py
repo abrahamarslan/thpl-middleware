@@ -12,8 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from geoalchemy2 import WKTElement
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.client_info import ClientInfo
@@ -21,6 +20,8 @@ from app.common.exception.errors import AppError, AuthError, ConflictError, Forb
 from app.common.security.jwt import decode_token
 from app.common.time import is_valid_iana_timezone
 from app.core.conf import settings
+from app.database import scope
+from app.database.scope import Scope
 from app.modules.activity.recorder import model_changes
 from app.modules.users import auth_emails, authentik_sync, crud, identifiers, moderation, password_reset
 from app.modules.users.audit import Event, audit
@@ -28,7 +29,7 @@ from app.modules.users.authentik_sync import AUTHENTIK_SYNCED_FIELDS, SyncResult
 from app.modules.users.model import Country, CountryTimezone, Timezone, TimezoneSource, User, UserProfile
 from app.modules.users.password_policy import validate_password
 from app.modules.users.schema import (
-    GEO_FIELDS,
+    LocationUpdate,
     LoginRequest,
     RegisterRequest,
     TokenPair,
@@ -61,17 +62,30 @@ def _enqueue_authentik(task_name: str, *args) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _geo_to_elements(values: dict) -> dict:
-    """Convert WKT strings to PostGIS-bindable elements (SRID 4326)."""
-    for field in GEO_FIELDS:
-        if values.get(field):
-            values[field] = WKTElement(values[field], srid=4326)
-    return values
+async def resolve_user_organization(db: AsyncSession, *, org_code: str | None = None) -> Scope:
+    """Where a new user is created.
+
+    Registration is unauthenticated, so there is no ambient organization to
+    stamp from and ``users.organization_id`` is NOT NULL. The caller may name
+    an organization by code (``X-Organization-Code``) — for a public sign-up
+    that code is what *chooses* the tenant, so it is resolved across tenants;
+    otherwise the deployment's configured default
+    (``DEFAULT_ORGANIZATION_CODE`` in ``DEFAULT_TENANT_CODE``) applies.
+
+    Both the tenant and the organization are returned because a user created
+    outside any request context must be stamped with both — the tenancy
+    listener would otherwise default the tenant independently and could put the
+    user in a tenant its organization does not belong to.
+    """
+    return await scope.require(db, org_code=org_code)
 
 
 # ── Authentication ────────────────────────────────────────────────────────────
 
-async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInfo | None = None) -> User:
+async def register(
+    db: AsyncSession, body: RegisterRequest, *,
+    client: ClientInfo | None = None, org_code: str | None = None,
+) -> User:
     if await crud.get_by_email(db, body.email, include_deleted=True):
         raise ConflictError("A user with this email already exists")
     if body.username and await crud.get_by_username(db, body.username):
@@ -80,7 +94,6 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
 
     # Localization resolution via GeoIP client info
     detected_country_code = (client.country_code.strip().upper() if client and client.country_code else None)
-    detected_country_name = client.country if client else None
     detected_timezone = (client.timezone.strip() if client and client.timezone else None)
 
     country_row = None
@@ -88,7 +101,6 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
         country_row = await db.scalar(select(Country).where(Country.iso2 == detected_country_code))
 
     resolved_country_iso2 = country_row.iso2 if country_row else (detected_country_code or "IN")
-    resolved_country_name = country_row.name if country_row else (detected_country_name or "India")
     resolved_currency = country_row.currency_code if (country_row and country_row.currency_code) else "INR"
 
     resolved_tz = None
@@ -105,6 +117,7 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
 
     resolved_tz = resolved_tz or "Asia/Kolkata"
 
+    where = await resolve_user_organization(db, org_code=org_code)
     user = await crud.create(db, {
         "name": body.name,
         "email": body.email.lower(),
@@ -112,10 +125,14 @@ async def register(db: AsyncSession, body: RegisterRequest, *, client: ClientInf
         "phone": body.phone,
         "password": hash_password(body.password),
         "last_password_change_at": datetime.now(UTC),
-        "country": resolved_country_name,
         "country_code": resolved_country_iso2,
         "timezone": resolved_tz,
         "currency": resolved_currency,
+        # Both, together: the organization decides the tenant. Letting the
+        # tenancy listener default the tenant independently could put the user
+        # in a tenant its own organization does not belong to.
+        "tenant_id": where.tenant_id,
+        "organization_id": where.organization_id,
     })
     await audit(
         db, Event.REGISTER, user=user, client=client,
@@ -341,6 +358,12 @@ async def provision_from_authentik(db: AsyncSession, claims: dict) -> User:
 
     Linking: external_id <- Authentik `sub`; falls back to email match for
     users that pre-existed Authentik (and back-fills external_id).
+
+    JIT provisioning runs BEFORE the request is bound to a tenant/organization
+    (``deps._bind_tenancy`` needs the user this returns), so the new row has no
+    organization context to be stamped from — and ``users.organization_id`` is
+    NOT NULL. ``resolve_user_organization`` supplies the default tenant's root
+    organization, exactly as unauthenticated registration does.
     """
     sub = str(claims["sub"])
     user = await crud.get_by_external_id(db, sub)
@@ -350,6 +373,7 @@ async def provision_from_authentik(db: AsyncSession, claims: dict) -> User:
             user.external_id = sub
 
     if user is None:
+        where = await resolve_user_organization(db)
         user = await crud.create(db, {
             "external_id": sub,
             "email": (claims.get("email") or f"{sub}@authentik.local").lower(),
@@ -361,6 +385,8 @@ async def provision_from_authentik(db: AsyncSession, claims: dict) -> User:
             "password": hash_password(secrets.token_urlsafe(32)),  # unusable; SSO-only account
             "user_type": "sso",
             "onboarding_status": "provisioned",
+            "tenant_id": where.tenant_id,
+            "organization_id": where.organization_id,
         })
         await audit(db, Event.PROVISIONED, user=user, context={"method": "authentik", "sub": sub})
 
@@ -369,6 +395,28 @@ async def provision_from_authentik(db: AsyncSession, claims: dict) -> User:
     user.last_login = datetime.now(UTC)
     await db.flush()
     return user
+
+
+async def get_or_create_dev_user(db: AsyncSession, email: str = "dev@local.test") -> User:
+    """The real user row behind ``POST /api/auth/dev-token`` (DEBUG stacks only).
+
+    A token subject must be a numeric user id, so the dev token needs a real
+    row — and that row is organization-scoped like every other user. Lives in
+    the service layer, not the route, so the organization is resolved by the
+    same function every other creation path uses.
+    """
+    user = await crud.get_by_email(db, email)
+    if user is not None:
+        return user
+    where = await resolve_user_organization(db)
+    return await crud.create(db, {
+        "email": email,
+        "username": email.split("@")[0],
+        "name": "Dev Token User",
+        "password": hash_password(secrets.token_urlsafe(24)),   # unusable for login
+        "tenant_id": where.tenant_id,
+        "organization_id": where.organization_id,
+    })
 
 
 # ── User CRUD lifecycle ───────────────────────────────────────────────────────
@@ -397,11 +445,14 @@ async def create_user(
         raise ConflictError("This username is taken")
     validate_password(body.password, email=body.email, name=body.name)
 
-    values = _geo_to_elements(body.model_dump(exclude_unset=True, exclude_none=True))
+    values = body.model_dump(exclude_unset=True, exclude_none=True)
     values["email"] = body.email.lower()
     values["password"] = hash_password(values.pop("password"))
     values["created_by"] = created_by
     values["last_password_change_at"] = datetime.now(UTC)
+    # Admin-create runs inside a bound request, so this normally returns the
+    # caller's own organization; the fallbacks only matter for a system caller.
+    values["organization_id"] = (await resolve_user_organization(db)).organization_id
     user = await crud.create(db, values)
     await audit(
         db, Event.USER_CREATED, user=user, actor_id=created_by, actor_label=actor_label,
@@ -426,7 +477,7 @@ async def update_user(
 ) -> User:
     user = await get_user(db, user_id)
 
-    values = _geo_to_elements(body.model_dump(exclude_unset=True))
+    values = body.model_dump(exclude_unset=True)
     if "email" in values and values["email"]:
         existing = await crud.get_by_email(db, values["email"], include_deleted=True)
         if existing and existing.id != user.id:
@@ -441,7 +492,7 @@ async def update_user(
     # Apply, capture a masked {field: {old,new}} diff *before* flushing (history
     # is reset by flush), then persist the change.
     crud.apply_values(user, values)
-    diff = model_changes(user, exclude=set(GEO_FIELDS) | {"updated_by"})
+    diff = model_changes(user, exclude={"updated_by"})
     await db.flush()
     await db.refresh(user)
 
@@ -517,6 +568,90 @@ async def logout(db: AsyncSession, user: User, *, client: ClientInfo | None = No
     await audit(db, Event.LOGOUT, user=user, client=client)
 
 
+# ── Location telemetry ────────────────────────────────────────────────────────
+
+async def record_location(
+    db: AsyncSession, user: User, body: LocationUpdate, *, client: ClientInfo | None = None,
+) -> Any:
+    """Record one position fix: upsert the live row, append to the history.
+
+    Both writes happen in the caller's transaction, so a fix is either fully
+    recorded or not at all — dispatch reading `user_live_locations` can never
+    see a position that has no corresponding ping.
+
+    The `users` row is NOT touched (that isolation is the reason the telemetry
+    tables exist), with one exception: `is_location_set` is the flag the apps
+    read to decide whether to ask for a location, and it belongs to the user.
+    """
+    recorded_at = body.recorded_at or datetime.now(UTC)
+    coordinates = crud.point(body.latitude, body.longitude)
+
+    live_values: dict[str, Any] = {
+        "coordinates": coordinates,
+        "recorded_at": recorded_at,
+        "received_at": datetime.now(UTC),
+    }
+    # Only what the device actually sent — see the ON CONFLICT set_ in crud.
+    for field in (
+        "place_id", "accuracy_m", "altitude_m", "altitude_accuracy_m", "heading_deg",
+        "speed_mps", "location_source", "is_moving", "tracking_active",
+        "background_tracking_enabled", "device_id", "device_type", "network_type",
+    ):
+        value = getattr(body, field)
+        if value is not None:
+            live_values[field] = value
+    if client is not None and client.ip:
+        live_values["ip_address"] = client.ip
+
+    live = await crud.upsert_live_location(db, user=user, values=live_values)
+    await crud.record_location_ping(db, user=user, values={
+        "coordinates": coordinates,
+        "recorded_at": recorded_at,
+        "place_id": body.place_id,
+        "accuracy_m": body.accuracy_m,
+        "altitude_m": body.altitude_m,
+        "heading_deg": body.heading_deg,
+        "speed_mps": body.speed_mps,
+        "location_source": body.location_source,
+        "device_id": body.device_id,
+    })
+
+    if not user.is_location_set:
+        user.is_location_set = True
+    await db.flush()
+    logger.info(
+        "users.location_recorded",
+        user_id=user.id, source=body.location_source, accuracy_m=body.accuracy_m,
+    )
+    return live
+
+
+async def get_live_location(db: AsyncSession, user_id: int) -> Any:
+    """The user's last known position, or ``None`` if they never reported one."""
+    return await crud.get_live_location(db, user_id)
+
+
+async def refresh_primary_place(db: AsyncSession, user_id: int) -> int | None:
+    """Re-point ``users.primary_place_id`` at the user's primary live address.
+
+    ``primary_place_id`` is a CACHE of the address book, kept so a user list can
+    show a place without joining `geo`. This is the ONE function that writes it;
+    the geo address service calls it whenever a user's links change, so the two
+    can only disagree for the length of a transaction.
+    """
+    place_id = await db.scalar(text(
+        "SELECT place_id FROM geo.place_links "
+        "WHERE owner_type = 'user' AND owner_id = :user_id "
+        "  AND is_primary AND valid_to IS NULL AND deleted_at IS NULL "
+        "ORDER BY updated_at DESC LIMIT 1"
+    ), {"user_id": user_id})
+    user = await crud.get_by_id(db, user_id)
+    if user is not None and user.primary_place_id != place_id:
+        user.primary_place_id = place_id
+        await db.flush()
+    return place_id
+
+
 # ── Profile & Localization (auto-unless-overridden) ───────────────────────────
 
 async def get_or_create_profile(
@@ -525,14 +660,25 @@ async def get_or_create_profile(
     initial_country: str | None = None,
     initial_timezone: str | None = None,
 ) -> UserProfile:
-    """Retrieve existing UserProfile or initialize with detected or default localization."""
+    """Retrieve existing UserProfile or initialize with detected or default localization.
+
+    Defaults are only applied when the referenced country/timezone actually
+    exists in the (global) reference tables, so a registration never fails on a
+    foreign key just because the reference data has not been seeded.
+    """
     stmt = select(UserProfile).where(UserProfile.user_id == user_id)
     profile = await db.scalar(stmt)
     if profile is None:
+        country_iso2 = initial_country or "IN"
+        if not await db.scalar(select(Country.iso2).where(Country.iso2 == country_iso2)):
+            country_iso2 = None
+        tz_name = initial_timezone or "Asia/Kolkata"
+        if not await db.scalar(select(Timezone.iana_name).where(Timezone.iana_name == tz_name)):
+            tz_name = None
         profile = UserProfile(
             user_id=user_id,
-            country_iso2=initial_country or "IN",
-            timezone_name=initial_timezone or "Asia/Kolkata",
+            country_iso2=country_iso2,
+            timezone_name=tz_name,
             timezone_source=TimezoneSource.auto,
         )
         db.add(profile)
@@ -561,7 +707,6 @@ async def set_user_country(db: AsyncSession, profile: UserProfile, country_iso2:
 
     user = await crud.get_by_id(db, profile.user_id)
     if user:
-        user.country = country.name
         user.country_code = country.iso2
         if profile.timezone_name:
             user.timezone = profile.timezone_name

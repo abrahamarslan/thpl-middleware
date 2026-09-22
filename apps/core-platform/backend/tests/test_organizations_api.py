@@ -30,9 +30,12 @@ async def test_building_a_tree_and_reading_it_back(worlds):
     assert entity["hierarchy_path"] == f"/{holding['uuid']}/{entity['uuid']}/"
     assert entity["parent_uuid"] == holding["uuid"] and entity["created_by_name"] == "ACME Admin"
 
+    # The world's own HQ (users are organization-scoped, so `worlds` creates one)
+    # is a root beside the tree this test builds.
     tree = (await client.get("/api/organizations/tree", headers=acme.auth(acme.member))).json()["data"]
-    assert [n["org_code"] for n in tree] == ["ACME-H"]
-    assert tree[0]["children"][0]["children"][0]["children"][0]["org_code"] == "ACME-AMD-2"
+    assert {n["org_code"] for n in tree} == {"ACME-HQ", "ACME-H"}
+    built = next(n for n in tree if n["org_code"] == "ACME-H")
+    assert built["children"][0]["children"][0]["children"][0]["org_code"] == "ACME-AMD-2"
 
     ancestors = (await client.get(f"/api/organizations/{branch['uuid']}/ancestors",
                                   headers=acme.auth(acme.member))).json()["data"]
@@ -144,7 +147,9 @@ async def test_tenants_are_isolated(worlds):
     client, acme, globex = worlds
     acme_org = await node(client, acme, org_code="SECRET", legal_name="Acme Secret")
     seen = (await client.get("/api/organizations", headers=globex.auth(globex.member))).json()["data"]
-    assert seen == []
+    # GLOBEX sees its own HQ and nothing of ACME's — not an empty list, because
+    # every world now has an organization (users are organization-scoped).
+    assert [o["org_code"] for o in seen] == ["GLOBEX-HQ"]
     assert (await client.get(f"/api/organizations/{acme_org['uuid']}",
                              headers=globex.auth(globex.member))).status_code == 404
     header = globex.auth(globex.member, **{"X-Organization-Id": acme_org["uuid"]})

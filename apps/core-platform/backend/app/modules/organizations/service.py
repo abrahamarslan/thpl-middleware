@@ -185,6 +185,10 @@ async def create_organization(db: AsyncSession, body: OrganizationCreate, *, act
         org.depth = parent.depth + 1
     db.add(org)
     await db.flush()
+    # Roles are organization-scoped: seed the system roles for the new org.
+    from app.modules.roles.service import seed_system_roles
+
+    await seed_system_roles(db, org.id)
     await record_activity(
         db, action="organization_created", actor_id=actor_id, subject_type="Organization", subject_id=org.id,
         changes={"after": {"org_code": org.org_code, "org_type": org.org_type,

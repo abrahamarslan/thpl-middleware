@@ -8,7 +8,14 @@ from app.modules.users.model import User
 
 
 async def platform_admin(db, acme) -> User:
-    root = User(name="Platform Root", email="root@platform.example", password="x", tenant_id=acme.tenant.id)
+    """A platform admin is still a user of some organization.
+
+    Platform-admin rights come from ``PLATFORM_ADMIN_EMAILS``, not from where
+    the row lives, but ``users.organization_id`` is NOT NULL — so the root user
+    sits in the world's own HQ like everyone else.
+    """
+    root = User(name="Platform Root", email="root@platform.example", password="x",
+                tenant_id=acme.tenant.id, organization_id=acme.organization.id)
     db.add(root)
     await db.commit()
     return root
@@ -17,9 +24,11 @@ async def platform_admin(db, acme) -> User:
 async def test_platform_admin_creates_a_tenant_with_its_root_organization(worlds, db):
     client, acme, _ = worlds
     root = await platform_admin(db, acme)
+    # Never the deployment's own code: the migration seeds DEFAULT_TENANT_CODE
+    # (`.env`, THPL here), so reusing it is a 409 from the fixture, not a bug.
     response = await client.post("/api/tenants", headers=acme.auth(root), json={
-        "tenant_code": "THPL", "name": "Tarrina Health", "primary_contact_email": "it@tarrinahealth.com",
-        "root_organization_name": "Tarrina Health Private Limited",
+        "tenant_code": "NEWCO", "name": "Newco Health", "primary_contact_email": "it@newco.example",
+        "root_organization_name": "Newco Health Private Limited",
     })
     assert response.status_code == 201, response.text
     tenant = response.json()["data"]
@@ -27,10 +36,10 @@ async def test_platform_admin_creates_a_tenant_with_its_root_organization(worlds
 
     org = await db.scalar(select(Organization).where(Organization.tenant_id == tenant["id"])
                           .execution_options(all_tenants=True))
-    assert org.org_code == "THPL" and org.parent_id is None and org.org_type == "legal_entity"
+    assert org.org_code == "NEWCO" and org.parent_id is None and org.org_type == "legal_entity"
 
     dup = await client.post("/api/tenants", headers=acme.auth(root), json={
-        "tenant_code": "THPL", "name": "x", "primary_contact_email": "x@x.example"})
+        "tenant_code": "NEWCO", "name": "x", "primary_contact_email": "x@x.example"})
     assert dup.status_code == 409
 
 
@@ -87,7 +96,10 @@ async def test_a_role_in_use_cannot_be_deleted(worlds, db):
     assert response.status_code == 422 and "still hold" in response.json()["msg"]
 
 
-async def test_a_user_cannot_hold_another_tenants_role(worlds, db):
+async def test_a_user_cannot_hold_another_organizations_role(worlds, db):
+    """Roles are organization-scoped, so the FK is three columns wide:
+    ``(tenant_id, organization_id, role_id)`` → ``roles``. Another tenant's role
+    fails on it, and so would another organization's role of the same tenant."""
     from sqlalchemy.exc import IntegrityError
 
     from app.modules.roles.model import Role
@@ -96,6 +108,6 @@ async def test_a_user_cannot_hold_another_tenants_role(worlds, db):
     globex_admin_role = await db.scalar(select(Role).where(Role.tenant_id == globex.tenant.id, Role.code == "admin")
                                         .execution_options(all_tenants=True))
     acme.member.role_id = globex_admin_role.id
-    with pytest.raises(IntegrityError, match="fk_users_tenant_role"):
+    with pytest.raises(IntegrityError, match="fk_users_tenant_org_role"):
         await db.commit()
     await db.rollback()

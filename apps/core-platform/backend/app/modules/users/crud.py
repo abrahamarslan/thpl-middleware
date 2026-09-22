@@ -2,10 +2,19 @@
 
 from datetime import UTC, datetime
 
+from geoalchemy2 import WKTElement
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.users.model import LoginOtpToken, PasswordResetToken, User
+from app.modules.geo.model import Place, PlaceLink
+from app.modules.users.model import (
+    LoginOtpToken,
+    PasswordResetToken,
+    User,
+    UserLiveLocation,
+    UserLocationPing,
+)
 
 
 def _base_query(include_deleted: bool = False) -> Select:
@@ -44,6 +53,7 @@ async def list_users(
     status: str | None = None,
     user_type: str | None = None,
     role_id: int | None = None,
+    country_code: str | None = None,
     city: str | None = None,
     state: str | None = None,
     country: str | None = None,
@@ -72,12 +82,31 @@ async def list_users(
         query = query.where(User.user_type == user_type)
     if role_id is not None:
         query = query.where(User.role_id == role_id)
-    if city:
-        query = query.where(User.city == city)
-    if state:
-        query = query.where(User.state == state)
-    if country:
-        query = query.where(User.country == country)
+    if country_code:
+        query = query.where(User.country_code == country_code)
+    # City/state/country moved off the users row onto the address book: they are
+    # a property of the user's live address links, not of the user. EXISTS keeps
+    # it one row per user no matter how many addresses match.
+    if city or state or country:
+        address = (
+            select(PlaceLink.id)
+            .join(Place, Place.id == PlaceLink.place_id)
+            .where(
+                PlaceLink.owner_type == "user",
+                PlaceLink.owner_id == User.id,
+                PlaceLink.deleted_at.is_(None),
+                PlaceLink.valid_to.is_(None),
+            )
+        )
+        if city:
+            address = address.where(Place.city.ilike(city))
+        if state:
+            address = address.where(Place.state.ilike(state))
+        if country:
+            address = address.where(
+                or_(Place.country.ilike(country), Place.country_code == country.upper())
+            )
+        query = query.where(address.exists())
 
     total = await db.scalar(select(func.count()).select_from(query.subquery())) or 0
 
@@ -132,6 +161,72 @@ async def restore(db: AsyncSession, user: User) -> User:
 async def hard_delete(db: AsyncSession, user: User) -> None:
     await db.delete(user)
     await db.flush()
+
+
+# ── Location telemetry ────────────────────────────────────────────────────────
+# Two tables, two write shapes: `user_live_locations` is one row per user,
+# upserted on every fix; `user_location_pings` is append-only history. Both are
+# written with Core statements (not the ORM) so a burst of fixes never drags a
+# user object through the identity map — and because the upsert must be a single
+# `INSERT ... ON CONFLICT` round trip, which is the whole point of the table.
+
+
+def point(latitude: float, longitude: float) -> WKTElement:
+    """WGS84 point. PostGIS is (longitude, latitude) — the inverse of how the
+    wire format reads, which is the single most common bug in this area."""
+    return WKTElement(f"POINT({longitude} {latitude})", srid=4326)
+
+
+async def upsert_live_location(db: AsyncSession, *, user: User, values: dict) -> UserLiveLocation:
+    """Write the user's last known position (insert or update, one statement)."""
+    row = {
+        "tenant_id": user.tenant_id,
+        "organization_id": user.organization_id,
+        "user_id": user.id,
+        **values,
+    }
+    statement = pg_insert(UserLiveLocation).values(**row)
+    # The conflict target is uq_user_live_locations_user. Only the columns the
+    # caller actually sent are overwritten, so a fix carrying no speed does not
+    # erase the speed of the previous one.
+    statement = statement.on_conflict_do_update(
+        index_elements=[UserLiveLocation.tenant_id, UserLiveLocation.user_id],
+        set_={
+            **{key: statement.excluded[key] for key in values},
+            "organization_id": statement.excluded.organization_id,
+            "received_at": func.now(),
+            "updated_at": func.now(),
+        },
+    ).returning(UserLiveLocation)
+    result = await db.execute(statement)
+    return result.scalar_one()
+
+
+async def record_location_ping(db: AsyncSession, *, user: User, values: dict) -> None:
+    """Append one fix to the partitioned history."""
+    await db.execute(
+        pg_insert(UserLocationPing).values(
+            tenant_id=user.tenant_id,
+            organization_id=user.organization_id,
+            user_id=user.id,
+            **values,
+        )
+    )
+
+
+async def get_live_location(db: AsyncSession, user_id: int) -> UserLiveLocation | None:
+    return await db.scalar(select(UserLiveLocation).where(UserLiveLocation.user_id == user_id))
+
+
+async def list_location_pings(
+    db: AsyncSession, user_id: int, *, since: datetime | None = None, limit: int = 100,
+) -> list[UserLocationPing]:
+    """Most recent fixes first. Bounded by `limit` — this table is unbounded."""
+    query = select(UserLocationPing).where(UserLocationPing.user_id == user_id)
+    if since is not None:
+        query = query.where(UserLocationPing.recorded_at >= since)
+    query = query.order_by(UserLocationPing.recorded_at.desc()).limit(limit)
+    return list((await db.scalars(query)).all())
 
 
 # ── Password reset tokens ─────────────────────────────────────────────────────

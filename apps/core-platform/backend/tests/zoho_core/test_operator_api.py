@@ -113,8 +113,11 @@ async def test_record_history_endpoint(operator_client, db):
     response = await operator_client.get("/api/zoho/admin/records/organizations/10229182/events?by=zoho")
     assert response.status_code == 200, response.text
     events = response.json()["data"]
-    assert [e["event_type"] for e in events] == ["inserted"]
-    assert events[0]["zoho_id"] == "10229182"
+    # `organizations` is FULL + inline detail: the listed row is written first
+    # and completed from the detail document, so a first sync is insert-then-
+    # update. Newest first.
+    assert [e["event_type"] for e in events] == ["updated", "inserted"]
+    assert {e["zoho_id"] for e in events} == {"10229182"}
 
     unknown = await operator_client.get("/api/zoho/admin/records/not_a_module/1/events")
     assert unknown.status_code == 404

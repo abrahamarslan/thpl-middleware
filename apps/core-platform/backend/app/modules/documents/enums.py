@@ -122,6 +122,8 @@ class DocumentLinkableType(str, enum.Enum):
     ORGANIZATION = "organization"
     HUB = "hub"
     BRAND_OWNER = "brand_owner"
+    BRAND = "brand"
+    MANUFACTURER = "manufacturer"
     EMAIL = "email"
     OTHER = "other"
 

@@ -9,33 +9,12 @@ Conventions:
 """
 
 from datetime import UTC, date, datetime
-from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.modules.users.password_policy import PasswordStr
-
-GEO_FIELDS = (
-    "location", "current_location", "route_points", "coordinates",
-    "constituency_geometry", "sub_constituency_geometry",
-    "assembly_constituency_geometry", "parliamentary_constituency_geometry",
-    "pincode_geometry", "taluka_geometry", "district_geometry",
-    "city_geometry", "state_geometry", "country_geometry",
-)
-
-
-def _wkb_to_wkt(value: Any) -> Any:
-    """Convert a geoalchemy2 WKBElement to a WKT string for API output."""
-    if value is None or isinstance(value, str):
-        return value
-    try:
-        from geoalchemy2.shape import to_shape
-
-        return to_shape(value).wkt
-    except Exception:  # pragma: no cover - unparseable geometry
-        return None
 
 
 class UserProfileBase(BaseModel):
@@ -147,88 +126,13 @@ class UserProfileBase(BaseModel):
     application_settings: dict | None = None
     default_language: str | None = None
 
-    # == Location (textual) ==
-    constituency: str | None = None
-    sub_constituency: str | None = None
-    assembly_constituency: str | None = None
-    parliamentary_constituency: str | None = None
-    pincode: str | None = None
-    street_address: str | None = None
-    landmark: str | None = None
-    village_town: str | None = None
-    taluka: str | None = None
-    district: str | None = None
-    city: str | None = None
-    state: str | None = None
-    postal_code: str | None = None
-    country: str | None = None
+    # == Location (address/coordinates live in geo; only caches/pointers here) ==
     country_code: str | None = Field(None, max_length=2, description="ISO 3166-1 alpha-2 country code")
+    primary_place_id: int | None = None
 
-    # == Location (geospatial — WKT strings, SRID 4326, lng/lat) ==
-    location: str | None = None
-    current_location: str | None = None
-    route_points: str | None = None
-    coordinates: str | None = None
-    constituency_geometry: str | None = None
-    sub_constituency_geometry: str | None = None
-    assembly_constituency_geometry: str | None = None
-    parliamentary_constituency_geometry: str | None = None
-    pincode_geometry: str | None = None
-    taluka_geometry: str | None = None
-    district_geometry: str | None = None
-    city_geometry: str | None = None
-    state_geometry: str | None = None
-    country_geometry: str | None = None
-
-    # == Location (coordinates & IDs) ==
-    latitude: Decimal | None = None
-    longitude: Decimal | None = None
-    current_pincode: str | None = None
-    current_location_latitude: str | None = None
-    current_location_longitude: str | None = None
-    constituency_latitude: Decimal | None = None
-    constituency_longitude: Decimal | None = None
-    district_latitude: Decimal | None = None
-    district_longitude: Decimal | None = None
-    taluka_latitude: Decimal | None = None
-    taluka_longitude: Decimal | None = None
-    city_latitude: Decimal | None = None
-    city_longitude: Decimal | None = None
-    state_latitude: Decimal | None = None
-    state_longitude: Decimal | None = None
-    country_latitude: Decimal | None = None
-    country_longitude: Decimal | None = None
-    postal_code_latitude: Decimal | None = None
-    postal_code_longitude: Decimal | None = None
-    constituency_geonameId: str | None = None
-    sub_constituency_geonameId: str | None = None
-    assembly_constituency_geonameId: str | None = None
-    parliamentary_constituency_geonameId: str | None = None
-    pincode_geonameId: str | None = None
-    taluka_geonameId: str | None = None
-    district_geonameId: str | None = None
-    city_geonameId: str | None = None
-    state_geonameId: str | None = None
-    country_geonameId: str | None = None
-
-    # == Tracking metadata ==
-    altitude: Decimal | None = None
-    altitude_accuracy: float | None = None
-    heading: float | None = None
-    speed: float | None = None
-    location_accuracy: str | None = None
-    location_source: str | None = None
-    location_timestamp: datetime | None = None
-    location_timezone: str | None = None
-    location_ip: str | None = None
-    geocode: dict | None = None
-    recorded_at: datetime | None = None
-    last_tracked_at: datetime | None = None
+    # == Device metadata (auth/device binding) ==
     device_id: str | None = None
     device_type: str | None = None
-    network_type: str | None = None
-    is_tracking_active: bool | None = None
-    background_tracking_enabled: bool | None = None
 
     # == Integration IDs ==
     external_id: str | None = None
@@ -289,20 +193,18 @@ class UserOut(UserProfileBase):
     updated_at: datetime | None = None
     deleted_at: datetime | None = None
 
-    @field_validator(*GEO_FIELDS, mode="before")
-    @classmethod
-    def _serialise_geography(cls, v: Any) -> Any:
-        return _wkb_to_wkt(v)
-
 
 class UserListFilters(BaseModel):
     q: str | None = Field(default=None, description="Search in name/email/username/phone")
     status: str | None = None
     user_type: str | None = None
     role_id: int | None = None
-    city: str | None = None
-    state: str | None = None
-    country: str | None = None
+    country_code: str | None = Field(default=None, description="Cached ISO2 on the user row")
+    # Resolved through the address book (geo.place_links → geo.places), not off
+    # the user row — those columns are gone.
+    city: str | None = Field(default=None, description="Matches any live address of the user")
+    state: str | None = Field(default=None, description="Matches any live address of the user")
+    country: str | None = Field(default=None, description="Address country name or ISO2 code")
     include_deleted: bool = False
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=50, ge=1, le=200)
@@ -499,3 +401,84 @@ class UserProfileOut(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ── Location telemetry ────────────────────────────────────────────────────────
+# The `users` row carries no coordinates any more: the last known fix lives in
+# `user_live_locations` and the history in the partitioned `user_location_pings`
+# (docs/analysis-report/user-new-architecture.md §10.4). Latitude/longitude are
+# the wire format; PostGIS geography is the storage format, converted in the
+# service layer exactly as the geo module does.
+
+class LocationUpdate(BaseModel):
+    """One position fix reported by a device."""
+
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    accuracy_m: float | None = Field(default=None, ge=0, description="Horizontal accuracy in metres")
+    altitude_m: float | None = None
+    altitude_accuracy_m: float | None = Field(default=None, ge=0)
+    heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    speed_mps: float | None = Field(default=None, ge=0)
+    location_source: str | None = Field(default=None, pattern="^(gps|network|manual)$")
+    is_moving: bool | None = None
+    tracking_active: bool | None = None
+    background_tracking_enabled: bool | None = None
+    device_id: str | None = Field(default=None, max_length=255)
+    device_type: str | None = Field(default=None, max_length=50)
+    network_type: str | None = Field(default=None, max_length=50)
+    place_id: int | None = Field(default=None, description="Resolved geo.places id, when the caller knows it")
+    recorded_at: datetime | None = Field(
+        default=None, description="Device clock for the fix; defaults to now. Offline queues send the real time."
+    )
+
+    @field_validator("recorded_at", mode="after")
+    @classmethod
+    def _utc(cls, v: datetime | None) -> datetime | None:
+        return _ensure_utc(v)
+
+
+class LiveLocationOut(BaseModel):
+    """The last known position of a user."""
+
+    user_id: int
+    latitude: float | None = None
+    longitude: float | None = None
+    place_id: int | None = None
+    accuracy_m: float | None = None
+    altitude_m: float | None = None
+    altitude_accuracy_m: float | None = None
+    heading_deg: float | None = None
+    speed_mps: float | None = None
+    location_source: str | None = None
+    is_moving: bool | None = None
+    tracking_active: bool = False
+    background_tracking_enabled: bool = False
+    device_id: str | None = None
+    device_type: str | None = None
+    network_type: str | None = None
+    ip_address: str | None = None
+    recorded_at: datetime | None = None
+    received_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @classmethod
+    def from_row(cls, row: Any) -> "LiveLocationOut":
+        """Build from a ``UserLiveLocation``, unpacking the PostGIS point.
+
+        Geography is (longitude, latitude); the wire format is latitude first.
+        Done here, at the schema boundary, the same way the geo module does it —
+        a second conversion convention is how the two drift apart.
+        """
+        out = cls.model_validate(row)
+        point = getattr(row, "coordinates", None)
+        if point is not None:
+            from geoalchemy2.shape import to_shape
+
+            try:
+                shape = to_shape(point)
+                out.longitude, out.latitude = float(shape.x), float(shape.y)
+            except Exception:  # pragma: no cover — unparseable geometry
+                out.longitude = out.latitude = None
+        return out

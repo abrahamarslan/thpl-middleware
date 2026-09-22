@@ -32,13 +32,21 @@ from app.modules.tenants import model as _tenants_model  # noqa: F401
 from app.modules.organizations import model as _organizations_model  # noqa: F401
 from app.modules.roles import model as _roles_model  # noqa: F401
 from app.modules.currencies import model as _currencies_model  # noqa: F401
-from app.modules.zoho_currencies import model as _zoho_currencies_model  # noqa: F401
-from app.modules.taxes import model as _zoho_taxes_model  # noqa: F401
+from app.modules.taxes import model as _taxes_model  # noqa: F401
 from app.modules.locations import model as _zoho_locations_model  # noqa: F401
+from app.modules.entities import model as _entities_model  # noqa: F401
+from app.modules.brands import model as _brands_model  # noqa: F401
+from app.modules.manufacturers import model as _manufacturers_model  # noqa: F401
 from app.modules.zoho_users import model as _zoho_users_model  # noqa: F401
 from app.modules.zoho.sync import models as _zoho_sync_models  # noqa: F401
 from app.modules.sync import models as _sync_models  # noqa: F401
 from app.modules.geo import model as _geo_models  # noqa: F401
+from app.modules.hubs import model as _hubs_model  # noqa: F401
+from app.modules.fleet_partners import model as _fleet_partners_model  # noqa: F401
+from app.modules.vehicles import model as _vehicles_model  # noqa: F401
+from app.modules.compliance import model as _compliance_model  # noqa: F401
+from app.modules.kyc import model as _kyc_model  # noqa: F401
+from app.modules.hr import model as _hr_model  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
@@ -59,7 +67,7 @@ _EXTENSION_TABLES = {"layer", "topology", "spatial_ref_sys"}
 #: Zoho retention task) — autogenerate must neither drop nor recreate them.
 #: ``sync_records`` partitions are per-source and created by migration, but they
 #: are still children and must never be compared as standalone tables.
-_PARTITIONED_PARENTS = ("zoho_sync_events", "sync_records", "sync_payloads")
+_PARTITIONED_PARENTS = ("zoho_sync_events", "sync_records", "sync_payloads", "user_location_pings")
 
 
 def _include_object(obj, name, type_, reflected, compare_to):
@@ -80,7 +88,7 @@ def _include_object(obj, name, type_, reflected, compare_to):
 #: Schemas our migrations own. `include_schemas=True` is needed for the tenancy
 #: tables in org_management; everything else (topology, tiger, …) belongs to
 #: PostGIS extensions and is never compared.
-_OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync"}
+_OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core"}
 
 
 def _include_name(name, type_, parent_names):

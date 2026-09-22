@@ -69,6 +69,18 @@ class SyncContract(BaseModel):
     #: False = today's in-place mirror (ZohoIdentityMixin + ZohoMirrorMixin on
     #: the entity table). True = crosswalk + history.
     crosswalk: bool = False
+    #: Entity columns stamped with the source's own id for this module — the
+    #: Zoho ``currency_id`` / ``tax_id`` / ``organization_id`` landing in a
+    #: ``zoho_id`` column on the row itself.
+    #:
+    #: This is a maintained ECHO, not the identity of record. The crosswalk's
+    #: unique ``(tenant, source, module, external_id)`` is what matching and
+    #: resolution use; the echo exists because a column you can read without a
+    #: join is worth having — ``Organization.org_code`` is literally derived
+    #: from it, and "what does Zoho call this row" is a constant question.
+    #: Keeping it written by the engine (never by hand, never matched on) is
+    #: what stops it drifting into a second, competing identity.
+    identity_echo: tuple[str, ...] = ()
     #: Keep the full document in sync_payloads history. False for high-volume
     #: document modules: history keeps hash + changed fields, and the current
     #: document still lives on the SyncRecord.

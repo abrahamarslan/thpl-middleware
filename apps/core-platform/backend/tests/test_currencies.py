@@ -20,19 +20,18 @@ from app.modules.currencies import service
 from app.modules.currencies.enums import CurrencyKind, values
 from app.modules.currencies.model import Currency
 from app.modules.currencies.schema import CurrencyCreate, ExchangeRateIn
-from app.modules.currencies.scope import CurrencyRuleError
+from app.modules.currencies.scope import CurrencyRuleError, require_organization
 from app.modules.organizations.model import Organization
 
 
 async def _org(db, world) -> Organization:
-    """Each world's tenant needs one organization: currency rows require one."""
-    with tenant_scope(world.tenant.id):
-        org = Organization(org_code=f"{world.tenant.tenant_code}-HQ",
-                           legal_name=f"{world.tenant.name} HQ", tenant_id=world.tenant.id)
-        db.add(org)
-        await db.flush()
-    await db.commit()
-    return org
+    """The world's organization — currency rows require one.
+
+    ``worlds`` builds it now (users are organization-scoped, so every world has
+    an HQ); creating a second one here would collide on
+    ``uq_organizations_code_active``.
+    """
+    return world.organization
 
 
 def _currency(**kw) -> dict:
@@ -164,11 +163,22 @@ async def test_rates_supersede_and_refresh_the_cache(worlds, db):
                               headers=headers)).json()["data"]
     assert Decimal(as_of["rate"]) == Decimal("83.5")
 
-    # Re-posting the same business date updates the row instead of colliding.
-    await client.post(f"/api/currencies/{ref}/rates",
-                      json={"rate": "84.25", "effective_date": "2026-02-01"}, headers=headers)
+    # Re-posting the same business date from the SAME source updates that row
+    # instead of colliding with uq_exchange_rates_currency_date.
+    assert (await client.post(f"/api/currencies/{ref}/rates",
+                              json={"rate": "84.25", "effective_date": "2026-02-01", "rate_source": "rbi"},
+                              headers=headers)).status_code == 201
     rates = (await client.get(f"/api/currencies/{ref}/rates", headers=headers)).json()["data"]
     assert len(rates) == 2 and Decimal(rates[0]["rate"]) == Decimal("84.25")
+
+    # A DIFFERENT source quoting the same day is a row of its own — that is why
+    # rate_source is part of the uniqueness key — and it does not overwrite RBI.
+    assert (await client.post(f"/api/currencies/{ref}/rates",
+                              json={"rate": "84.90", "effective_date": "2026-02-01"},
+                              headers=headers)).status_code == 201
+    rates = (await client.get(f"/api/currencies/{ref}/rates", headers=headers)).json()["data"]
+    same_day = {r["rate_source"]: Decimal(r["rate"]) for r in rates if r["effective_date"] == "2026-02-01"}
+    assert same_day == {"rbi": Decimal("84.25"), "manual": Decimal("84.90")}
 
 
 async def test_a_currency_in_use_is_archived_not_deleted(worlds, db):
@@ -202,12 +212,20 @@ async def test_one_tenant_never_sees_anothers_currency(worlds, db):
     assert listed.json()["data"] == []
 
 
-async def test_a_tenant_without_an_organization_is_told_so(worlds, db):
-    client, _, globex = worlds
-    # No organization is created for globex.
-    refused = await client.post("/api/currencies", json=_currency(), headers=globex.auth(globex.member))
-    assert refused.status_code == 422
-    assert refused.json()["code"] == "currency_rule_violation"
+async def test_a_tenant_without_an_organization_is_told_so(db):
+    """The guard is no longer reachable through the API — a signed-in user always
+    has an organization (``users.organization_id`` is NOT NULL) — but a system
+    context (Celery, a sync run) still binds a tenant with no organization."""
+    from app.modules.tenants.model import Tenant
+
+    bare = Tenant(tenant_code="BARE", name="Bare Ltd", primary_contact_email="ops@bare.example",
+                  status="active")
+    db.add(bare)
+    await db.flush()
+
+    with tenant_scope(bare.id):
+        with pytest.raises(CurrencyRuleError, match="no organization"):
+            await require_organization(db)
 
 
 # ── integration: the database guards ────────────────────────────────────────

@@ -22,7 +22,8 @@ READ   every ORM SELECT / UPDATE / DELETE touching a tenant-bound model gets
        ``tenant_id = :current`` (like the soft-delete filter). Escape hatch
        for platform code: ``.execution_options(all_tenants=True)``.
 INSERT tenant_id ← context (or the default tenant); organization_id ←
-       context when unset; created_by / created_by_name ← actor;
+       context when unset (or DEFAULT_ORGANIZATION_CODE within the default
+       tenant); created_by / created_by_name ← actor;
        app_version ← settings.VERSION.
 UPDATE updated_by / updated_by_name ← actor (only when a user is acting);
        app_version ← settings.VERSION.
@@ -117,15 +118,22 @@ def system_actor(component: str) -> Actor:
     return Actor(None, f"system:{component}")
 
 
-# ── default tenant ──────────────────────────────────────────────────────────
+# ── default tenant + organization ───────────────────────────────────────────
 
 _default_cache: dict[str, int] = {}
+_default_org_cache: dict[tuple[int, str], int | None] = {}
 
 
 def _default_code() -> str:
     from app.core.conf import settings
 
     return settings.DEFAULT_TENANT_CODE
+
+
+def _default_org_code() -> str:
+    from app.core.conf import settings
+
+    return settings.DEFAULT_ORGANIZATION_CODE
 
 
 def default_tenant_id_sync(session: Session) -> int:
@@ -144,6 +152,28 @@ def default_tenant_id_sync(session: Session) -> int:
         )
     _default_cache[code] = int(tenant_id)
     return _default_cache[code]
+
+
+def default_organization_id_sync(session: Session, tenant_id: int) -> int | None:
+    """The default organization's id for a tenant (cached per process).
+
+    ``DEFAULT_ORGANIZATION_CODE`` empty = disabled (returns None: rows stay
+    tenant-wide). Unlike the default tenant, a missing organization is not an
+    error — it simply means the deployment has no single-organization default.
+    """
+    code = _default_org_code()
+    if not code:
+        return None
+    key = (tenant_id, code)
+    if key in _default_org_cache:
+        return _default_org_cache[key]
+    org_id = session.execute(
+        text("SELECT id FROM org_management.organizations "
+             "WHERE tenant_id = :tenant AND org_code = :code AND deleted_at IS NULL"),
+        {"tenant": tenant_id, "code": code},
+    ).scalar()
+    _default_org_cache[key] = int(org_id) if org_id is not None else None
+    return _default_org_cache[key]
 
 
 async def resolve_tenant_id(db, code: str | None = None) -> int:
@@ -170,6 +200,7 @@ async def write_tenant_id(db) -> int:
 
 def clear_default_cache() -> None:
     _default_cache.clear()
+    _default_org_cache.clear()
 
 
 # ── session events ──────────────────────────────────────────────────────────
@@ -220,8 +251,13 @@ def _stamp_rows(session: Session, _flush_context, _instances) -> None:
                     f"from tenant {tenant_id}"
                 )
             if "organization_id" in cols and getattr(obj, "organization_id", None) is None \
-                    and organization_id is not None and type(obj).__name__ != "Organization":
-                obj.organization_id = organization_id
+                    and type(obj).__name__ != "Organization":
+                if organization_id is not None:
+                    obj.organization_id = organization_id
+                elif _default_org_code() and obj.tenant_id == default_tenant_id_sync(session):
+                    # Only the DEFAULT tenant gets the default organization; an
+                    # explicit other-tenant context is never re-scoped.
+                    obj.organization_id = default_organization_id_sync(session, obj.tenant_id)
         if "created_by_name" in cols and getattr(obj, "created_by_name", None) is None:
             obj.created_by_name = actor.name
             if getattr(obj, "created_by", None) is None:
@@ -254,6 +290,7 @@ __all__ = [
     "current_actor",
     "current_organization_id",
     "current_tenant_id",
+    "default_organization_id_sync",
     "default_tenant_id_sync",
     "resolve_tenant_id",
     "system_actor",

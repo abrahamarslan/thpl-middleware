@@ -336,9 +336,12 @@ class ExchangeRate(
         CheckConstraint(f"owner_type IN ({values(CurrencyOwnerType)})", name="chk_exchange_rate_owner_type"),
         CheckConstraint("sync_metadata IS NULL OR jsonb_typeof(sync_metadata) = 'object'",
                         name="chk_exchange_rate_sync_metadata_object"),
-        # One rate per currency per business date among live rows.
+        # One rate per currency per business date PER SOURCE among live rows.
+        # ``rate_source`` joined the key so Zoho and SAP (and an operator) can
+        # each quote the same day without overwriting one another; precedence
+        # decides which one feeds the Currency.exchange_rate cache.
         Index("uq_exchange_rates_currency_date", "tenant_id", "currency_id", "effective_date",
-              unique=True, postgresql_where=text("deleted_at IS NULL")),
+              "rate_source", unique=True, postgresql_where=text("deleted_at IS NULL")),
         Index("ix_exchange_rates_currency_date", "currency_id", "effective_date",
               postgresql_where=text("deleted_at IS NULL")),
         Index("ix_exchange_rates_owner", "tenant_id", "owner_type", "owner_id",
@@ -365,8 +368,22 @@ class ExchangeRate(
     sync_metadata: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), comment="L1 source sync envelope echo (object)")
 
     # ---- rate provenance (open vocabulary, no CHECK) -----------------------
-    rate_source: Mapped[str | None] = mapped_column(Text, comment="zoho / rbi / ecb / manual / ...")
+    # NOT NULL because it is part of the uniqueness key: a NULL there would
+    # make every unsourced rate distinct from every other and let duplicates in.
+    rate_source: Mapped[str] = mapped_column(
+        Text, nullable=False, default="manual", server_default=text("'manual'"),
+        comment="zoho / rbi / ecb / manual / ... (part of the per-day uniqueness key)",
+    )
     rate_type: Mapped[str | None] = mapped_column(Text, comment="e.g. spot / reference / average; NULL = unspecified")
+
+    # ---- source identity (the crosswalk owns currency identity; a rate is a
+    # child row with its own upstream id, so it carries its own echo) --------
+    external_source: Mapped[str | None] = mapped_column(
+        Text, comment="Source system that produced this rate (zoho / sap / ...)",
+    )
+    external_id: Mapped[str | None] = mapped_column(
+        Text, comment="The source's id for this rate, verbatim (e.g. Zoho exchange_rate_id)",
+    )
 
     currency: Mapped["Currency"] = relationship(
         "Currency",

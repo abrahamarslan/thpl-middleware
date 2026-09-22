@@ -8,6 +8,7 @@ from sqlalchemy import select, text
 
 from app.modules.zoho.control.models import ZohoSyncEvent
 from app.modules.organizations.model import Organization
+from app.modules.sync.models import SyncRecord
 from app.modules.zoho.sync.apply import (
     Incoming,
     Outcome,
@@ -178,20 +179,27 @@ async def test_thin_payload_never_overwrites_the_detail_document(db):
     org = await db.scalar(select(Organization))
     assert org.name == "Zillium Renamed"                        # mapped columns follow the newer version
     assert org.address_city == "Palo Alto"                      # missing keys never null a column
-    assert org.zoho_raw["industry_type"] == "Services"          # the detail document is kept
-    assert org.sync_source == "detail_fetch"
-    assert org.zoho_last_modified_time == datetime(2026, 9, 18, 6, 30, tzinfo=UTC)
+
+    # Provenance is the crosswalk's business now; the rule is unchanged.
+    record = await db.scalar(select(SyncRecord).where(SyncRecord.module == "organizations"))
+    assert record.raw["industry_type"] == "Services"            # the detail document is kept
+    assert record.raw_source == "detail_fetch"
+    assert record.source_modified_at == datetime(2026, 9, 18, 6, 30, tzinfo=UTC)
 
 
 async def test_version_and_bookkeeping_columns(db):
     await ZohoSyncEngine(db, client_for(ORG)).run("organizations", "full")
     await db.commit()
     org = await db.scalar(select(Organization))
-    assert org.sync_version == 1 and org.uuid is not None and org.row_version == 1
-    assert org.zoho_raw_hash and org.zoho_raw_synced_at and org.sync_source == "detail_fetch"
+    assert org.uuid is not None and org.row_version >= 1
+    record = await db.scalar(select(SyncRecord).where(SyncRecord.module == "organizations"))
+    # index_then_detail writes twice: the listed row, then the detail over it.
+    assert record.sync_version == 2
+    assert record.raw_hash and record.raw_synced_at and record.raw_source == "detail_fetch"
 
     changed = {**ORG, "name": "New", "last_modified_time": "2026-09-18T13:00:00+0530"}
     await ZohoSyncEngine(db, client_for(changed)).run("organizations", "full")
     await db.commit()
     await db.refresh(org)
-    assert org.sync_version == 2 and org.name == "New"
+    await db.refresh(record)
+    assert record.sync_version == 4 and org.name == "New"

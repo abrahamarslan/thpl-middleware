@@ -8,12 +8,12 @@ from sqlalchemy import func, select
 from app.modules.zoho.control.config import zoho_config
 from app.modules.zoho.control.models import RunStatus, ZohoSyncCursor, ZohoSyncRun
 from app.modules.zoho.core.errors import ZohoTransientError
-from app.modules.taxes.model import ZohoTax
+from app.modules.taxes.model import TaxComponent
 from app.modules.zoho.sync.registry import sync_registry
 from app.tasks.zoho_sync import execute_leased_run
 from tests.zoho_sync.fake_client import FakeZohoClient
 
-TAXES = [{"tax_id": str(1000 + i), "tax_name": f"Tax {i}", "tax_percentage": i} for i in range(3)]
+TAXES = [{"tax_id": str(1000 + i), "tax_name": f"Tax {i}", "tax_percentage": i, "tax_type": "tax"} for i in range(3)]
 
 
 class PagedClient(FakeZohoClient):
@@ -41,7 +41,7 @@ async def run_manual(db, client):
 
 
 async def tax_count(db) -> int:
-    return int(await db.scalar(select(func.count()).select_from(ZohoTax)))
+    return int(await db.scalar(select(func.count()).select_from(TaxComponent)))
 
 
 async def cursor(db) -> ZohoSyncCursor:

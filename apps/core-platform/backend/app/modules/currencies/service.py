@@ -56,6 +56,72 @@ def _stringify(values: dict) -> dict:
     return {k: (v.value if hasattr(v, "value") else v) for k, v in values.items()}
 
 
+# ── external sources: what an integration owns, and what we send it ─────────
+
+async def sources_for(db: AsyncSession, currency: Currency) -> list[dict[str, Any]]:
+    """Which external systems this currency is linked to, and what they call it.
+
+    Reads the crosswalk (``sync.sync_records``) — the canonical row carries no
+    source ids, which is what lets a third source cost zero migrations here.
+    """
+    from app.modules.sync.crosswalk import by_entity
+
+    rows = (await db.execute(by_entity(
+        tenant_id=currency.tenant_id,
+        entity_table=Currency.__table__.fullname,
+        entity_ids=[currency.id],
+    ))).all()
+    return [
+        {"source_system": source, "module": module, "external_id": external_id, "link_state": link_state}
+        for source, module, external_id, _entity_id, link_state in rows
+    ]
+
+
+async def _refuse_source_owned_edits(
+    db: AsyncSession, currency: Currency, changes: dict[str, Any]
+) -> None:
+    """A field an integration feeds is not a field a user may edit.
+
+    Allowing it produces the worst kind of bug: the edit saves, the user sees it
+    applied, and the next sync silently reverts it. Better to refuse with the
+    field names and say who owns them.
+    """
+    from app.modules.currencies.zoho.translator import ZOHO_OWNED_CURRENCY_FIELDS
+
+    owned = ZOHO_OWNED_CURRENCY_FIELDS & set(changes)
+    if not owned:
+        return
+    links = await sources_for(db, currency)
+    if not links:
+        return
+    systems = sorted({link["source_system"] for link in links})
+    raise CurrencyRuleError(
+        f"{', '.join(sorted(owned))} {'is' if len(owned) == 1 else 'are'} maintained by "
+        f"{', '.join(systems)} and would be overwritten by the next sync. "
+        "Change it in the source system, or unlink this currency first.",
+        data={"owned_fields": sorted(owned), "sources": systems},
+    )
+
+
+def to_zoho_payload(currency: Currency, *, create: bool = False) -> dict[str, Any]:
+    """This currency as the body Zoho's currency endpoints expect.
+
+    The outbound half of the anti-corruption layer: the caller never assembles
+    Zoho JSON by hand, and read-only attributes (the id Zoho owns, the name it
+    computes, the base-currency flag it derives) are structurally excluded
+    rather than remembered.
+
+    Raises ``TranslationError`` when a required create argument is missing, so
+    a payload Zoho would reject costs nothing instead of an API call.
+    """
+    from app.modules.currencies.zoho.translator import CURRENCY_TRANSLATOR
+    from app.modules.sync.translation import WriteIntent
+
+    return CURRENCY_TRANSLATOR.encode(
+        currency, intent=WriteIntent.CREATE if create else WriteIntent.UPDATE
+    )
+
+
 # ── currencies ──────────────────────────────────────────────────────────────
 
 async def list_currencies(
@@ -113,6 +179,7 @@ async def update_currency(
     currency = await get_currency(db, ref)
     _check_version(currency, body.row_version, f"Currency '{currency.currency_code or currency.uuid}'")
     changes = _stringify(body.model_dump(exclude_unset=True, exclude={"row_version"}))
+    await _refuse_source_owned_edits(db, currency, changes)
 
     before = {k: getattr(currency, k, None) for k in changes}
     for field, value in changes.items():
@@ -215,9 +282,10 @@ async def add_exchange_rate(
     currency = await get_currency(db, ref)
     organization_id = await require_organization(db)
 
-    # One rate per currency per business date: re-posting the same date updates
-    # the existing row rather than colliding with the partial unique index.
-    existing = await crud.get_rate_for_date(db, currency.id, body.effective_date)
+    # One rate per currency per business date PER SOURCE: re-posting the same
+    # date from the same source updates that row rather than colliding with the
+    # partial unique index; a different source gets a row of its own.
+    existing = await crud.get_rate_for_date(db, currency.id, body.effective_date, body.rate_source)
     if existing is not None:
         existing.rate = body.rate
         existing.rate_source = body.rate_source

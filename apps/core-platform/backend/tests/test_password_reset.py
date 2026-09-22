@@ -24,6 +24,7 @@ async def _make_user(db, email: str, *, username: str | None = None, phone: str 
         username=username,
         phone=phone,
         password=hash_password("0ldPassw0rd"),
+        organization_id=(await service.resolve_user_organization(db)).organization_id,
     )
     db.add(user)
     await db.flush()

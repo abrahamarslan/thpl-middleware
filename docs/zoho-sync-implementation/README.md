@@ -52,7 +52,7 @@ doc is stale — both are defects.
 | Worker event loop (ADR‑3) | [`worker-event-loop.md`](worker-event-loop.md) | ✅ live | `app/tasks/_loop.py` |
 | Adapter: organizations | [`adapters/organizations.md`](adapters/organizations.md) | ✅ live (moved) | `app/modules/organizations/` |
 | Adapter: currencies (O1) | [`adapters/currencies.md`](adapters/currencies.md) | ✅ live (pull) | `app/modules/currencies/`, migration `91e970e99176` |
-| Adapter: taxes (O1) | [`adapters/taxes.md`](adapters/taxes.md) | ✅ live (pull) | `app/modules/taxes/`, migration `91e970e99176` |
+| Adapter: taxes (O1) — the `tax` schema | [`adapters/taxes.md`](adapters/taxes.md) | ✅ live (pull): taxes, exemptions · ⏸ tax groups (no list endpoint) | `app/modules/taxes/`, migration `62303d9097fe` |
 | Adapter: locations (O1) | [`adapters/locations.md`](adapters/locations.md) | ✅ live (pull) | `app/modules/locations/`, migration `e6e42c16c52e` |
 | Adapter: Zoho users (O1) | [`adapters/users.md`](adapters/users.md) | ✅ live (pull) | `app/modules/zoho_users/`, migration `e6e42c16c52e` |
 | Import contracts (dependency rules) | [`package-by-feature.md`](package-by-feature.md) §3 | ✅ enforced by tests | `.importlinter`, `tests/test_import_contracts.py` |

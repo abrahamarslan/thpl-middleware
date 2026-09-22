@@ -10,7 +10,6 @@ Every auth entry point resolves request audit context (IP/device/GeoIP) via
 ClientInfoDep; see docs/modules/auth-module-documentation.md.
 """
 
-import secrets
 from dataclasses import asdict
 
 from fastapi import APIRouter, Query
@@ -22,7 +21,7 @@ from app.common.security.jwt import create_access_token
 from app.core.conf import settings
 from app.database.db import DBSession
 from app.modules.users import login_otp, moderation, service
-from app.modules.users.deps import CurrentUser
+from app.modules.users.deps import CurrentUser, OrganizationCode
 from app.modules.users.password_policy import get_password_policy
 from app.modules.users.schema import (
     BanRequest,
@@ -31,6 +30,8 @@ from app.modules.users.schema import (
     CountryTimezoneOut,
     ForgotPasswordOut,
     ForgotPasswordRequest,
+    LiveLocationOut,
+    LocationUpdate,
     LoginOtpRequest,
     LoginOtpVerifyRequest,
     LoginRequest,
@@ -58,8 +59,17 @@ me_router = APIRouter()
 # ════════════════════════════════ AUTH ════════════════════════════════════════
 
 @auth_router.post("/register", response_model=ResponseModel[UserOut], status_code=201)
-async def register(db: DBSession, body: RegisterRequest, client: ClientInfoDep):
-    user = await service.register(db, body, client=client)
+async def register(
+    db: DBSession, body: RegisterRequest, client: ClientInfoDep, org_code: OrganizationCode = None,
+):
+    """Create an account.
+
+    Registration is unauthenticated, so the organization comes from
+    `X-Organization-Code` or — when it is omitted — the deployment's configured
+    default (`DEFAULT_ORGANIZATION_CODE` in `DEFAULT_TENANT_CODE`). With neither,
+    the request is refused with `organization_required` rather than guessed.
+    """
+    user = await service.register(db, body, client=client, org_code=org_code)
     return ResponseModel.ok(
         data=UserOut.model_validate(user),
         module="users",
@@ -163,20 +173,7 @@ async def dev_token(db: DBSession):
     """
     if not settings.DEBUG:
         raise ForbiddenError("dev-token is only available when DEBUG=true")
-    from app.modules.users import crud
-    from app.modules.users.service import hash_password
-
-    user = await crud.get_by_email(db, "dev@local.test")
-    if user is None:
-        user = await crud.create(
-            db,
-            {
-                "email": "dev@local.test",
-                "username": "dev",
-                "name": "Dev Token User",
-                "password": hash_password(secrets.token_urlsafe(24)),  # unusable for login
-            },
-        )
+    user = await service.get_or_create_dev_user(db)
     return ResponseModel(
         data={"access_token": create_access_token(str(user.id), claims={"scope": "dev"})}
     )
@@ -305,6 +302,44 @@ async def update_my_profile(db: DBSession, user: CurrentUser, body: UserProfileU
         module="users",
         msg_key="profile_updated",
     )
+
+
+# ════════════════════════════════ ME / LOCATION ══════════════════════════════
+# The user's position lives in `user_live_locations` / `user_location_pings`,
+# not on the users row. Addresses are NOT here: they go through the platform-wide
+# address book at `/api/addresses` with `owner_type=user` — one address API for
+# every entity, not one per module.
+
+@me_router.patch("/location", response_model=ResponseModel[LiveLocationOut])
+@auth_router.patch("/me/location", response_model=ResponseModel[LiveLocationOut])
+async def update_my_location(
+    db: DBSession, user: CurrentUser, body: LocationUpdate, client: ClientInfoDep
+):
+    """Report the authenticated user's current position (one fix).
+
+    Called on every GPS update from FSA/DLP, so it writes only the telemetry
+    tables — never the `users` master row that authentication reads.
+    """
+    live = await service.record_location(db, user, body, client=client)
+    return ResponseModel.ok(
+        data=LiveLocationOut.from_row(live), module="users", msg_key="location_recorded",
+    )
+
+
+@me_router.get("/location", response_model=ResponseModel[LiveLocationOut | None])
+@auth_router.get("/me/location", response_model=ResponseModel[LiveLocationOut | None])
+async def get_my_location(db: DBSession, user: CurrentUser):
+    """The authenticated user's last known position (`null` if never reported)."""
+    live = await service.get_live_location(db, user.id)
+    return ResponseModel(data=LiveLocationOut.from_row(live) if live else None)
+
+
+@users_router.get("/{user_id}/location", response_model=ResponseModel[LiveLocationOut | None])
+async def get_user_location(db: DBSession, _: CurrentUser, user_id: int):
+    """A user's last known position — what dispatch and beat planning read."""
+    await service.get_user(db, user_id)          # 404 for an unknown/other-tenant user
+    live = await service.get_live_location(db, user_id)
+    return ResponseModel(data=LiveLocationOut.from_row(live) if live else None)
 
 
 # ════════════════════════════════ COUNTRIES & TIMEZONES ══════════════════════

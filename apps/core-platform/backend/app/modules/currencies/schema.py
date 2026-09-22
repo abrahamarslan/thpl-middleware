@@ -27,7 +27,10 @@ from app.modules.currencies.enums import (
 class ExchangeRateIn(BaseModel):
     rate: Decimal = Field(..., ge=0, max_digits=15, decimal_places=6)
     effective_date: dt.date
-    rate_source: str | None = Field(None, max_length=50, description="zoho / rbi / ecb / manual / ...")
+    # Part of the per-day uniqueness key and NOT NULL on the table, so it has a
+    # value on every write: an unsourced rate is an operator's, i.e. "manual".
+    rate_source: str = Field("manual", min_length=1, max_length=50,
+                             description="zoho / rbi / ecb / manual / ...")
     rate_type: str | None = Field(None, max_length=50, description="spot / reference / average / ...")
     is_active: bool = True
     sync_metadata: dict | None = None

@@ -7,7 +7,7 @@
     api.py     HTTP at /api/currencies
     scope.py   which organization a new row belongs to
 
-Not to be confused with **``app.modules.zoho_currencies``**, the read-only Zoho
+This IS the Zoho sync target: the engine writes the canonical row here. (The old
 *currency* mirror at ``/api/zoho/currencies``. That module records what Zoho
 said; this one owns the canonical currency and the rate history.
 """

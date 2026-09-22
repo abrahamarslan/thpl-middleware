@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
+from app.database.tenancy import tenant_scope
 from app.main import app
-from app.modules.zoho_currencies.model import ZohoCurrency
-from app.modules.taxes.model import ZohoTax
+from app.modules.currencies.model import Currency, ExchangeRate
+from app.modules.organizations.model import Organization
+from app.modules.sync.models import SyncRecord
+from app.modules.taxes.model import TaxComponent
+from app.modules.tenants.model import Tenant
 from app.modules.users.deps import get_current_user
 from app.modules.zoho.sync.engine import ZohoSyncEngine
 from tests.zoho_sync.fake_client import FakeZohoClient, make_response
@@ -41,18 +45,49 @@ def taxes_client() -> FakeZohoClient:
     return client
 
 
-async def test_currencies_pull_in_one_call_and_then_write_nothing(db):
-    client = currencies_client()
-    report = await ZohoSyncEngine(db, client).run("currencies")
+async def _tenant_org(db):
+    """Currencies land in the canonical master, which requires an organization."""
+    tenant = Tenant(tenant_code="MASTERS", name="Masters Ltd",
+                    primary_contact_email="ops@masters.example", status="active")
+    db.add(tenant)
+    await db.flush()
+    with tenant_scope(tenant.id):
+        org = Organization(org_code="MASTERS-HQ", legal_name="Masters HQ", tenant_id=tenant.id)
+        db.add(org)
+        await db.flush()
     await db.commit()
+    return tenant, org
+
+
+async def test_currencies_pull_into_the_canonical_master_and_then_write_nothing(db):
+    """Currencies is the first crosswalk module: no mirror table, no zoho_* columns."""
+    tenant, org = await _tenant_org(db)
+    client = currencies_client()
+    with tenant_scope(tenant.id, org.id):
+        report = await ZohoSyncEngine(db, client).run("currencies")
+    await db.commit()
+
     assert report.created == 2 and report.pages == 1
     assert len(client.calls) == 1 and client.calls[0]["params"] is None      # not paginated
 
-    inr = await db.scalar(select(ZohoCurrency).where(ZohoCurrency.currency_code == "INR"))
-    assert inr.is_base_currency is True and inr.zoho_id == "982000000004000"
-    assert inr.sync_source == "list:full" and inr.zoho_raw_hash
+    inr = await db.scalar(select(Currency).where(Currency.currency_code == "INR"))
+    assert inr.is_base_currency is True
+    assert inr.currency_name == "INR- Indian Rupee"       # decoded, not recomputed
 
-    again = await ZohoSyncEngine(db, currencies_client()).run("currencies")
+    # Identity lives in the crosswalk — the canonical row holds no source id.
+    record = await db.scalar(
+        select(SyncRecord).where(SyncRecord.external_id == "982000000004000")
+    )
+    assert record.entity_id == inr.id and record.entity_table == "currency.currencies"
+    assert record.raw_source == "list:full" and record.raw_hash
+
+    # The rate carried inline on the currency payload became history, and the
+    # column on the currency row is only the cache of it.
+    rate = await db.scalar(select(ExchangeRate).where(ExchangeRate.currency_id == inr.id))
+    assert rate.rate_source == "zoho" and rate.effective_date.isoformat() == "2013-09-04"
+
+    with tenant_scope(tenant.id, org.id):
+        again = await ZohoSyncEngine(db, currencies_client()).run("currencies")
     await db.commit()
     assert again.unchanged == 2 and again.created == again.updated == 0
 
@@ -61,7 +96,7 @@ async def test_taxes_pull_across_pages(db):
     report = await ZohoSyncEngine(db, taxes_client()).run("taxes")
     await db.commit()
     assert report.pages == 2 and report.created == 3
-    cgst = await db.scalar(select(ZohoTax).where(ZohoTax.tax_specific_type == "cgst"))
+    cgst = await db.scalar(select(TaxComponent).where(TaxComponent.tax_specific_type == "cgst"))
     assert str(cgst.tax_percentage) == "9.0000"
 
 
@@ -81,16 +116,22 @@ async def api_client(db):
     app.dependency_overrides.clear()
 
 
-async def test_read_endpoints_serve_the_mirror(db, api_client):
-    await ZohoSyncEngine(db, currencies_client()).run("currencies")
-    await ZohoSyncEngine(db, taxes_client()).run("taxes")
+async def test_read_endpoints_serve_the_canonical_masters(db, api_client):
+    """The read endpoints moved with the data.
+
+    ``/api/taxes`` and ``/api/currencies`` serve canonical masters; the
+    ``/api/zoho/*`` mirror routes went with their tables.
+    """
+    tenant, org = await _tenant_org(db)
+    with tenant_scope(tenant.id, org.id):
+        await ZohoSyncEngine(db, taxes_client()).run("taxes")
     await db.commit()
 
-    listed = (await api_client.get("/api/zoho/currencies")).json()["data"]
-    assert [c["currency_code"] for c in listed][0] == "INR"                  # base currency first
-    by_code = (await api_client.get("/api/zoho/currencies/inr")).json()["data"]
-    assert by_code["zoho_id"] == "982000000004000"
-
-    igst = (await api_client.get("/api/zoho/taxes", params={"specific_type": "igst"})).json()["data"]
+    igst = (await api_client.get("/api/taxes", params={"specific_type": "igst"})).json()["data"]
     assert len(igst) == 1 and igst[0]["tax_name"] == "GST18"
-    assert (await api_client.get("/api/zoho/taxes/nope")).status_code == 404
+    # The Zoho id is the crosswalk's, so it resolves the same row without an echo column.
+    fat = (await api_client.get("/api/taxes/982000000566000")).json()["data"]
+    assert fat["id"] == igst[0]["id"] and fat["tax_type"] == "tax"
+    assert [(s["source_system"], s["module"], s["external_id"]) for s in fat["sources"]] == [
+        ("zoho", "taxes", "982000000566000")]
+    assert (await api_client.get("/api/taxes/nope")).status_code == 404

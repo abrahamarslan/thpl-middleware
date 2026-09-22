@@ -147,9 +147,13 @@ class Organization(
     currency_id: Mapped[int | None] = mapped_column(
         # use_alter: currencies → organizations (tenant/org FK) and organizations →
         # currencies form a cycle; the FK is added after both tables exist.
-        BigInteger, ForeignKey("zoho_currencies.id", ondelete="SET NULL", name="fk_organizations_currency",
-                               use_alter=True),
-        comment="Base reporting currency (zoho_currencies.id).",
+        #
+        # Points at the CANONICAL master. It referenced the old ``zoho_currencies``
+        # mirror until currencies moved to the crosswalk architecture; a real sync
+        # run caught the stale target immediately (fk_organizations_currency).
+        BigInteger, ForeignKey("currency.currencies.id", ondelete="SET NULL",
+                               name="fk_organizations_currency", use_alter=True),
+        comment="Base reporting currency (currency.currencies.id).",
     )
     timezone: Mapped[str | None] = mapped_column(
         String(50), comment="Operational IANA timezone, overriding the tenant default.",

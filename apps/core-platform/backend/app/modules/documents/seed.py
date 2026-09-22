@@ -173,6 +173,11 @@ SEED_DOCUMENT_TYPES: list[dict[str, Any]] = [
          category=_P.ENTITY_PROOF, has_expiry=False, agent_type_requirement=_ENTITY_ONLY),
     dict(code="CIN_CERTIFICATE", display_name="Certificate of Incorporation (CIN)",
          category=_P.ENTITY_PROOF, has_expiry=False, agent_type_requirement=_ENTITY_ONLY),
+    dict(code="FLEET_PARTNER_AGREEMENT", display_name="Fleet Partner / Vendor Agreement",
+         category=_P.ENTITY_PROOF, has_expiry=True, default_validity_days=365,
+         agent_type_requirement=_ENTITY_ONLY,
+         regulatory_reference="Signed contract with a third-party fleet/staffing vendor "
+                              "(replaces a raw agreement_storage_key on fleet_partners)"),
 ]
 
 _DEFAULTS: dict[str, Any] = dict(

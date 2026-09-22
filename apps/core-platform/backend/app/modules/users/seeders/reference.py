@@ -9,10 +9,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
-import os
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 
@@ -136,12 +135,19 @@ def seed_country_timezones(
     return len(rows)
 
 
-def run_seed_reference(
-    engine: Engine,
+def seed_reference_on_connection(
+    conn,
     json_path: str = "data/countries/countries.json",
     zone_path: str = "data/timezones/zone1970.tab",
 ) -> dict[str, int]:
-    """Synchronous orchestrator to seed countries, timezones, and mappings."""
+    """Seed countries, timezones and mappings on an OPEN sync connection.
+
+    Taking a connection rather than an engine is what lets this run on an
+    asyncpg-only install: the caller hands it a sync ``Connection`` obtained
+    from ``AsyncConnection.run_sync``. ``requirements.txt`` removed psycopg2 on
+    purpose — asyncpg is the only driver — so a seeder that builds its own sync
+    engine cannot run at all.
+    """
     countries_data = load_countries_data(json_path)
     tz_mapping = build_country_timezones(zone_path)
 
@@ -150,13 +156,22 @@ def run_seed_reference(
     all_timezones.add("Asia/Kolkata")
     all_timezones.add("UTC")
 
-    with engine.begin() as conn:
-        valid_iso2 = seed_countries(conn, countries_data)
-        seed_timezones(conn, all_timezones)
-        mapping_count = seed_country_timezones(conn, tz_mapping, valid_iso2)
+    valid_iso2 = seed_countries(conn, countries_data)
+    seed_timezones(conn, all_timezones)
+    mapping_count = seed_country_timezones(conn, tz_mapping, valid_iso2)
 
     return {
         "countries": len(valid_iso2),
         "timezones": len(all_timezones),
         "mappings": mapping_count,
     }
+
+
+def run_seed_reference(
+    engine: Engine,
+    json_path: str = "data/countries/countries.json",
+    zone_path: str = "data/timezones/zone1970.tab",
+) -> dict[str, int]:
+    """Engine-level wrapper, for callers that already hold a sync engine."""
+    with engine.begin() as conn:
+        return seed_reference_on_connection(conn, json_path=json_path, zone_path=zone_path)

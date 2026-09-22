@@ -31,10 +31,11 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    Numeric,
+    PrimaryKeyConstraint,
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -45,11 +46,12 @@ from app.database.mixins import (
     AppMetaMixin,
     BigIntPKWithUUIDMixin,
     DeactivationMixin,
+    IntPKMixin,
     LedgerMixin,
+    MultiTenantMixin,
     RowVersionMixin,
     SoftDeleteMixin,
     TenantEntityMixin,
-    TenantScopedMixin,
     TimestampMixin,
 )
 
@@ -58,11 +60,12 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, Base):
-    """A person who signs in. Belongs to ONE tenant (``tenant_id``) and optionally a
-    primary organization (``organization_id``); holds a role OF THAT TENANT
-    (composite FK ``(tenant_id, role_id)`` → ``roles``). ``email`` stays globally
-    unique so sign-in needs no tenant picker (docs/tenancy/README.md §6)."""
+class User(MultiTenantMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, Base):
+    """A person who signs in. Belongs to ONE tenant (``tenant_id``) AND one
+    organization (``organization_id``, NOT NULL); holds a role OF THAT
+    ORGANIZATION (composite FK ``(tenant_id, organization_id, role_id)`` →
+    ``roles``). ``email`` stays globally unique so sign-in needs no tenant
+    picker (docs/tenancy/README.md §6)."""
 
     __tablename__ = "users"
 
@@ -187,7 +190,10 @@ class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, 
 
     # == Preferences ==
     language = mapped_column(String(255), nullable=True, default="en", comment="Preferred language code")
-    timezone = mapped_column(String(255), nullable=True, default="Asia/Kolkata", comment="Preferred timezone")
+    timezone = mapped_column(
+        String(64), nullable=True, default="Asia/Kolkata",
+        comment="CACHE of user_profiles.timezone_name (auth emails read it without a join)",
+    )
     date_format = mapped_column(String(255), nullable=True, default="d-m-Y", comment="Preferred date format")
     time_format = mapped_column(String(255), nullable=True, default="H:i", comment="Preferred time format")
     currency = mapped_column(String(255), nullable=True, default="INR", comment="Preferred currency code")
@@ -200,92 +206,23 @@ class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, 
     application_settings = mapped_column(JSONB, nullable=True, comment="JSON object for user-specific application settings")
     default_language = mapped_column(String(10), nullable=True, default="en", comment="Fallback or default language preference")
 
-    # == Location Information (Textual / Administrative) ==
-    constituency = mapped_column(String(255), nullable=True, comment="Name of the political constituency")
-    sub_constituency = mapped_column(String(255), nullable=True, comment="Name of the sub-constituency")
-    assembly_constituency = mapped_column(String(255), nullable=True, comment="Name of the assembly constituency")
-    parliamentary_constituency = mapped_column(String(255), nullable=True, comment="Name of the parliamentary constituency")
-    pincode = mapped_column(String(255), nullable=True, comment="Postal Index Number (PIN) code")
-    street_address = mapped_column(Text, nullable=True, comment="User's street address")
-    landmark = mapped_column(String(255), nullable=True, comment="Nearby landmark for the address")
-    village_town = mapped_column(String(255), nullable=True, comment="Name of the village or town")
-    taluka = mapped_column(String(255), nullable=True, comment="Name of the taluka or sub-district")
-    district = mapped_column(String(255), nullable=True, comment="Name of the district")
-    city = mapped_column(String(255), nullable=True, comment="Name of the city")
-    state = mapped_column(String(255), nullable=True, comment="Name of the state or province")
-    country = mapped_column(String(255), nullable=True, comment="Name of the country")
+    # == Location ==
+    # Addresses and coordinates live in the location hub (geo.place_links →
+    # geo.places); live position lives in `user_live_locations`. The two columns
+    # kept here are caches/pointers for cheap reads.
     country_code = mapped_column(
         String(2),
         nullable=True,
-        comment="ISO 3166-1 alpha-2 country code (e.g. IN, US)",
+        comment="CACHE of user_profiles.country_iso2, for cheap list filtering",
+    )
+    primary_place_id = mapped_column(
+        BigInteger, ForeignKey("geo.places.id", ondelete="SET NULL"), nullable=True,
+        comment="CACHE of the primary address link's place (maintained by the address service)",
     )
 
-    # == Location Information (Geospatial — PostGIS Geography, SRID 4326) ==
-    # geoalchemy2 creates GIST spatial indexes automatically for these columns
-    location = mapped_column(Geography(geometry_type="POINT", srid=4326), nullable=True, comment="Primary geographic location (Point: lng, lat)")
-    current_location = mapped_column(Geography(geometry_type="POINT", srid=4326), nullable=True, comment="Last known current geographic location")
-    route_points = mapped_column(Geography(geometry_type="LINESTRING", srid=4326), nullable=True, comment="Series of geographic points representing a route")
-    constituency_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the constituency")
-    sub_constituency_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the sub-constituency")
-    assembly_constituency_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the assembly constituency")
-    parliamentary_constituency_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the parliamentary constituency")
-    pincode_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary corresponding to the pincode")
-    taluka_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the taluka")
-    district_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the district")
-    city_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the city")
-    state_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the state")
-    country_geometry = mapped_column(Geography(geometry_type="GEOMETRY", srid=4326), nullable=True, comment="Geographic boundary of the country")
-
-    # == Location Information (Coordinates & IDs) ==
-    latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Latitude coordinate")
-    longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Longitude coordinate")
-    coordinates = mapped_column(Geography(geometry_type="POINT", srid=4326), nullable=True, comment="Alternative storage for geographic coordinates")
-    current_pincode = mapped_column(String(20), nullable=True, comment="Pincode associated with the current location")
-    current_location_latitude = mapped_column(String(255), nullable=True, comment="Latitude of the current location")
-    current_location_longitude = mapped_column(String(255), nullable=True, comment="Longitude of the current location")
-    constituency_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the constituency")
-    constituency_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the constituency")
-    district_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the district")
-    district_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the district")
-    taluka_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the taluka")
-    taluka_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the taluka")
-    city_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the city")
-    city_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the city")
-    state_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the state")
-    state_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the state")
-    country_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the country")
-    country_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the country")
-    postal_code_latitude = mapped_column(Numeric(10, 8), nullable=True, comment="Representative latitude for the postal code area")
-    postal_code_longitude = mapped_column(Numeric(11, 8), nullable=True, comment="Representative longitude for the postal code area")
-    constituency_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the constituency")
-    sub_constituency_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the sub-constituency")
-    assembly_constituency_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the assembly constituency")
-    parliamentary_constituency_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the parliamentary constituency")
-    pincode_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the pincode area")
-    taluka_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the taluka")
-    district_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the district")
-    city_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the city")
-    state_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the state")
-    country_geonameId = mapped_column(String(255), nullable=True, comment="GeoNames ID for the country")
-
-    # == Location Tracking & Metadata ==
-    altitude = mapped_column(Numeric(10, 8), nullable=True, comment="Altitude in meters above sea level")
-    altitude_accuracy = mapped_column(Float, nullable=True, comment="Accuracy of the altitude measurement in meters")
-    heading = mapped_column(Float, nullable=True, comment="Direction of travel in degrees (0-359.9)")
-    speed = mapped_column(Float, nullable=True, comment="Speed of travel in meters per second")
-    location_accuracy = mapped_column(String(255), nullable=True, comment="Accuracy of the location measurement in meters")
-    location_source = mapped_column(String(255), nullable=True, comment="Source of the location data (gps, network, manual)")
-    location_timestamp = mapped_column(DateTime(timezone=True), nullable=True, comment="Timestamp when the location was recorded by the source")
-    location_timezone = mapped_column(String(255), nullable=True, comment="Timezone detected at the location")
-    location_ip = mapped_column(String(45), nullable=True, comment="IP address associated with the location capture event")
-    geocode = mapped_column(JSONB, nullable=True, comment="JSON object containing reverse geocoding results")
-    recorded_at = mapped_column(DateTime(timezone=True), nullable=True, comment="Timestamp when the location record was saved")
-    last_tracked_at = mapped_column(DateTime(timezone=True), nullable=True, comment="Timestamp of the very last tracking update received")
-    device_id = mapped_column(String(255), nullable=True, comment="Identifier of the device providing tracking data")
+    # == Device metadata (auth/device binding) ==
+    device_id = mapped_column(String(255), nullable=True, comment="Identifier of the device last used to sign in")
     device_type = mapped_column(String(255), nullable=True, comment="Type of the device (mobile, web, sensor)")
-    network_type = mapped_column(String(255), nullable=True, comment="Network type used during tracking (wifi, cellular)")
-    is_tracking_active = mapped_column(Boolean, nullable=True, default=False, comment="Whether location tracking is currently active")
-    background_tracking_enabled = mapped_column(Boolean, nullable=True, default=False, comment="Whether background location tracking is enabled")
 
     # == Integration IDs ==
     external_id = mapped_column(String(255), nullable=True, unique=True, comment="Unique identifier for linking to an external system (Authentik sub / uuid)")
@@ -326,6 +263,8 @@ class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, 
     deleted_reason = mapped_column(Text, nullable=True, comment="Why the account was deleted")
 
     __table_args__ = (
+        # Target of children's composite FKs (user_live_locations, telemetry, …).
+        UniqueConstraint("tenant_id", "id", name="uq_users_tenant_id"),
         Index("users_first_last_name_index", "first_name", "last_name"),
         Index("users_phone_index", "phone"),
         Index("users_status_index", "status"),
@@ -333,16 +272,13 @@ class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, 
         Index("users_user_type_index", "user_type"),
         Index("users_member_id_index", "member_id"),
         Index("users_company_name_index", "company_name"),
-        Index("users_pincode_index", "pincode"),
-        Index("users_city_index", "city"),
-        Index("users_state_index", "state"),
-        Index("users_country_index", "country"),
         Index("ix_users_country_code", "country_code"),
         Index("users_last_login_index", "last_login"),
-        Index("users_last_tracked_at_index", "last_tracked_at"),
         Index("users_device_id_index", "device_id"),
         Index("users_authentik_sync_status_index", "authentik_sync_status"),
-        Index("users_zoho_id_index", "zoho_id"),
+        # Zoho crosswalk: unique among live rows (matches every Zoho mirror).
+        Index("uq_users_zoho_id_live", "tenant_id", "zoho_id", unique=True,
+              postgresql_where=text("deleted_at IS NULL AND zoho_id IS NOT NULL")),
         Index("users_zoho_customer_id_index", "zoho_customer_id"),
         Index("users_zoho_contact_id_index", "zoho_contact_id"),
         Index("users_created_by_index", "created_by"),
@@ -351,8 +287,14 @@ class User(TenantScopedMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, 
         Index("users_deleted_at_index", "deleted_at"),
         Index("ix_users_is_banned", "is_banned"),
         Index("ix_users_is_throttled", "is_throttled"),
-        ForeignKeyConstraint(["tenant_id", "role_id"], ["roles.tenant_id", "roles.id"],
-                             name="fk_users_tenant_role", ondelete="RESTRICT"),
+        Index("ix_users_primary_place", "primary_place_id",
+              postgresql_where=text("primary_place_id IS NOT NULL")),
+        # A user's role must belong to the user's own organization.
+        ForeignKeyConstraint(
+            ["tenant_id", "organization_id", "role_id"],
+            ["roles.tenant_id", "roles.organization_id", "roles.id"],
+            name="fk_users_tenant_org_role", ondelete="RESTRICT",
+        ),
     )
 
     @property
@@ -514,3 +456,101 @@ class UserProfile(BigIntPKWithUUIDMixin, TenantEntityMixin, SoftDeleteMixin, Bas
         Index("idx_user_profiles_country", "country_iso2"),
         CheckConstraint("timezone_source IN ('auto', 'manual')", name="ck_user_profiles_tz_source"),
     )
+
+
+# =============================================================================
+# Live location telemetry — isolated from the users master row.
+# =============================================================================
+class UserLiveLocation(IntPKMixin, MultiTenantMixin, AppMetaMixin, TimestampMixin, Base):
+    """One row per user — the last known position.
+
+    Hot (upserted on every fix) but isolated from the ``users`` row, so GPS
+    writes never contend with authentication/profile reads. Write path is a
+    single ``INSERT ... ON CONFLICT (tenant_id, user_id) DO UPDATE``. This is
+    what dispatch/beat-planning reads.
+    """
+
+    __tablename__ = "user_live_locations"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "user_id", name="uq_user_live_locations_user"),
+        CheckConstraint("accuracy_m IS NULL OR accuracy_m >= 0", name="chk_user_live_accuracy"),
+        CheckConstraint("heading_deg IS NULL OR (heading_deg >= 0 AND heading_deg < 360)",
+                        name="chk_user_live_heading"),
+        CheckConstraint("speed_mps IS NULL OR speed_mps >= 0", name="chk_user_live_speed"),
+        Index("ix_user_live_locations_recorded", "tenant_id", "recorded_at"),
+        {"comment": "Last known position per user (hot but isolated from the users row)."},
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    coordinates: Mapped[object | None] = mapped_column(
+        Geography(geometry_type="POINT", srid=4326), nullable=True,
+        comment="WGS84 point (longitude, latitude)",
+    )
+    place_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("geo.places.id", ondelete="SET NULL"),
+        comment="Nearest/resolved place, if any",
+    )
+    accuracy_m: Mapped[float | None] = mapped_column(Float)
+    altitude_m: Mapped[float | None] = mapped_column(Float)
+    altitude_accuracy_m: Mapped[float | None] = mapped_column(Float)
+    heading_deg: Mapped[float | None] = mapped_column(Float)
+    speed_mps: Mapped[float | None] = mapped_column(Float)
+    location_source: Mapped[str | None] = mapped_column(String(20), comment="gps / network / manual")
+    is_moving: Mapped[bool | None] = mapped_column(Boolean)
+    tracking_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    background_tracking_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+    )
+    device_id: Mapped[str | None] = mapped_column(String(255))
+    device_type: Mapped[str | None] = mapped_column(String(50))
+    network_type: Mapped[str | None] = mapped_column(String(50))
+    ip_address: Mapped[str | None] = mapped_column(String(45))
+    recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), comment="Device clock")
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserLiveLocation user={self.user_id} recorded_at={self.recorded_at}>"
+
+
+class UserLocationPing(MultiTenantMixin, AppMetaMixin, Base):
+    """Append-only location history; monthly RANGE partitions on ``recorded_at``.
+
+    Partitions are managed by pg_partman; retention is a partition drop and the
+    window is a ``data_retention_schedules`` row (``location_history``).
+    """
+
+    __tablename__ = "user_location_pings"
+    __table_args__ = (
+        # Partitioned by recorded_at, so the PK must include it.
+        PrimaryKeyConstraint("recorded_at", "id", name="pk_user_location_pings"),
+        Index("ix_user_location_pings_user_time", "tenant_id", "user_id", text("recorded_at DESC")),
+        Index("ix_user_location_pings_time", "tenant_id", text("recorded_at DESC")),
+        {"postgresql_partition_by": "RANGE (recorded_at)",
+         "comment": "Append-only location history; monthly partitions via pg_partman."},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    coordinates: Mapped[object | None] = mapped_column(
+        Geography(geometry_type="POINT", srid=4326), nullable=True,
+    )
+    place_id: Mapped[int | None] = mapped_column(BigInteger)
+    accuracy_m: Mapped[float | None] = mapped_column(Float)
+    altitude_m: Mapped[float | None] = mapped_column(Float)
+    heading_deg: Mapped[float | None] = mapped_column(Float)
+    speed_mps: Mapped[float | None] = mapped_column(Float)
+    location_source: Mapped[str | None] = mapped_column(String(20))
+    device_id: Mapped[str | None] = mapped_column(String(255))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserLocationPing user={self.user_id} recorded_at={self.recorded_at}>"

@@ -10,13 +10,10 @@ location hub; both are leaf helpers over the tenancy runtime.
 
 from __future__ import annotations
 
-from typing import Any
-
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exception.errors import AppError
-from app.database.tenancy import current_organization_id, current_tenant_id
+from app.database import scope
 
 
 class CurrencyRuleError(AppError):
@@ -25,38 +22,17 @@ class CurrencyRuleError(AppError):
 
 
 async def require_organization(db: AsyncSession) -> int:
-    """The organization new rows belong to.
+    """The organization new ``currency`` rows belong to.
 
-    The request's organization (``X-Organization-Id`` or the user's own); else
-    the tenant's single organization; else a 422 naming the header — not a
-    constraint violation.
+    The resolution order lives in ``app/database/scope.py`` — one implementation
+    shared by every module, because three copies of it drifted into three
+    different answers. Only the error *code* is this module's own, so the API
+    keeps answering ``currency_rule_violation``.
     """
-    organization_id = current_organization_id()
-    if organization_id is not None:
-        return organization_id
-
-    # Raw SQL: the currency module must not import the organizations model.
-    tenant_id = current_tenant_id()
-    sql = ("SELECT id, org_code FROM org_management.organizations "
-           "WHERE deleted_at IS NULL AND status <> 'archived' ")
-    params: dict[str, Any] = {}
-    if tenant_id is not None:
-        sql += "AND tenant_id = :tenant_id "
-        params["tenant_id"] = tenant_id
-    roots = (await db.execute(text(sql + "ORDER BY depth, id LIMIT 2"), params)).all()
-
-    if not roots:
-        raise CurrencyRuleError(
-            "This tenant has no organization yet; create one (POST /api/organizations) "
-            "before adding currencies."
-        )
-    if len(roots) > 1:
-        raise CurrencyRuleError(
-            "Several organizations exist — choose one with the 'X-Organization-Id' header "
-            "before adding currencies.",
-            data={"hint": "GET /api/organizations lists them"},
-        )
-    return int(roots[0][0])
+    try:
+        return await scope.require_organization_id(db)
+    except scope.OrganizationRequiredError as exc:
+        raise CurrencyRuleError(exc.msg, data=exc.data) from exc
 
 
 __all__ = ["CurrencyRuleError", "require_organization"]

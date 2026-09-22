@@ -153,7 +153,7 @@ def map_inbound(config: ModuleSyncConfig, payload: dict) -> dict[str, Any]:
     """Zoho payload -> {local_column: value} using the module's field map."""
     values: dict[str, Any] = {}
     for mapping in config.field_map:
-        raw = extract(payload, mapping.zoho)
+        raw = extract(payload, mapping.external)
         if raw is MISSING:
             if mapping.apply_default_when_missing:
                 values[mapping.local] = mapping.default
@@ -188,7 +188,7 @@ def map_outbound(config: ModuleSyncConfig, row: Any, *, include_none: bool = Fal
     """
     payload: dict[str, Any] = {}
     for mapping in config.field_map:
-        if not mapping.outbound:
+        if not mapping.writes:
             continue
         value = getattr(row, mapping.local, None)
         if value is None and not include_none:
@@ -199,7 +199,7 @@ def map_outbound(config: ModuleSyncConfig, row: Any, *, include_none: bool = Fal
             value = value.isoformat()
         elif isinstance(value, Decimal):
             value = float(value)
-        _assign(payload, mapping.outbound_key or mapping.zoho, value)
+        _assign(payload, mapping.write_key, value)
     return payload
 
 

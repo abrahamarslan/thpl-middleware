@@ -66,6 +66,14 @@ def test_module_routers_registered():
         "/api/me/profile",
         "/api/countries",
         "/api/countries/{iso2}/timezones",
+        "/api/brands",
+        "/api/brands/{ref}",
+        "/api/brands/{ref}/manufacturers",
+        "/api/manufacturers",
+        "/api/manufacturers/{ref}",
+        "/api/manufacturers/{ref}/identifiers",
+        "/api/entities/types",
+        "/api/entities/aliases",
     }
     missing = expected - paths
     assert not missing, f"routes missing from the app: {sorted(missing)}"

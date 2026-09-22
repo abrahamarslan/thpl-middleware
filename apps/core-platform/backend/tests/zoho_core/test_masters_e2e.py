@@ -48,6 +48,14 @@ TAXES = [
     {"tax_id": "982000000566010", "tax_name": "CGST9", "tax_percentage": 9, "tax_type": "tax",
      "tax_specific_type": "cgst", "is_value_added": False, "is_default_tax": False, "is_editable": True},
 ]
+TAX_EXEMPTIONS = [
+    {"tax_exemption_id": "982000000566101", "tax_exemption_code": "BILL OF SUPPLY",
+     "description": "Composition dealer", "type": "item", "type_formatted": "Item",
+     "exemption_name": "", "exemption_type": "exempt", "exemption_type_formatted": "Exempt"},
+    {"tax_exemption_id": "982000000566102", "tax_exemption_code": "SEZ SUPPLY",
+     "description": "Supply to an SEZ unit", "type": "customer", "type_formatted": "Customer",
+     "exemption_name": "SEZ", "exemption_type": "exempt", "exemption_type_formatted": "Exempt"},
+]
 LOCATIONS = [{
     "type": "general", "email": "willsmith@bowmanfurniture.com", "phone": "+1-925-921-9201",
     "address": {"city": "New York City", "state": "New York", "country": "U.S.A", "attention": "string",
@@ -73,6 +81,7 @@ class ZohoWire:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.data = {"currencies": copy.deepcopy(CURRENCIES), "taxes": copy.deepcopy(TAXES),
+                     "tax_exemptions": copy.deepcopy(TAX_EXEMPTIONS),
                      "locations": copy.deepcopy(LOCATIONS), "users": copy.deepcopy(USERS)}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -90,6 +99,13 @@ class ZohoWire:
             return self._ok({"currencies": self.data["currencies"]})
         if path == "/settings/taxes":
             return self._ok({"taxes": self.data["taxes"], **paged})
+        if match := re.fullmatch(r"/settings/taxes/(\d+)", path):    # index_then_detail
+            detail = next((t for t in self.data["taxes"] if t["tax_id"] == match.group(1)), None)
+            if detail is None:
+                return httpx.Response(404, json={"code": 1001, "message": "Tax not found"})
+            return self._ok({"tax": detail})
+        if path == "/settings/taxexemptions":                    # documented WITHOUT page_context
+            return self._ok({"tax_exemptions": self.data["tax_exemptions"]})
         if path == "/locations":                                 # documented WITHOUT page_context
             return self._ok({"locations": self.data["locations"]})
         if path == "/users":
@@ -116,6 +132,13 @@ class StubTokens:
 @pytest.fixture
 async def wire(db, redis_available, monkeypatch):
     """Every ZohoClient the platform builds talks to the fake wire."""
+    from app.core.conf import settings
+
+    # The connection must name the organization the wire actually serves: the
+    # engine attaches synced rows to the organization node whose `zoho_id` is
+    # ZOHO_ORGANIZATION_ID (`zoho/control/tenancy.py`), and a canonical master
+    # such as `currency.currencies` requires one. Point it at ORG_DETAIL.
+    monkeypatch.setattr(settings, "ZOHO_ORGANIZATION_ID", ORG_DETAIL["organization_id"])
     wire = ZohoWire()
 
     # A subclass, not a factory function: modules imported lazily afterwards
@@ -136,11 +159,19 @@ async def wire(db, redis_available, monkeypatch):
 
 
 async def run_all(db) -> dict[str, dict]:
-    """What the worker does for each enqueued lane — execute_leased_run."""
+    """What the worker does for each enqueued lane — execute_leased_run.
+
+    ``organizations`` goes first, always: it is the module that creates the
+    organization node the Zoho connection points at (``ZOHO_ORGANIZATION_ID``),
+    and the org-scoped masters — ``currency.currencies`` above all — cannot
+    place a row until it exists. Registry order is import order, so relying on
+    it made this test pass or fail depending on which test module ran before it.
+    """
     from app.tasks.zoho_sync import execute_leased_run
 
+    modules = sorted(sync_registry.all(), key=lambda d: d.name != "organizations")
     results = {}
-    for defn in sync_registry.all():
+    for defn in modules:
         client = transport_module.ZohoClient(default_module=defn.name)
         try:
             results[defn.name] = await execute_leased_run(
@@ -156,23 +187,34 @@ async def test_the_planner_schedules_every_master_and_the_runs_mirror_them(db, w
     monkeypatch.setattr(settings, "ZOHO_PLANNER_MAX_CONCURRENT_RUNS", 10)
     enqueued = []
     await planner.tick(db, enqueue=lambda module, lane, mode: enqueued.append((module, lane)))
-    assert sorted(enqueued) == sorted((m, "scheduled") for m in
-                                      ("organizations", "currencies", "taxes", "locations", "users"))
+    # `tax_groups` is registered DISABLED (Zoho documents no list endpoint), so
+    # the planner schedules every master except that one.
+    assert sorted(enqueued) == sorted(
+        (m, "scheduled") for m in
+        ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users")
+    )
 
     results = await run_all(db)
     assert {m: r["status"] for m, r in results.items()} == dict.fromkeys(results, RunStatus.SUCCEEDED)
     assert results["organizations"]["created"] == 1
     assert results["currencies"]["created"] == 2 and results["taxes"]["created"] == 2
+    assert results["tax_exemptions"]["created"] == 2
     assert results["locations"]["created"] == 1 and results["users"]["created"] == 2
 
-    # 1 list + 1 detail for organizations, 1 call each for the four masters
-    assert len(wire.requests) == 6 and wire.calls_to("/organizations/10229182") == 1
+    # organizations: 1 list + 1 detail. taxes: 1 list + 2 details (index_then_detail).
+    # currencies / tax_exemptions / locations / users: 1 list each.
+    assert len(wire.requests) == 9 and wire.calls_to("/organizations/10229182") == 1
+    assert wire.calls_to("/settings/taxes/982000000566009") == 1
 
     # the governor counted every call; the runs and events are recorded
-    assert (await zoho_governor.snapshot())["used"] == 6
-    assert await db.scalar(select(func.count()).select_from(ZohoSyncRun)) == 5
+    assert (await zoho_governor.snapshot())["used"] == 9
+    # `run_all` executes every REGISTERED module, so `tax_groups` gets a run too
+    # even though the planner never schedules it (direction=disabled).
+    assert set(await db.scalars(select(ZohoSyncRun.module))) == {
+        "organizations", "currencies", "taxes", "tax_groups", "tax_exemptions", "locations", "users",
+    }
     assert await db.scalar(select(func.count()).select_from(ZohoSyncEvent)
-                           .where(ZohoSyncEvent.event_type == "inserted")) == 8
+                           .where(ZohoSyncEvent.event_type == "inserted")) == 10
 
     from app.modules.locations.model import ZohoLocation
     from app.modules.zoho_users.model import ZohoUser
@@ -197,12 +239,18 @@ async def test_a_second_pass_writes_nothing_and_a_zoho_change_lands(db, wire):
     wire.data["taxes"][1]["tax_percentage"] = 6              # someone edits CGST in Zoho
     second = await run_all(db)
 
-    assert second["taxes"]["updated"] == 1 and second["taxes"]["unchanged"] == 1
-    for module in ("currencies", "locations", "users", "organizations"):
+    # taxes is index_then_detail: each record is applied twice (the listed row,
+    # then the detail document), so two taxes make four applies — the edited
+    # CGST detail is the one update, the other three are unchanged.
+    assert second["taxes"]["updated"] == 1 and second["taxes"]["unchanged"] == 3
+    for module in ("currencies", "tax_exemptions", "locations", "users", "organizations"):
         assert second[module]["created"] == second[module]["updated"] == 0, module
 
-    changed = await db.scalar(select(ZohoSyncEvent).where(ZohoSyncEvent.event_type == "updated"))
-    assert changed.module == "taxes" and changed.diff == {"tax_percentage": ["9.0000", "6"]}
+    # Scoped to the module: `organizations` is index-then-detail, so its own
+    # first-pass detail write is an "updated" event too.
+    changed = await db.scalar(select(ZohoSyncEvent).where(ZohoSyncEvent.event_type == "updated",
+                                                          ZohoSyncEvent.module == "taxes"))
+    assert changed.diff == {"tax_percentage": ["9.0000", "6"]}
 
 
 async def test_the_cli_runs_the_same_pipeline(db, wire, capsys):
@@ -213,7 +261,7 @@ async def test_the_cli_runs_the_same_pipeline(db, wire, capsys):
     assert await cli.cmd_runs(10, None) == 0
     out = capsys.readouterr().out
     print(out)                                               # visible with -s
-    for module in ("organizations", "currencies", "taxes", "locations", "users"):
+    for module in ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users"):
         assert module in out
     assert "failed" not in out
 

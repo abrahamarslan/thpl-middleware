@@ -81,6 +81,22 @@ SEARCHABLE_ENTITIES: dict[str, SearchableEntity] = {
         ],
         sortable=["legal_name", "org_code", "account_created_date"],
     ),
+    "brands": SearchableEntity(
+        index_name="brands",
+        model_path=("app.modules.brands.model", "Brand"),
+        schema_path=("app.modules.brands.schema", "BrandSlimOut"),
+        searchable=["name", "slug", "code"],
+        filterable=["tenant_id", "organization_id", "status", "kind", "country_code", "parent_id"],
+        sortable=["name", "created_at"],
+    ),
+    "manufacturers": SearchableEntity(
+        index_name="manufacturers",
+        model_path=("app.modules.manufacturers.model", "Manufacturer"),
+        schema_path=("app.modules.manufacturers.schema", "ManufacturerSlimOut"),
+        searchable=["name", "legal_name", "slug", "code"],
+        filterable=["tenant_id", "organization_id", "status", "country_code", "is_verified"],
+        sortable=["name", "created_at"],
+    ),
 }
 
 

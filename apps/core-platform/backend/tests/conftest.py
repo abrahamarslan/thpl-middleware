@@ -63,10 +63,48 @@ _TEST_TABLES = (
     # Currency: rates before the currency (FK order).
     "currency.exchange_rates",
     "currency.currencies",
+    # Tax: children before the component (composite FK order).
+    "tax.tax_group_members",
+    "tax.org_default_tax_preferences",
+    "tax.organization_tax_components",
+    "tax.tax_components",
+    "tax.tax_exemptions",
+    "tax.gst_treatment_types",
+    # Core master data: children before parents (FK order). core.entity_types is
+    # reference data seeded by the migration — NOT truncated.
+    "core.entity_aliases",
+    "core.manufacturer_identifiers",
+    "core.brand_manufacturers",
+    "core.brands",
+    "core.manufacturers",
     "org_management.organizations",   # CASCADE: every tenant table references it
     "roles",
-    "zoho_currencies",
-    "zoho_taxes",
+    # Users & telemetry
+    "user_location_pings",
+    "user_live_locations",
+    # Hubs / fleet partners / vehicles
+    "driving_licenses",
+    "vehicle_compliance_documents",
+    "vehicles",
+    "hubs",
+    "fleet_partners",
+    # Person compliance (DPDP / KYC / BGV) — data_retention_schedules is global reference data
+    "kyc_audit_logs",
+    "data_principal_requests",
+    "consent_records",
+    "bgv_check_results",
+    "background_verifications",
+    "aadhaar_verifications",
+    "pan_verifications",
+    "liveness_verifications",
+    "medical_fitness_certificates",
+    "training_certifications",
+    "kyc_profiles",
+    # HR / employment / payouts
+    "gig_worker_fy_stats",
+    "gig_worker_registrations",
+    "employment_records",
+    "bank_accounts",
     "zoho_locations",
     "zoho_users",
     "taggables",
@@ -114,7 +152,42 @@ async def db():
                 text("DELETE FROM org_management.tenants WHERE tenant_code <> :code"),
                 {"code": settings.DEFAULT_TENANT_CODE},
             )
+            await _restore_default_organization(conn)
     await engine.dispose()
+
+
+async def _restore_default_organization(conn) -> None:
+    """Give the default tenant its organization back after the truncate.
+
+    A migrated database always has one — migration ``fdbf62102e86`` creates a
+    ``DEFAULT-HQ`` for every tenant that lacks one, because ``users`` and
+    ``roles`` became organization-scoped. ``org_management.organizations`` is in
+    ``_TEST_TABLES`` (it must be: CASCADE from it is what clears every tenant
+    table), so the truncate takes that row with it and leaves the database in a
+    state no migration ever produces — one where nothing can be written at all.
+
+    Restoring it here keeps the *production* rule strict: `app/database/scope.py`
+    refuses a write it cannot place rather than inventing an organization, and
+    that refusal stays testable (``test_a_tenant_without_an_organization_is_told_so``
+    builds a bare tenant of its own).
+    """
+    await conn.execute(
+        text("""
+            INSERT INTO org_management.organizations
+                (uuid, tenant_id, parent_id, org_code, legal_name, org_type, hierarchy_path,
+                 depth, status, is_verified, row_version, app_version, app_metadata,
+                 created_at, updated_at)
+            SELECT gen_random_uuid(), t.id, NULL, :code, 'Default HQ', 'solo',
+                   '/' || gen_random_uuid()::text || '/', 0, 'active', false, 1, '0.1.0',
+                   '{}'::jsonb, now(), now()
+            FROM org_management.tenants t
+            WHERE t.tenant_code = :tenant_code
+              AND NOT EXISTS (SELECT 1 FROM org_management.organizations o
+                              WHERE o.tenant_id = t.id AND o.deleted_at IS NULL)
+        """),
+        {"code": settings.DEFAULT_ORGANIZATION_CODE or "DEFAULT-HQ",
+         "tenant_code": settings.DEFAULT_TENANT_CODE},
+    )
 
 
 @pytest.fixture(autouse=True)

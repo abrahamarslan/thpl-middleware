@@ -139,7 +139,7 @@ async def test_one_query_resolves_references_across_every_module(db):
                         external_id="900", values=_values(entity_id=11, modified=None, digest=b"c"))
     await upsert_record(db, tenant_id=tenant_id, source_system=ZOHO, module="taxes",
                         external_id="901", values=_values(entity_id=22, modified=None, digest=b"t",
-                                                          entity_table="zoho_taxes"))
+                                                          entity_table="tax.tax_components"))
     await db.flush()
 
     rows = (await db.execute(resolve_many(

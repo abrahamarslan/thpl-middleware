@@ -158,7 +158,12 @@ async def cmd_status() -> int:
                 select(ZohoSyncRun).where(ZohoSyncRun.module == defn.name)
                 .order_by(ZohoSyncRun.started_at.desc()).limit(1)
             )
-            newest = await db.scalar(select(func.max(model.synced_at)))
+            # Mirror tables carry `synced_at` (ZohoEntityMixin); the canonical
+            # masters (currencies, tax_components, tax_exemptions) do not —
+            # their freshness lives in the crosswalk (sync.sync_records), not on
+            # the row. Report the run's own timestamps for those.
+            synced_at = getattr(model, "synced_at", None)
+            newest = await db.scalar(select(func.max(synced_at))) if synced_at is not None else None
             rows.append({
                 "module": defn.name, "table": model.__tablename__, "rows": live,
                 "last_synced_row": newest,

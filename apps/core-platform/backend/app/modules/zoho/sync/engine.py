@@ -60,15 +60,19 @@ from typing import Any
 import structlog
 from pydantic import BaseModel
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.tenancy import write_tenant_id
 from app.modules.sync.crosswalk import live_external_ids as crosswalk_live_ids
 from app.modules.sync.crosswalk import load_page as crosswalk_load_page
+from app.modules.sync.crosswalk import resolve_many
 from app.modules.sync.crosswalk import tombstone as crosswalk_tombstone
 from app.modules.sync.crosswalk import upsert_record
-from app.modules.sync.models import LinkState, SyncPayload, SyncRecord
+from app.modules.sync.models import LinkState, PendingReference, SyncPayload, SyncRecord
+from app.modules.sync.references import Budget, Plan, pairs_in_page, plan_references
+from app.modules.sync.translation import PayloadShape
 from app.modules.zoho.control.events import build_diff
 from app.modules.zoho.control.events import enabled_for as events_enabled_for
 from app.modules.zoho.control.events import new_event as new_sync_event
@@ -246,6 +250,15 @@ class ZohoSyncEngine:
         self._state_cache: dict[tuple[str, str], _CrosswalkState] | None = None
         self._state_loaded: set[str] = set()
         self._pending_links: list[tuple[int, str, Any, Any]] = []
+        #: index_then_detail: ids listed this page whose detail is still owed.
+        self._detail_backlog: list[str] = []
+        # Reference resolution (redesign §4). The budget and the single-flight
+        # set are per RUN, not per page: a ceiling that reset every page would
+        # not be a ceiling. The cache is per page.
+        self._reference_cache: dict[tuple[str, str], int | None] | None = None
+        self._reference_budget: Budget | None = None
+        self._reference_attempted: set[tuple[str, str]] = set()
+        self._pending_reference_writes: list[tuple[ZohoModuleDefinition, Any, Any, str]] = []
 
     # ── Public entry points ──────────────────────────────────────────────────
 
@@ -490,8 +503,35 @@ class ZohoSyncEngine:
                                zoho_id=external_id)
             return ApplyResult(None, decision.outcome, decision)
 
-        values = map_inbound(cfg, payload)
+        # The anti-corruption boundary: nothing below this line reads the source
+        # payload's field names. A thin index row decodes to fewer columns than
+        # a detail document, never to NULLs.
+        decoded = defn.resolved_translator.decode(payload, shape=PayloadShape.of(source))
+        if decoded.warnings:
+            logger.warning("zoho.sync.translation_warnings", module=defn.name,
+                           external_id=external_id, warnings=decoded.warnings[:10])
+        values = decoded.values
+        # The identity echo: the module's own Zoho id (currency_id, tax_id,
+        # organization_id …) stamped onto the row's zoho_id column. Written
+        # here so it can never drift from the crosswalk, which stays the
+        # identity of record.
+        #
+        # Written BEFORE _resolve_entity on purpose: a module may declare the
+        # echo column in `match_on` so a row that already carries the source id
+        # is ADOPTED rather than duplicated. That is how the seeded company
+        # organization becomes the Zoho organization instead of gaining a
+        # parallel ZOHO-<id> twin. It stays a match key, never an identity: the
+        # crosswalk's unique (tenant, source, module, external_id) is what every
+        # subsequent sync resolves on.
+        for column in contract.identity_echo:
+            values[column] = external_id
         values.update(await self._resolve_nested(defn, payload))
+        # Source ids the payload only NAMES (tax_id, currency_id, …) become
+        # local foreign keys here, through the crosswalk — one query for the
+        # whole page, every referenced module at once. DEFER waiters are queued
+        # further down, once the entity has an id for them to wait on.
+        reference_plan = await self._resolve_references(defn, payload)
+        values.update(reference_plan.values)
         if defn.pre_upsert is not None:
             values = defn.pre_upsert(payload, values) or values
 
@@ -506,9 +546,13 @@ class ZohoSyncEngine:
             "entity_table": contract.entity_table or model.__table__.fullname,
             "entity_id": None if created else entity.id,
             "link_state": LinkState.LINKED,
-            "raw_source": source[:48],
             "synced_at": now,
         }
+        # NB: raw_source belongs with the raw document, inside the write_raw
+        # branch below. Writing it unconditionally would let a thin list row
+        # stamp "list:index" over a stored detail document — the provenance
+        # rank would then say the row is thin, and the next thin payload would
+        # be allowed to overwrite the rich one it should never touch.
         # Only ever WIDEN the crosswalk's organization: passing None on every
         # apply would clobber a good value. A created entity's org is stamped by
         # the link step, once its row exists.
@@ -521,7 +565,8 @@ class ZohoSyncEngine:
         if modified is not None:
             xref_values["source_modified_at"] = modified
         if decision.write_raw:
-            xref_values |= {"raw": payload, "raw_hash": digest, "raw_synced_at": now}
+            xref_values |= {"raw": payload, "raw_hash": digest, "raw_synced_at": now,
+                            "raw_source": source[:48]}
             if contract.capture_custom_fields:
                 xref_values["custom_fields"] = flatten_custom_fields(payload)
             if contract.capture_comments and isinstance(payload.get("comments"), list | dict):
@@ -529,10 +574,17 @@ class ZohoSyncEngine:
         if decision.revive:
             xref_values["remote_deleted_at"] = None
 
-        written = await upsert_record(
-            self.db, tenant_id=tenant_id, source_system=contract.source_system,
-            module=defn.name, external_id=external_id, values=xref_values,
-        )
+        # no_autoflush matters more than it looks: this is a Core statement in
+        # the middle of a batched page, and an autoflush here would push the
+        # page's pending entity INSERTs out one record at a time, silently
+        # turning SQLAlchemy's insertmanyvalues into N round trips. The upsert
+        # never needs pending entity state — entity_id is passed explicitly, or
+        # NULL and patched after the flush — so suppressing it is safe.
+        with self.db.no_autoflush:
+            written = await upsert_record(
+                self.db, tenant_id=tenant_id, source_system=contract.source_system,
+                module=defn.name, external_id=external_id, values=xref_values,
+            )
         if written is None:
             # Another lane applied a newer payload between the gate read and
             # here. Nothing was written, and the entity is untouched.
@@ -583,6 +635,11 @@ class ZohoSyncEngine:
             await self.db.flush()
             await self._link_pending()
 
+        # DEFER waiters are recorded against the entity, not the payload: the
+        # queue row names the row that is waiting, and only now do we have it.
+        for rule, missing_id in reference_plan.defer:
+            self._pending_reference_writes.append((defn, entity, rule, missing_id))
+
         self._record_event(defn, entity, event_type=decision.outcome.value, changed=changed,
                            diff=diff, source=source, zoho_last_modified_time=modified,
                            zoho_id=external_id)
@@ -592,6 +649,185 @@ class ZohoSyncEngine:
             else:
                 await defn.post_upsert(entity, payload)
         return ApplyResult(entity, decision.outcome, decision)
+
+    # ── Reference resolution (redesign §4) ──────────────────────────────────
+
+    async def _preload_references(
+        self, defn: ZohoModuleDefinition, payloads: list[dict]
+    ) -> None:
+        """Resolve every reference the PAGE names, in one query.
+
+        This is the payoff the crosswalk was built for: a page of documents
+        naming taxes, currencies, contacts and items resolves all four modules
+        together, instead of one query per module against a per-table
+        ``zoho_id`` column. The cache survives the page, so the same twelve
+        taxes an invoice page repeats are resolved once.
+        """
+        rules = defn.config.contract.references
+        if not rules:
+            self._reference_cache = None
+            return
+        pairs = pairs_in_page(rules, payloads)
+        self._reference_cache = await self._resolve_pairs(pairs)
+
+    async def _resolve_pairs(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], int | None]:
+        if not pairs:
+            return {}
+        rows = await self.db.execute(resolve_many(
+            tenant_id=await self._tenant_id(), source_system="zoho", pairs=pairs,
+        ))
+        resolved: dict[tuple[str, str], int | None] = dict.fromkeys(pairs)
+        for module, external_id, _entity_table, entity_id, _link_state in rows:
+            resolved[(module, external_id)] = entity_id
+        return resolved
+
+    async def _resolve_references(self, defn: ZohoModuleDefinition, payload: dict) -> Plan:
+        """Turn this record's source ids into local foreign keys.
+
+        Policy (which misses fetch, stub, defer or are ignored, and when the
+        budget says no) is pure and lives in ``app/modules/sync/references.py``.
+        Everything here is the mechanism that policy asks for.
+        """
+        rules = defn.config.contract.references
+        if not rules:
+            return Plan()
+
+        cache = self._reference_cache
+        if cache is None:                      # single-record apply: resolve just this one
+            cache = await self._resolve_pairs(pairs_in_page(rules, [payload]))
+
+        if self._reference_budget is None:
+            self._reference_budget = Budget(limit=defn.config.max_reference_fetches_per_run)
+        plan = plan_references(rules, payload, cache, budget=self._reference_budget)
+
+        # FETCH: go get the master now. Single-flight per run — a page of 200
+        # invoices naming one missing tax fetches it once, not 200 times.
+        for module, external_id in plan.fetch:
+            if (module, external_id) in self._reference_attempted:
+                continue
+            self._reference_attempted.add((module, external_id))
+            if await self._fetch_reference(module, external_id):
+                cache.update(await self._resolve_pairs([(module, external_id)]))
+
+        # STUB: a provisional row linked NOW, so the document is correct and
+        # queryable immediately. Idempotent — the owning module's real sync
+        # finds the crosswalk row and fills the same entity, never a duplicate.
+        for module, external_id in plan.stub:
+            entity_id = await self._stub_reference(module, external_id)
+            if entity_id is not None:
+                cache[(module, external_id)] = entity_id
+
+        # Re-plan against what fetching and stubbing just resolved: pure, cheap,
+        # and the step that actually turns a FETCH/STUB into a foreign key.
+        if plan.fetch or plan.stub:
+            plan = plan_references(rules, payload, cache, budget=self._reference_budget)
+        return plan
+
+    async def _stub_reference(self, module: str, external_id: str) -> int | None:
+        """A minimal provisional row for a master we have not synced yet.
+
+        One INSERT against a quota-free local table, versus one API call against
+        a budget the whole fleet shares — which is why this, not FETCH, is the
+        default for high-cardinality references (redesign §4.2).
+        """
+        try:
+            owner = await self.resolve(module)
+        except KeyError:
+            logger.warning("sync.reference.unknown_module", module=module)
+            return None
+        contract = owner.config.contract
+        if not contract.crosswalk:
+            # An in-place mirror has no crosswalk row to fill later, so a stub
+            # here would become a permanent orphan rather than a placeholder.
+            logger.info("sync.reference.stub_skipped", module=module,
+                        reason="module is not on the crosswalk")
+            return None
+
+        tenant_id = await self._tenant_id()
+        entity = owner.model()
+        for column in contract.identity_echo:
+            setattr(entity, column, external_id)
+        if "status" in owner.model.__table__.c:
+            entity.status = "provisional"
+        self.db.add(entity)
+        await self.db.flush()
+
+        await upsert_record(
+            self.db, tenant_id=tenant_id, source_system=contract.source_system,
+            module=module, external_id=external_id,
+            values={
+                "entity_table": contract.entity_table or owner.model.__table__.fullname,
+                "entity_id": entity.id,
+                "link_state": LinkState.PROVISIONAL,
+                "organization_id": getattr(entity, "organization_id", None),
+                "synced_at": datetime.now(UTC),
+            },
+        )
+        logger.info("sync.reference.stubbed", module=module, external_id=external_id,
+                    entity_id=entity.id)
+        return entity.id
+
+    async def _fetch_reference(self, module: str, external_id: str) -> bool:
+        """Fetch one referenced master through the normal transport and apply it.
+
+        Through ``self.client``, so the governor, the breaker and the rate
+        budget all still apply — an unplanned reference fetch is not a licence
+        to bypass them. A miss is logged and never raised: a document must not
+        fail because a master it names has been deleted upstream.
+        """
+        try:
+            owner = await self.resolve(module)
+        except KeyError:
+            logger.warning("sync.reference.unknown_module", module=module)
+            return False
+        try:
+            response = await self.client.get(owner.config.detail_path(external_id), **_api_kw(owner.config))
+            if not isinstance(response.data, dict):
+                return False
+            async with self.db.begin_nested():
+                await self.apply_payload(owner, response.data, source="reference_fetch")
+            logger.info("sync.reference.fetched", module=module, external_id=external_id)
+            return True
+        except ZohoNotFoundError:
+            logger.warning("sync.reference.gone_upstream", module=module, external_id=external_id)
+            return False
+        except ZohoApiError:
+            raise                              # quota / breaker — the runner decides
+        except Exception as exc:               # noqa: BLE001 — one reference never sinks a page
+            logger.warning("sync.reference.fetch_failed", module=module,
+                           external_id=external_id, error=str(exc)[:200])
+            return False
+
+    async def _flush_pending_references(self) -> None:
+        """Queue DEFER waiters, now that every entity in the page has an id.
+
+        Deliberately after the flush: a ``PendingReference`` records *which row*
+        is waiting for what, and a row inserted this page has no id until then.
+        The reconcile lane drains the queue — this is also the honest answer to
+        "what did we fail to link?", a number an operator can watch instead of
+        silent NULLs.
+        """
+        waiting, self._pending_reference_writes = self._pending_reference_writes, []
+        if not waiting:
+            return
+        tenant_id = await self._tenant_id()
+        for defn, entity, rule, external_id in waiting:
+            entity_id = getattr(entity, "id", None)
+            if entity_id is None:                      # the flush failed for this row
+                continue
+            table = defn.config.contract.entity_table or defn.model.__table__.fullname
+            await self.db.execute(
+                pg_insert(PendingReference).values(
+                    tenant_id=tenant_id,
+                    organization_id=getattr(entity, "organization_id", None),
+                    source_system=defn.config.contract.source_system,
+                    module=rule.module,
+                    external_id=external_id,
+                    waiting_table=table,
+                    waiting_id=entity_id,
+                    waiting_column=rule.fk,
+                ).on_conflict_do_nothing(constraint="uq_pending_references_waiter")
+            )
 
     async def _resolve_entity(
         self, defn: ZohoModuleDefinition, state: _CrosswalkState | None, values: dict[str, Any]
@@ -820,6 +1056,8 @@ class ZohoSyncEngine:
 
             # Phase 2 — apply the page: one preload query, one flush.
             await self._apply_page(defn, to_apply, report)
+            # Phase 3 — index_then_detail: the rows now exist; fill them in.
+            await self._apply_detail_backlog(defn, report)
 
             context = page.page_context
             page_number = (context.page if context and context.page else page_number)
@@ -865,6 +1103,11 @@ class ZohoSyncEngine:
 
     async def _record_failure(self, defn: ZohoModuleDefinition, zoho_id: str | None, error: Exception,
                               report: SyncRunReport) -> None:
+        # A record whose index apply failed does not get a detail call: the
+        # fetch would cost quota to produce a second failure for the same row,
+        # and the run's error count would double-report it.
+        if zoho_id and zoho_id in self._detail_backlog:
+            self._detail_backlog.remove(zoho_id)
         report.errors += 1
         logger.error("zoho_record_sync_failed", module=defn.name, zoho_id=zoho_id, error=str(error))
         await record_queue_log(
@@ -883,6 +1126,24 @@ class ZohoSyncEngine:
         """
         if not items:
             return
+        if defn.config.contract.crosswalk:
+            # A second payload for an id already in THIS page cannot see the row
+            # the first one is about to insert (the preload predates it), so it
+            # would insert a duplicate entity behind the one crosswalk row. The
+            # zoho_id echo's unique index used to catch that by accident; a
+            # module without the echo has no such net, so repeats wait for the
+            # first flush and are applied as updates against a fresh preload.
+            seen: set[str] = set()
+            first: list[tuple[str | None, dict, str]] = []
+            repeats: list[tuple[str | None, dict, str]] = []
+            for item in items:
+                (repeats if item[0] and item[0] in seen else first).append(item)
+                if item[0]:
+                    seen.add(item[0])
+            if repeats:
+                await self._apply_page(defn, first, report)
+                await self._apply_page(defn, repeats, report)
+                return
         outcomes: list[tuple[str | None, Outcome]] = []
         failures: list[tuple[str | None, Exception]] = []
         ids = [zid for zid, _, _ in items if zid]
@@ -890,6 +1151,7 @@ class ZohoSyncEngine:
             self._row_cache = {}
             self._state_cache = await self._load_crosswalk_states(defn, ids)
             self._state_loaded.add(defn.name)
+            await self._preload_references(defn, [payload for _, payload, _ in items])
         else:
             self._row_cache = await self._load_rows(defn, ids)
         self._pending_events, self._pending_hooks = [], []
@@ -922,6 +1184,53 @@ class ZohoSyncEngine:
             if zoho_id:
                 await self._touch_last_id(defn, zoho_id)
 
+    async def _apply_detail_backlog(self, defn: ZohoModuleDefinition, report: SyncRunReport) -> None:
+        """Phase two of ``index_then_detail``: fetch each listed record's full
+        document and upsert it over the row the index already created.
+
+        Zoho's list endpoints are thin by design — a tax, an invoice or an
+        organization carries only a summary there — so the detail document is
+        where most columns actually come from. Running it as a second apply
+        rather than a pre-fetch means a failure here costs the *detail*, not
+        the record: the row is already in place, correct as far as the index
+        went, and the next run completes it.
+
+        The apply gate does the rest: ``detail_fetch`` outranks ``list:*``, so
+        the richer payload wins and the raw document it stores is the full one.
+        """
+        backlog, self._detail_backlog = self._detail_backlog, []
+        if not backlog:
+            return
+        cfg = defn.config
+        for external_id in backlog:
+            if cfg.detail_dispatch == "queued":
+                log = await record_queue_log(
+                    self.db, module=defn.name, operation="detail_fetch",
+                    status="queued", zoho_id=external_id,
+                )
+                from app.tasks.zoho_sync import fetch_detail  # lazy: tasks import this module
+
+                log.celery_task_id = fetch_detail.delay(defn.name, external_id, queue_log_id=log.id).id
+                report.queued_details += 1
+                continue
+            try:
+                if cfg.wait_between_calls:
+                    await asyncio.sleep(cfg.wait_between_calls)
+                response = await self.client.get(cfg.detail_path(external_id), **_api_kw(cfg))
+                if not isinstance(response.data, dict):
+                    continue
+                async with self.db.begin_nested():
+                    result = await self.apply_payload(defn, response.data, source="detail_fetch")
+                _count(report, result.outcome)
+            except ZohoNotFoundError:
+                # Deleted upstream between the listing and the detail fetch.
+                report.skipped += 1
+                logger.warning("zoho_detail_gone", module=defn.name, zoho_id=external_id)
+            except ZohoApiError:
+                raise                      # upstream failure — the runner decides
+            except Exception as e:  # one bad detail never sinks the run
+                await self._record_failure(defn, external_id, e, report)
+
     async def _apply_one_by_one(
         self, defn: ZohoModuleDefinition, items: list[tuple[str | None, dict, str]], report: SyncRunReport
     ) -> None:
@@ -948,8 +1257,10 @@ class ZohoSyncEngine:
                     break
 
     async def _run_deferred(self) -> None:
-        # Links first: events and hooks both want a row that knows its id.
+        # Links first: events, hooks and reference waiters all want a row that
+        # knows its id.
         await self._link_pending()
+        await self._flush_pending_references()
         events, hooks = self._pending_events or [], self._pending_hooks
         self._pending_events, self._pending_hooks = None, []
         for defn, row, fields in events:
@@ -962,6 +1273,9 @@ class ZohoSyncEngine:
         self._pending_events, self._pending_hooks = None, []
         self._state_cache, self._state_loaded = None, set()
         self._pending_links = []
+        # Per-page only. The budget and the single-flight set live for the run.
+        self._reference_cache = None
+        self._pending_reference_writes = []
 
     async def _load_rows(self, defn: ZohoModuleDefinition, ids: list[str]) -> dict[tuple[str, str], Any]:
         """Every stored row of the page in ONE query (live rows win over ghosts)."""
@@ -997,6 +1311,12 @@ class ZohoSyncEngine:
             report.unchanged += 1
             report.details_saved += 1
             return None
+
+        if needs_detail and zoho_id and cfg.index_then_detail:
+            # Phase one: apply the listed row now so the record exists. Phase
+            # two runs after the page is written (_apply_detail_backlog).
+            self._detail_backlog.append(zoho_id)
+            return zoho_id, record, f"list:{mode.value}"
 
         if needs_detail and zoho_id and cfg.detail_dispatch == "queued":
             # Fan out: journal first, then one Celery task per record.

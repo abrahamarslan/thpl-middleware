@@ -419,6 +419,21 @@ async def _clear_other_primary_links(db: AsyncSession, link: PlaceLink) -> None:
         row.is_primary = False
 
 
+async def _refresh_owner_caches(db: AsyncSession, link: PlaceLink) -> None:
+    """Keep an owner's denormalised "primary place" pointer in step.
+
+    ``users.primary_place_id`` is a cache of this table, so every write path
+    that can change which link is primary ends here — attaching, editing and
+    detaching alike. Imported lazily: the users module reads geo models, and a
+    module-level import in this direction would close the cycle.
+    """
+    if link.owner_type != "user":
+        return
+    from app.modules.users import service as users_service
+
+    await users_service.refresh_primary_place(db, link.owner_id)
+
+
 async def attach_address(
     db: AsyncSession, body: AddressCreate, *, actor_id: int | None = None,
 ) -> PlaceLink:
@@ -456,6 +471,7 @@ async def attach_address(
         changes={"after": {"owner": f"{link.owner_type}:{link.owner_id}", "link_type": link.link_type,
                            "place": str(place.uuid), "frozen": link.is_frozen}},
     )
+    await _refresh_owner_caches(db, link)
     logger.info("geo.address.attached", link_id=link.id, owner=f"{link.owner_type}:{link.owner_id}",
                 place_id=place.id, link_type=link.link_type)
     return link
@@ -486,6 +502,7 @@ async def update_address(
         changes={"before": {k: _jsonable(v) for k, v in before.items()},
                  "after": {k: _jsonable(v) for k, v in changes.items()}},
     )
+    await _refresh_owner_caches(db, link)
     return link
 
 
@@ -517,6 +534,7 @@ async def detach_address(db: AsyncSession, ref: str, *, reason: str, actor_id: i
         db, action="address_detached", actor_id=actor_id, subject_type="PlaceLink", subject_id=link.id,
         context={"reason": reason},
     )
+    await _refresh_owner_caches(db, link)
 
 
 async def address_history(

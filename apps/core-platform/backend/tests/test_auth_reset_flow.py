@@ -29,7 +29,10 @@ async def _tech_user(db, password: str = OLD_PASSWORD) -> User:
     user = await crud.get_by_email(db, TECH)
     if user is None:
         user = await crud.create(
-            db, {"name": "Tech", "email": TECH, "password": hash_password(password)}
+            db, {
+                "name": "Tech", "email": TECH, "password": hash_password(password),
+                "organization_id": (await service.resolve_user_organization(db)).organization_id,
+            }
         )
     else:
         user.password = hash_password(password)

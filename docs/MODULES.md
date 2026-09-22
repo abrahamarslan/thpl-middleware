@@ -168,6 +168,31 @@ Settings: `EMAIL_PROVIDER`, `EMAIL_ENABLED`, `EMAIL_LOG_ONLY`,
   rollback discards them). See
   `apps/core-platform/docs/AUTH_AUDIT_LOGGING_PLAN.md`.
 
+- **Every user belongs to an organization.** `users.organization_id` is NOT NULL
+  (`MultiTenantMixin`) and the role FK is three columns wide
+  (`(tenant_id, organization_id, role_id)` → `roles`), so a user can never hold
+  another organization's role. The unauthenticated creation paths have no
+  organization bound to stamp from, so **`service.resolve_user_organization`**
+  supplies one — the request's organization when there is one, else the tenant's
+  root. Register, admin-create, **Authentik JIT provisioning** and the DEBUG-only
+  dev-token user all go through it; a new path that creates a user must too, or
+  it fails with a NOT NULL violation rather than anything readable.
+- **Location is not on the user row.** Addresses live in the platform-wide
+  address book (`/api/addresses` with `owner_type=user` → `geo.place_links` →
+  `geo.places`) — there is deliberately no user-specific address endpoint.
+  `users.primary_place_id` and `users.country_code` are caches; the address
+  service calls `users.service.refresh_primary_place` on every attach/update/
+  detach, which is the only writer of that column. `GET /api/users?city=…`
+  (and `state`/`country`) resolves through the address book, not the user row.
+- **Position telemetry** is two tables of its own so a GPS burst never contends
+  with the row authentication reads: `user_live_locations` (one row per user,
+  a single `INSERT … ON CONFLICT` per fix — what dispatch and beat planning
+  read) and `user_location_pings` (append-only history, monthly partitions plus
+  a DEFAULT partition so a late offline replay is never rejected).
+  `PATCH /api/me/location` records a fix, `GET /api/me/location` and
+  `GET /api/users/{id}/location` read the last one. The only `users` column a
+  fix touches is `is_location_set`.
+
 Settings (auth OTP): `LOGIN_OTP_CODE_LENGTH`, `LOGIN_OTP_TTL_MINUTES`,
 `LOGIN_OTP_MAX_ATTEMPTS`, `LOGIN_OTP_RESEND_COOLDOWN_SECONDS`,
 `LOGIN_OTP_MAX_PER_HOUR`. GeoIP: `GEOIP_ENABLED`, `GEOIP_CITY_DB_PATH`,
@@ -233,6 +258,36 @@ via the DEBUG-only `/api/auth/dev-token`).
 **Tests** (`tests/test_search_indexer.py`): consumer exercised through
 `TestKafkaBroker` (no Kafka container), Meilisearch mocked with pytest-mock's
 `mocker`; registry test asserts every declared attribute exists on the model.
+
+## Core master data — `app/modules/{brands,manufacturers,entities}/`
+
+Domain masters (not cross-cutting infrastructure) in the dedicated `core`
+schema, following the canonical-master pattern `currencies` established:
+`OrgEntityMixin` (tenant + organization NOT NULL) + `PolymorphicOwnerMixin`
+provenance + `SoftDeleteFilteredMixin` + `BigIntPKWithUUIDv7Mixin`; business
+columns nullable by doctrine; partial unique indexes for every uniqueness
+rule; `name_normalized` / `value_normalized` / `alias_normalized` are STORED
+generated columns with pg_trgm GIN indexes.
+
+**Tables.** `brands`, `manufacturers` (canonical masters), `brand_manufacturers`
+(role + `[valid_from, valid_to)` window), `manufacturer_identifiers`
+(GSTIN/PAN/CIN/FSSAI/… with statutory-format CHECKs), `entity_types` (registry)
+and `entity_aliases` (polymorphic alternative names).
+
+**Database-owned guards** (the parts a CHECK cannot express):
+`core.guard_brand_parent()` (no brand-tree cycles), and two *deferrable
+constraint triggers* — `core.check_brand_manufacturer_overlap()` (no
+overlapping validity windows per brand×manufacturer×kind) and
+`core.check_entity_alias()` (proves a polymorphic alias target exists via
+`core.entity_types`; `core.find_orphan_entity_aliases()` reports leaks).
+Cross-organization pairing is prevented structurally by composite FKs
+`(tenant_id, organization_id, x_id)`, so the reference design's
+scope/owner-sync triggers are unnecessary.
+
+**HTTP.** `/api/brands`, `/api/manufacturers`, `/api/entities`; each list is a
+Slim DTO backed by `load_only`, each detail a Fat DTO with `selectinload`ed
+children. Both masters are taggable and carry documents, and are searchable
+via `search/registry.py` (`brands`, `manufacturers`).
 
 ## Circuit breaker — upgraded
 

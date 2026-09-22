@@ -1,9 +1,10 @@
-"""Roles business logic — always inside the caller's tenant (tenancy filter)."""
+"""Roles business logic — organization-scoped (inside the caller's tenant)."""
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exception.errors import AppError, ConflictError, NotFoundError
+from app.database.tenancy import current_organization_id
 from app.modules.activity.recorder import record_activity
 from app.modules.roles.model import SYSTEM_ROLES, Role
 from app.modules.roles.schema import RoleCreate, RoleUpdate
@@ -26,10 +27,23 @@ async def get_role(db: AsyncSession, ref: str) -> Role:
     return role
 
 
+def _require_org() -> int:
+    organization_id = current_organization_id()
+    if organization_id is None:
+        raise RoleRuleError(
+            "No organization is bound to this request; choose one with the 'X-Organization-Id' header.",
+            data={"hint": "GET /api/organizations lists them"},
+        )
+    return organization_id
+
+
 async def create_role(db: AsyncSession, body: RoleCreate, *, actor_id: int | None) -> Role:
-    if await db.scalar(select(Role.id).where(func.lower(Role.code) == body.code.lower())):
-        raise ConflictError(f"Role code '{body.code}' already exists in this tenant")
-    role = Role(**body.model_dump())
+    organization_id = _require_org()
+    if await db.scalar(select(Role.id).where(
+        Role.organization_id == organization_id, func.lower(Role.code) == body.code.lower()
+    )):
+        raise ConflictError(f"Role code '{body.code}' already exists in this organization")
+    role = Role(**body.model_dump(), organization_id=organization_id)
     db.add(role)
     await db.flush()
     await record_activity(db, action="role_created", actor_id=actor_id, subject_type="Role", subject_id=role.id,
@@ -57,7 +71,9 @@ async def delete_role(db: AsyncSession, ref: str, *, reason: str, actor_id: int 
     role = await get_role(db, ref)
     if role.is_system:
         raise RoleRuleError(f"'{role.code}' is a system role and cannot be deleted")
-    holders = await db.scalar(select(func.count()).select_from(User).where(User.role_id == role.id))
+    holders = await db.scalar(select(func.count()).select_from(User).where(
+        User.role_id == role.id, User.organization_id == role.organization_id
+    ))
     if holders:
         raise RoleRuleError(f"{holders} user(s) still hold role '{role.code}'; reassign them first")
     role.soft_delete(reason=reason, by=actor_id)
@@ -66,13 +82,18 @@ async def delete_role(db: AsyncSession, ref: str, *, reason: str, actor_id: int 
                           context={"reason": reason})
 
 
-async def seed_system_roles(db: AsyncSession) -> list[Role]:
-    """Idempotent: create the missing system roles in the CURRENT tenant."""
-    existing = set((await db.scalars(select(Role.code))).all())
+async def seed_system_roles(db: AsyncSession, organization_id: int) -> list[Role]:
+    """Idempotent: create the missing system roles for one organization."""
+    existing = set((await db.scalars(
+        select(Role.code).where(Role.organization_id == organization_id)
+    )).all())
     created = []
     for code, name, description in SYSTEM_ROLES:
         if code not in existing:
-            role = Role(code=code, name=name, description=description, is_system=True)
+            role = Role(
+                code=code, name=name, description=description, is_system=True,
+                organization_id=organization_id,
+            )
             db.add(role)
             created.append(role)
     await db.flush()

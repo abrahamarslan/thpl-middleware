@@ -57,7 +57,7 @@ th-middleware/
 |---|---|
 | `env.py` | Async migration environment. Imports `Base` and every module's `model.py` so `--autogenerate` detects tables. URL comes from `app.core.conf.settings`. |
 | `script.py.mako` | Template for generated migration files. |
-| `versions/` | Generated migrations live here. Create: `./manage.sh makemig "add zoho_contacts"`; apply: `./manage.sh migrate`. Includes `20260917_1800_a1b2c3d4e5f6_add_country_code_to_users.py` (adds `country_code` to `users`). |
+| `versions/` | Generated migrations live here. Create: `./manage.sh makemig "add zoho_contacts"`; apply: `./manage.sh migrate`. Includes `20260917_1800_a1b2c3d4e5f6_add_country_code_to_users.py` (adds `country_code` to `users`) and `20260922_0900_b1a2c3d4e5f6_core_master_data_brands_manufacturers.py` (the `core` schema: brands, manufacturers, brand_manufacturers, manufacturer_identifiers, entity_types, entity_aliases + the guard functions). |
 
 ### 2.2b Logging config — `config/logging/` (baked into the image; bind-mountable)
 
@@ -163,14 +163,19 @@ Business/compliance audit — distinct from operational logging (`app/core/loggi
 
 #### `app/modules/users/` — users & authentication
 
-Authentik is the IdP; this module owns the **custom users table** (full port of the
-Laravel migrations — every column, PostGIS geography fields, JSONB, all indexes).
+Authentik is the IdP; this module owns the **custom users table**, ported from the
+Laravel migrations and since **organization-scoped and location-free**: the ~90
+address/coordinate/geoname/tracking columns were decomposed onto the location hub
+(`geo.place_links` → `geo.places`) and a telemetry pair of its own
+(`user_live_locations`, `user_location_pings`). See
+[analysis](analysis-report/user-new-architecture.md) §10 and the
+[implementation plan](implementation-plan/users-update-implementation-plan.md).
 
 | File | Purpose / usage |
 |---|---|
-| `users/model.py` | `User` (200+ columns: identity, 2FA, status, personal/family, professional, company, preferences, textual + geospatial location, `country_code` ISO-2, tracking metadata, integration IDs incl. **Authentik mirror state**, targets, login tracking, audit, soft deletes), `PasswordResetToken` (hardened one-time-code row: keyed `code_hash`, attempt cap, expiry, send-count/cooldown), `LoginOtpToken` (passwordless email OTP challenge), `Country` (ISO 3166-1 alpha-2/3, numeric, dialing code, currency, continent), `Timezone` (IANA identifier), `CountryTimezone` (many-to-many with partial unique default index), and `UserProfile` (dual-key `BigIntPKWithUUIDMixin`, `user_id` FK, timezone settings, auto/manual `TimezoneSource`). Geography columns get GIST indexes automatically. |
-| `users/schema.py` | `UserProfileBase` (every editable field), `UserCreate`/`UserUpdate`/`UserOut` (secrets excluded; geography as WKT strings), `UserListFilters`, auth schemas (login, **login-OTP**, register, refresh, password flows; password fields use the policy `PasswordStr` type; reset/OTP take a single `identifier`), `CountryOut`, `CountryTimezoneOut`, `UserProfileUpdate`, and `UserProfileOut`. |
-| `users/crud.py` | Lookups (id/email/username/**phone**/external_id), filtered + paginated list, create/update, soft-delete/restore/hard-delete, reset-token + login-OTP storage. |
+| `users/model.py` | `User` (`MultiTenantMixin` — `organization_id` **NOT NULL**, role held through the composite FK `(tenant_id, organization_id, role_id)`; identity, 2FA, status, personal/family, professional, company, preferences, device binding, integration IDs incl. **Authentik mirror state**, login tracking, audit, soft deletes. Location is reduced to two caches: `country_code` and `primary_place_id`), `UserLiveLocation` (one row per user, upserted on every fix — hot but isolated from the users row so GPS writes never contend with auth reads), `UserLocationPing` (append-only history, monthly RANGE partitions on `recorded_at` + a DEFAULT partition), `PasswordResetToken` (hardened one-time-code row: keyed `code_hash`, attempt cap, expiry, send-count/cooldown), `LoginOtpToken` (passwordless email OTP challenge), `Country` (ISO 3166-1 alpha-2/3, numeric, dialing code, currency, continent), `Timezone` (IANA identifier), `CountryTimezone` (many-to-many with partial unique default index), and `UserProfile` (dual-key `BigIntPKWithUUIDMixin`, `user_id` FK, timezone settings, auto/manual `TimezoneSource`). Geography columns get GIST indexes automatically. |
+| `users/schema.py` | `UserProfileBase` (every editable field), `UserCreate`/`UserUpdate`/`UserOut` (secrets excluded), `UserListFilters` (`city`/`state`/`country` resolve through the address book, not the user row), `LocationUpdate` + `LiveLocationOut` (lat/lng on the wire, PostGIS geography in storage — converted at this boundary only), auth schemas (login, **login-OTP**, register, refresh, password flows; password fields use the policy `PasswordStr` type; reset/OTP take a single `identifier`), `CountryOut`, `CountryTimezoneOut`, `UserProfileUpdate`, and `UserProfileOut`. |
+| `users/crud.py` | Lookups (id/email/username/**phone**/external_id), filtered + paginated list (city/state/country via an `EXISTS` over `geo.place_links` → `geo.places`), create/update, soft-delete/restore/hard-delete, **location telemetry** (`upsert_live_location` as a single `INSERT … ON CONFLICT`, `record_location_ping`, `point()` — longitude first), reset-token + login-OTP storage. |
 | `users/identifiers.py` | Resolves an auth `identifier` (email \| username \| phone) to a user, shape-driven with a username fallback. |
 | `users/security.py` | Password hashing (bcrypt) + one-time code hashing (keyed HMAC-SHA256, never plaintext) and numeric code generation. |
 | `users/tokens.py` | Shared first-party token-pair issuance (`issue_token_pair`) used by password and OTP login. |
@@ -181,10 +186,10 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `users/audit.py` | Auth **event catalog** + `audit()` dual-write helper (append-only `activity_logs` row + structured log); `commit=True` persists failure-path state before raising. |
 | `users/auth_emails.py` | Auth transactional emails (typed Pydantic contexts) sent through the reusable email layer: welcome, login OTP, password reset code/link, password changed. Templates live in `users/templates/`. |
 | `users/templates/` | Auth email HTML/text templates (Jinja2) extending the shared `_base.en.html` shell. |
-| `users/service.py` | Registration (+ welcome email + profile initialization), login with lockout, token pair issuance/refresh, change password, **password reset** (delegates to `password_reset`), **Authentik JIT provisioning**, full CRUD lifecycle with WKT→PostGIS conversion, and `UserProfile` operations (`get_or_create_profile`, `set_user_country` with auto-timezone, `set_user_timezone_manually`, cached countries/timezones). |
+| `users/service.py` | Registration (+ welcome email + profile initialization), login with lockout, token pair issuance/refresh, change password, **password reset** (delegates to `password_reset`), **Authentik JIT provisioning**, full CRUD lifecycle, **`resolve_user_organization`** (every creation path — register, admin create, Authentik JIT, dev-token — resolves an organization before the row is flushed, because `organization_id` is NOT NULL and unauthenticated paths have no org bound), **`record_location`** / **`get_live_location`** (telemetry), **`refresh_primary_place`** (the one writer of the `users.primary_place_id` cache; the geo address service calls it), and `UserProfile` operations (`get_or_create_profile`, `set_user_country` with auto-timezone, `set_user_timezone_manually`, cached countries/timezones). |
 | `users/authentik_sync.py` | **Outbound sync orchestration** (app → Authentik): `sync_create/update_profile/set_password/set_active/delete`, local→Authentik field mapping, `SyncResult` enum, `AUTHENTIK_SYNCED_FIELDS`. Best-effort — never raises into the request. See [docs/AUTHENTIK_SYNC.md](AUTHENTIK_SYNC.md). |
 | `users/deps.py` | `CurrentUser` dependency: accepts Authentik RS256 **or** first-party HS256 tokens, resolves/provisions the DB user, rejects deactivated accounts. Used by every protected endpoint. |
-| `users/api.py` | `/api/auth/*` (register with localized friendly messages, login, **login-otp/request**, **login-otp/verify**, refresh, **logout**, me, password-policy, change/forgot/reset-password, dev-token), `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore, **ban/unban**, **throttle/unthrottle**, moderation status), `countries_router` (`/api/countries`, `/api/countries/{iso2}/timezones`), and `me_router` (`/api/me/profile`). All auth entry points resolve request IP/device/GeoIP audit context and are audited. |
+| `users/api.py` | `/api/auth/*` (register with localized friendly messages, login, **login-otp/request**, **login-otp/verify**, refresh, **logout**, me, password-policy, change/forgot/reset-password, dev-token), `/api/users/*` (list with filters, create, get, update, soft/hard delete, restore, **ban/unban**, **throttle/unthrottle**, moderation status, **`GET /{id}/location`** for dispatch), `countries_router` (`/api/countries`, `/api/countries/{iso2}/timezones`), and `me_router` (`/api/me/profile`, **`PATCH /api/me/location`** + `GET /api/me/location`). A user's *addresses* are not here: they go through the platform-wide address book (`/api/addresses`, `owner_type=user`) — one address API for every entity. All auth entry points resolve request IP/device/GeoIP audit context and are audited. |
 | `users/lang/en.py` | English translation catalog for user module responses (`register.success`, `profile.updated`, etc.). |
 | `users/generators/user_factory.py` | Mock data generation factories: `create_mock_user` and `create_mock_user_profile`. |
 | `users/seeders/reference.py` | Reference data seeder populating `countries`, `timezones`, and `country_timezones` from ISO 3166-1 `countries.json` and IANA `zone1970.tab`. |
@@ -238,6 +243,31 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `model.py` | `zoho_organizations` mirror (strict schema + org business columns; partial unique index on live `zoho_id`). |
 | `schema.py` / `crud.py` / `service.py` / `api.py` | Local-first CRUD at `/api/zoho/organizations`: reads from Postgres, writes via the outbox, `POST /sync` triggers an engine run. |
 
+#### `app/modules/brands|manufacturers|entities/` — `core` master data (migration `20260922_0900_b1a2c3d4e5f6`)
+
+Canonical (non-Zoho) masters in a dedicated `core` schema — the same shape
+`currencies` established: `OrgEntityMixin` (tenant + organization NOT NULL) +
+`PolymorphicOwnerMixin` provenance + `SoftDeleteFilteredMixin` +
+`BigIntPKWithUUIDv7Mixin`; `name_normalized`/`value_normalized`/`alias_normalized`
+are STORED generated columns with pg_trgm GIN indexes; every uniqueness rule is
+a partial index. Cross-organization pairing is prevented structurally by
+composite FKs `(tenant_id, organization_id, x_id)`, so the reference design's
+scope/owner-sync triggers are not needed; the genuine database guards are kept
+as triggers (brand-tree cycle, validity-window overlap, deferred alias integrity).
+
+| Path | Purpose / usage |
+|---|---|
+| `brands/model.py` | `Brand` (name/slug/code/kind/self-referential `parent_id`/country/logo key) and `BrandManufacturer` (role, default, `[valid_from, valid_to)` window). |
+| `brands/service.py` + `api.py` | `/api/brands`: Slim list / Fat detail, create/update (`row_version` → 409), soft delete, brand↔manufacturer link surface; slug de-duplication and the parent-cycle walk. |
+| `manufacturers/model.py` | `Manufacturer` (name/legal_name/slug/code/country + verification) and `ManufacturerIdentifier` (GSTIN/PAN/CIN/FSSAI/…, statutory-format CHECKs on `value_normalized`). |
+| `manufacturers/service.py` + `api.py` | `/api/manufacturers`: CRUD + identifier add/remove; early 422 on a bad statutory format. |
+| `entities/model.py` | `EntityType` (registry) and `EntityAlias` (polymorphic names; `core.check_entity_alias()` proves the target at COMMIT). |
+| `entities/scope.py` + `enums.py` | `require_organization()`/`CoreRuleError` and the shared `CORE_SCHEMA` / `MasterOwnerType` vocabularies. |
+
+Both masters inherit `HasTagsMixin` and `HasDocumentsMixin`; searchable via
+`search/registry.py` (`brands`, `manufacturers`); Debezium
+`table.include.list` carries `core.brands`/`core.manufacturers`.
+
 #### `app/modules/tags|documents|media|emails|search/` — cross-cutting modules (see [docs/MODULES.md](MODULES.md))
 
 | Path | Purpose / usage |
@@ -284,6 +314,7 @@ Laravel migrations — every column, PostGIS geography fields, JSONB, all indexe
 | `test_response_messages.py` | Hermetic: module language catalog loading, memory caching, parameter interpolation, and fallback resolution. |
 | `test_zone1970_parser.py` | Unit tests for IANA `zone1970.tab` country timezone mapping and primary timezone defaults. |
 | `test_profile_endpoints.py` | Hermetic & mocked boundary tests for `/api/countries`, `/api/countries/{iso2}/timezones`, `/api/me/profile`, localized `/register` responses, and `/api/zoho/auth/revoke`. |
+| `test_core_master.py` | `core` master data: hermetic schema-shape (generated columns, partial indexes, registry attributes) + integration (brand/manufacturer CRUD, slug de-dupe, parent cycle, validity-window overlap, statutory identifier formats, deferred alias integrity). |
 
 #### `scripts/` — Seeding & Utility Scripts
 

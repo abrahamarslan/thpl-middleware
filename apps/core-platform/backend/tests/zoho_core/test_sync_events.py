@@ -66,8 +66,9 @@ async def test_insert_then_update_then_noop_are_recorded(db):
     await ZohoSyncEngine(db, client_for(ORG), run_id=run_id).run("organizations", "full")
     await db.commit()
 
+    # index_then_detail: the listed row is inserted, then the detail completes it.
     inserted = await events(db, module="organizations", zoho_id="10229182")
-    assert [e.event_type for e in inserted] == ["inserted"]
+    assert [e.event_type for e in inserted] == ["inserted", "updated"]
     assert inserted[0].run_id == run_id and inserted[0].direction == "pull"
     assert inserted[0].local_id is not None
 
@@ -78,10 +79,14 @@ async def test_insert_then_update_then_noop_are_recorded(db):
     await db.commit()
 
     history = await events(db, module="organizations", zoho_id="10229182")
-    assert [e.event_type for e in history] == ["inserted", "updated"]           # unchanged not sampled
-    assert history[1].changed_fields == ["legal_name", "name"]   # a Zoho-linked node's legal name follows Zoho
-    assert history[1].diff == {"name": ["Zillium Inc", "Zillium Renamed"],
-                               "legal_name": ["Zillium Inc", "Zillium Renamed"]}
+    # insert + detail, then the rename (carried by the detail). The thin index
+    # row is undated and strictly thinner than the stored document, so it is
+    # correctly a no-op both times rather than a write per scan.
+    assert [e.event_type for e in history] == ["inserted", "updated", "updated"]
+    rename = history[2]
+    assert rename.changed_fields == ["legal_name", "name"]   # a Zoho-linked node's legal name follows Zoho
+    assert rename.diff == {"name": ["Zillium Inc", "Zillium Renamed"],
+                           "legal_name": ["Zillium Inc", "Zillium Renamed"]}
 
 
 async def test_events_can_be_disabled(db, monkeypatch):
@@ -103,8 +108,28 @@ def org_with_soft_delete(monkeypatch):
 
 
 async def _seed_orgs(db, count: int) -> None:
+    """Seed orgs the way a real sync leaves them: entity row + crosswalk row.
+
+    The reconciliation scan reads the CROSSWALK for "what we hold", not the
+    entity table — which is the point of the split. A row inserted with a
+    ``zoho_id`` echo but no crosswalk entry was never synced, and the sync is
+    right not to tombstone it.
+    """
+    from app.database.tenancy import write_tenant_id
+    from app.modules.sync.crosswalk import upsert_record
+
+    tenant_id = await write_tenant_id(db)
     for i in range(count):
-        db.add(Organization(zoho_id=f"90000{i:04d}", name=f"Org {i}"))
+        external_id = f"90000{i:04d}"
+        org = Organization(zoho_id=external_id, name=f"Org {i}")
+        db.add(org)
+        await db.flush()
+        await upsert_record(
+            db, tenant_id=tenant_id, source_system="zoho", module="organizations",
+            external_id=external_id,
+            values={"entity_table": Organization.__table__.fullname, "entity_id": org.id,
+                    "link_state": "linked", "raw_source": "list:full"},
+        )
     await db.commit()
 
 
@@ -149,7 +174,7 @@ async def test_leased_run_records_the_run_and_links_events(db):
     await db.refresh(run)
     assert run.status == RunStatus.SUCCEEDED and run.created == 1 and run.finished_at
     linked = await events(db, run_id=run.id)
-    assert [e.event_type for e in linked] == ["inserted"]
+    assert [e.event_type for e in linked] == ["inserted", "updated"]   # index, then detail
 
 
 async def test_leased_run_skips_when_the_lane_is_busy(db):
