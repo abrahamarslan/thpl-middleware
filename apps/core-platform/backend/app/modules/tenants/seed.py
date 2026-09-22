@@ -142,8 +142,31 @@ async def _upsert_tenant(db: AsyncSession, p: CompanyProfile) -> tuple[Tenant, b
     return tenant, created
 
 
+#: The placeholder organization migration ``fdbf62102e86`` creates for a tenant
+#: that has none, so ``users``/``roles`` had somewhere to land when they became
+#: organization-scoped. It is a scaffold, not a company.
+_MIGRATION_PLACEHOLDER = "DEFAULT-HQ"
+
+
 async def _upsert_organization(db: AsyncSession, p: CompanyProfile, *, actor_id: int | None) -> tuple[Organization, bool]:
     org = await db.scalar(select(Organization).where(Organization.org_code == p.org_code))
+    if org is None:
+        # Adopt the migration's placeholder rather than adding a second row
+        # beside it. A freshly migrated database has exactly one organization
+        # and it is a scaffold; creating the real company next to it would
+        # leave the tenant with two, which is the state that makes every
+        # "which organization?" fallback ambiguous for good.
+        # Runs inside tenant_scope, so the tenancy filter confines this to the
+        # tenant being seeded.
+        placeholder = await db.scalar(
+            select(Organization).where(Organization.org_code == _MIGRATION_PLACEHOLDER)
+        )
+        if placeholder is not None:
+            logger.info("tenants.seed_adopted_placeholder", from_code=_MIGRATION_PLACEHOLDER,
+                        to_code=p.org_code, org_id=placeholder.id)
+            placeholder.org_code = p.org_code
+            placeholder.org_type = OrganizationType.LEGAL_ENTITY.value
+            org = placeholder
     custom = _custom_attributes(p)
     if org is None:
         from app.modules.organizations import service as org_service
