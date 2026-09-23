@@ -167,7 +167,15 @@ class UserOut(UserProfileBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    email: EmailStr
+    # Plain `str`, NOT `EmailStr`: this is an OUTPUT model. The row already
+    # exists — its email was validated (or deliberately bypassed) at write
+    # time by whichever path created it (RegisterRequest, Authentik JIT
+    # provisioning, the DEBUG-only dev-token user). Re-validating on the way
+    # out makes every read 500 for any row whose email uses a special-use
+    # domain (`dev@local.test`, `<sub>@authentik.local`) that email-validator
+    # rejects as syntactically ineligible, even though it's a normal string
+    # already sitting in the database.
+    email: str
     email_verified_at: datetime | None = None
     phone_verified_at: datetime | None = None
     two_factor_confirmed_at: datetime | None = None
