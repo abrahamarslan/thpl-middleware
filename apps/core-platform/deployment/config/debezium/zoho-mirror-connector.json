@@ -9,7 +9,7 @@
   "plugin.name": "pgoutput",
   "slot.name": "zoho_mirror",
   "publication.autocreate.mode": "filtered",
-  "table.include.list": "public.zoho_contacts,public.zoho_items,org_management.tenants,org_management.organizations,public.roles,public.zoho_currencies,public.zoho_taxes,public.zoho_locations,public.zoho_users,public.zoho_sync_stats,public.zoho_queue_logs,public.email_events,public.email_links,core.brands,core.manufacturers,public.hubs,public.fleet_partners,public.vehicles,public.vehicle_compliance_documents,public.driving_licenses,public.user_live_locations,public.user_location_pings,public.kyc_profiles,public.background_verifications,public.consent_records,public.employment_records,public.bank_accounts",
+  "table.include.list": "org_management.tenants,org_management.organizations,public.roles,public.zoho_locations,public.zoho_users,public.zoho_sync_stats,public.zoho_queue_logs,public.email_events,public.email_links,core.brands,core.manufacturers,public.hubs,public.fleet_partners,public.vehicles,public.vehicle_compliance_documents,public.driving_licenses,public.user_live_locations,public.user_location_pings,public.kyc_profiles,public.background_verifications,public.consent_records,public.employment_records,public.bank_accounts,currency.currencies,currency.exchange_rates,tax.tax_components,tax.tax_exemptions,sync.sync_records",
   "snapshot.mode": "initial",
   "tombstones.on.delete": "false",
   "decimal.handling.mode": "double",

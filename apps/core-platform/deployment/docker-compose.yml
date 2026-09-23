@@ -65,8 +65,14 @@ x-backend-env: &backend-env
   # CORS
   CORS_ORIGINS: ${CORS_ORIGINS}
   CORS_CREDENTIALS: ${CORS_CREDENTIALS:-true}
-  # Tenancy (docs/tenancy/README.md): rows written without a tenant context go here
+  # Tenancy (docs/tenancy/README.md): rows written without a tenant context go
+  # here. DEFAULT_ORGANIZATION_CODE completes the pair — `app/database/scope.py`
+  # resolves it inside DEFAULT_TENANT_CODE and refuses the write
+  # (422 organization_required) when neither the request nor these name an
+  # organization. Passing only the tenant, as this file used to, left the
+  # containers with no default organization at all.
   DEFAULT_TENANT_CODE: ${DEFAULT_TENANT_CODE:-default}
+  DEFAULT_ORGANIZATION_CODE: ${DEFAULT_ORGANIZATION_CODE:-}
   # Platform administrators (manage tenants), comma-separated emails
   PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
   # Zoho

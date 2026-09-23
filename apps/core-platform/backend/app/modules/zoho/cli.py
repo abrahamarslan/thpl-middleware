@@ -198,6 +198,25 @@ async def cmd_runs(limit: int, module: str | None) -> int:
     return 0
 
 
+async def cmd_reconcile(limit: int) -> int:
+    """Drain ``sync.pending_references`` — link the FKs a DEFER left NULL.
+
+    A document that named a master we had not synced yet queued a waiter. Once
+    the owning module has run, the crosswalk can answer and the foreign key is
+    written. Safe to run repeatedly: what still cannot resolve is kept, with
+    ``attempts`` incremented, and reported rather than dropped.
+    """
+    from app.modules.sync.reconcile import drain_pending_references
+    from app.modules.zoho.control.tenancy import zoho_scope
+
+    async with async_session_factory() as db:
+        async with zoho_scope(db, "reconcile") as (tenant_id, _organization_id):
+            report = await drain_pending_references(db, tenant_id=tenant_id, limit=limit)
+            await db.commit()
+    print(_table([report.as_dict()], ["scanned", "linked", "still_missing", "skipped"]))
+    return 0
+
+
 # ── entry point ─────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -212,6 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     runs = sub.add_parser("runs", help="recent runs")
     runs.add_argument("--limit", type=int, default=20)
     runs.add_argument("--module")
+    reconcile = sub.add_parser("reconcile", help="link deferred references (sync.pending_references)")
+    reconcile.add_argument("--limit", type=int, default=500)
     args = parser.parse_args(argv)
 
     async def _run() -> int:
@@ -222,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
                 return await cmd_sync(args.modules or None, args.mode)
             if args.command == "status":
                 return await cmd_status()
+            if args.command == "reconcile":
+                return await cmd_reconcile(args.limit)
             return await cmd_runs(args.limit, args.module)
         finally:
             from app.database.db import engine
