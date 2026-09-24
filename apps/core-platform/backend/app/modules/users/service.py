@@ -798,6 +798,26 @@ async def get_my_profile_view(db: AsyncSession, user: User) -> UserMeOut:
     return out
 
 
+# ── Self-service organization (GET /api/auth/me/organization) ─────────────────
+
+async def get_my_organization(db: AsyncSession, user: User) -> Any:
+    """The organization the authenticated user belongs to.
+
+    Login returns tokens only and ``GET /api/auth/me`` carries no organization,
+    so a freshly signed-in client has no way to learn the ``org_code`` it must
+    send as ``X-Organization-Code``. ``users.organization_id`` is NOT NULL, so
+    this always resolves; the organizations lookup stays inside the caller's
+    tenant. Deliberately the user's OWN organization, independent of any
+    ``X-Organization-*`` header that selects an active branch for the request.
+    """
+    if user.organization_id is None:  # pragma: no cover — NOT NULL on `users`
+        raise NotFoundError("Your account is not attached to an organization")
+
+    from app.modules.organizations import service as organizations
+
+    return await organizations.get_organization(db, str(user.organization_id))
+
+
 async def _attach_user_residence(db: AsyncSession, user: User, body: Any) -> None:
     """Write a residential address through the location hub.
 

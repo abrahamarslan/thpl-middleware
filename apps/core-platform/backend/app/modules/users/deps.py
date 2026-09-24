@@ -14,8 +14,10 @@ Use it on any endpoint that needs the authenticated user:
 Tenancy (docs/tenancy/README.md §4): after authentication the request is bound
 to the user's tenant — every ORM query is filtered to it and every insert is
 stamped with it. A user of a suspended/cancelled tenant is refused. The active
-organization is the user's own, or the ``X-Organization-Id`` header (uuid of
-an organization of the SAME tenant).
+organization is the user's own, or the ``X-Organization-Id`` / ``X-Organization-Code``
+header (an organization of the SAME tenant). Both headers are optional: a
+malformed ``X-Organization-Id`` is treated as a code rather than refused, so an
+optional header never blocks a request.
 """
 
 import uuid
@@ -75,6 +77,15 @@ async def _authenticate(db, credentials: HTTPAuthorizationCredentials | None) ->
     return user
 
 
+def _is_uuid(value: str) -> bool:
+    """True when ``value`` is a syntactically valid UUID."""
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
 async def _bind_tenancy(
     db, user: User, *, org_uuid: str | None = None, org_code: str | None = None,
 ) -> None:
@@ -84,6 +95,12 @@ async def _bind_tenancy(
     also work in — but only one of **their own tenant**: both lookups are
     confined by ``for_tenant``, so neither header can reach across tenants.
     Naming nothing binds the user's own organization.
+
+    ``X-Organization-Id`` is documented as a uuid, but a client that only holds
+    the human-readable code routinely sends it here — and the code is the
+    resolution-order-first form anyway. A non-uuid value is therefore treated as
+    a code instead of refused: an optional header must never block a request. An
+    explicit ``X-Organization-Code`` still wins when both are present.
     """
     from app.database import scope
     from app.database.tenancy import bind_user
@@ -93,11 +110,9 @@ async def _bind_tenancy(
         raise ForbiddenError("Your organization's account is suspended or closed; contact your administrator")
 
     organization_id = None
-    if org_uuid:
-        try:
-            uuid.UUID(org_uuid)
-        except ValueError:
-            raise ForbiddenError("X-Organization-Id must be an organization uuid") from None
+    if org_uuid and not _is_uuid(org_uuid):
+        org_code = org_code or org_uuid
+        org_uuid = None
     if org_code or org_uuid:
         chosen = await scope.resolve(
             db, org_code=org_code, org_uuid=org_uuid, for_tenant=user.tenant_id,

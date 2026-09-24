@@ -20,6 +20,7 @@ from app.common.response.schema import PageModel, ResponseModel
 from app.common.security.jwt import create_access_token
 from app.core.conf import settings
 from app.database.db import DBSession
+from app.modules.organizations.schema import OrganizationOut
 from app.modules.users import login_otp, moderation, service
 from app.modules.users.deps import CurrentUser, OrganizationCode
 from app.modules.users.password_policy import get_password_policy
@@ -307,6 +308,28 @@ async def update_my_profile(
     """
     data = await service.update_my_profile(db, user, body, client=client)
     return ResponseModel.ok(data=data, module="users", msg_key="profile_updated")
+
+
+# ════════════════════════════════ ME / ORGANIZATION ══════════════════════════
+# Login returns tokens only and `/me` carries no organization, so a signed-in
+# client otherwise has no way to learn the code it must send as
+# `X-Organization-Code`. This returns the organization the user BELONGS to —
+# never the branch an `X-Organization-*` header selects for the request.
+
+@me_router.get("/organization", response_model=ResponseModel[OrganizationOut])
+@auth_router.get("/me/organization", response_model=ResponseModel[OrganizationOut])
+async def get_my_organization(db: DBSession, user: CurrentUser):
+    """The authenticated user's own organization.
+
+    The ``org_code`` here is what a client sends back as ``X-Organization-Code``
+    on subsequent calls; the rest of the profile (legal name, type, status,
+    locale, address) is included for display. Both organization headers remain
+    optional throughout the API.
+    """
+    org = await service.get_my_organization(db, user)
+    return ResponseModel.ok(
+        data=OrganizationOut.model_validate(org), module="users", msg_key="organization_fetched",
+    )
 
 
 # ════════════════════════════════ ME / LOCATION ══════════════════════════════

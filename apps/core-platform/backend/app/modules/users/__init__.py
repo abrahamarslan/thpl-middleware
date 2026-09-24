@@ -5,7 +5,7 @@ Three routers (`users/api.py`):
                 password-policy, forgot-password, reset-password, dev-token
   /api/users/*  admin CRUD (list/get/create/update/soft-delete/restore) and
                 a user's last known position
-  /api/me/*     the authenticated user's own profile and location
+  /api/me/*     the authenticated user's own profile, organization and location
 
 A user belongs to ONE organization (`organization_id` NOT NULL) and holds a role
 OF THAT ORGANIZATION. Creation paths therefore resolve an organization before

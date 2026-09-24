@@ -175,3 +175,105 @@ def test_the_deployment_is_configured_with_both_halves():
     at all — the state that left the stack writing to a tenant the seeder never
     touched. Both belong in .env and in docker-compose.yml."""
     assert settings.DEFAULT_TENANT_CODE, "DEFAULT_TENANT_CODE must name the deployment's tenant"
+
+
+# ── the id header is optional: a code in it must never block ─────────────────
+
+async def test_a_non_uuid_organization_id_header_is_treated_as_a_code(worlds):
+    """`X-Organization-Id` is documented as a uuid, but a client that only holds
+    the code sends it there — the reported failure. It must be read as a code,
+    not refused; passing the code in BOTH headers is the exact case."""
+    client, acme, _ = worlds
+    headers = acme.auth(
+        acme.member,
+        **{"X-Organization-Id": acme.organization.org_code,
+           "X-Organization-Code": acme.organization.org_code},
+    )
+    assert (await client.get("/api/organizations", headers=headers)).status_code == 200
+
+
+async def test_me_accepts_the_code_in_the_organization_id_header(worlds):
+    """The exact reported case: a client sends the code in the id header (only).
+    It must resolve as a code, never be refused for not being a uuid."""
+    client, acme, _ = worlds
+    response = await client.get(
+        "/api/auth/me",
+        headers=acme.auth(acme.member, **{"X-Organization-Id": acme.organization.org_code}),
+    )
+    assert response.status_code == 200
+
+
+async def test_a_malformed_id_with_a_valid_code_is_not_blocked(worlds):
+    """A malformed id next to a valid code is ignored: the code wins and the
+    request is not refused for the id's format."""
+    client, acme, _ = worlds
+    response = await client.get(
+        "/api/auth/me",
+        headers=acme.auth(acme.member, **{"X-Organization-Id": "not-a-uuid",
+                                          "X-Organization-Code": acme.organization.org_code}),
+    )
+    assert response.status_code == 200
+
+
+async def test_a_nonuuid_id_that_names_no_organization_is_a_clean_refusal(worlds):
+    """Leniency is about FORMAT, not about accepting nonsense: a value that is
+    not a uuid and matches no code is still a normal 403 with the code message —
+    never the old 'must be an organization uuid' string."""
+    client, acme, _ = worlds
+    response = await client.get(
+        "/api/auth/me",
+        headers=acme.auth(acme.member, **{"X-Organization-Id": "NO-SUCH-CODE"}),
+    )
+    assert response.status_code == 403
+    assert "must be an organization uuid" not in response.text
+
+
+async def test_a_valid_but_foreign_org_id_is_still_refused(worlds):
+    """Leniency is ONLY for a malformed id. A well-formed uuid of another tenant
+    is still a 403 — the isolation model is untouched."""
+    client, acme, globex = worlds
+    headers = globex.auth(globex.member, **{"X-Organization-Id": str(acme.organization.uuid)})
+    assert (await client.get("/api/organizations", headers=headers)).status_code == 403
+
+
+# ── GET /api/auth/me/organization: the code a signed-in client needs ─────────
+
+async def test_me_organization_returns_the_users_own_organization(worlds):
+    client, acme, _ = worlds
+    response = await client.get("/api/auth/me/organization", headers=acme.auth(acme.member))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["msg"] == "Organization retrieved successfully."
+    assert body["data"]["org_code"] == "ACME-HQ"
+    assert body["data"]["legal_name"] == "ACME HQ"
+    assert body["data"]["uuid"] == str(acme.organization.uuid)
+
+
+async def test_me_organization_alias_matches(worlds):
+    """`/api/me/organization` and `/api/auth/me/organization` are the same view."""
+    client, acme, _ = worlds
+    auth = acme.auth(acme.member)
+    primary = await client.get("/api/auth/me/organization", headers=auth)
+    alias = await client.get("/api/me/organization", headers=auth)
+    assert primary.status_code == 200 and alias.status_code == 200
+    assert primary.json()["data"] == alias.json()["data"]
+
+
+async def test_me_organization_reports_the_users_own_not_the_selected_branch(worlds):
+    """`/me` is the user's OWN organization. A header may select a branch as the
+    request's active scope, but the identity returned here is not the branch."""
+    client, acme, _ = worlds
+    created = await client.post(
+        "/api/organizations", headers=acme.auth(acme.admin),
+        json={"org_code": "ACME-BRANCH", "legal_name": "Acme Branch", "org_type": "solo"},
+    )
+    assert created.status_code == 201, created.text
+    branch = created.json()["data"]
+
+    response = await client.get(
+        "/api/auth/me/organization",
+        headers=acme.auth(acme.member, **{"X-Organization-Id": branch["uuid"]}),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["data"]["org_code"] == "ACME-HQ"
+

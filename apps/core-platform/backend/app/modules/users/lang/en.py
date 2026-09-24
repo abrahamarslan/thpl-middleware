@@ -17,6 +17,7 @@ MESSAGES: dict[str, str] = {
     "country_updated": "Country updated successfully.",
     "timezone_updated": "Timezone updated successfully.",
     "profile_fetched": "Profile retrieved successfully.",
+    "organization_fetched": "Organization retrieved successfully.",
 
     # Location telemetry
     "location_recorded": "Location recorded successfully.",

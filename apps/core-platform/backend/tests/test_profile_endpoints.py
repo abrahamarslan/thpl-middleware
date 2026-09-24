@@ -11,6 +11,7 @@ from app.common.client_info import get_client_info
 from app.database.db import get_db
 from app.database.scope import Scope
 from app.main import app
+from app.modules.organizations.model import Organization
 from app.modules.users.deps import get_current_user
 from app.modules.users.model import TimezoneSource, User, UserProfile
 from app.modules.users.schema import ProfileAddressIn, UserMeOut, UserSelfUpdate
@@ -424,3 +425,35 @@ async def test_register_assigns_country_and_timezone_from_geoip(mocker):
     assert create_args["timezone"] == "America/New_York"
     assert create_args["currency"] == "USD"
     assert create_args["organization_id"] == 1
+
+
+def test_get_my_organization_endpoint(mocker):
+    """Login carries no organization and `/me` has none either, so this is how a
+    client learns its `org_code` — without sending any organization header."""
+    now = datetime.now(UTC)
+    mock_org = Organization(
+        id=10, tenant_id=1, uuid=uuid.uuid4(), org_code="ACME-HQ", legal_name="Acme HQ",
+        org_type="solo", status="active", hierarchy_path=f"/{uuid.uuid4()}/", depth=0,
+        is_verified=False, row_version=1, custom_attributes={},
+        created_at=now, updated_at=now,
+    )
+    mocker.patch(
+        "app.modules.users.service.get_my_organization",
+        new_callable=AsyncMock,
+        return_value=mock_org,
+    )
+
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
+    app.dependency_overrides[get_db] = lambda: AsyncMock()
+
+    try:
+        client = TestClient(app)
+        response = client.get("/api/auth/me/organization")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["code"] == "ok"
+        assert body["msg"] == "Organization retrieved successfully."
+        assert body["data"]["org_code"] == "ACME-HQ"
+        assert body["data"]["legal_name"] == "Acme HQ"
+    finally:
+        app.dependency_overrides.clear()
