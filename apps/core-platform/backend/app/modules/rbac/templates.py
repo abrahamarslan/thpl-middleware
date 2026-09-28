@@ -70,6 +70,15 @@ _OPERATIONAL: frozenset[str] = frozenset({
 })
 
 
+#: Reviewing field work: shifts, visits, anomalies — and the tracks behind them (``users.location:read``,
+#: deliberately withheld from ``member``). Managers see only their own teams' people through the fieldops
+#: team filter (``fieldops/scope.py``) until RBAC data scope exists.
+_FIELD_REVIEW: frozenset[str] = frozenset({
+    "fieldops.shift:read", "fieldops.shift:approve", "fieldops.visit:read", "fieldops.visit:approve",
+    "fieldops.anomaly:read", "fieldops.anomaly:approve", "users.location:read",
+})
+
+
 def _templates() -> tuple[RoleTemplate, ...]:
     reads = codes_matching(actions={"read"})
     return (
@@ -89,7 +98,7 @@ def _templates() -> tuple[RoleTemplate, ...]:
                 "teams.job_title:read", "teams.team_type:read", "teams.team_role:read",
                 "teams.team:read", "teams.membership:read", "teams.membership:assign",
                 "teams.membership:approve", "hr.employment:read",
-            }),
+            }) | _FIELD_REVIEW | {"fieldops.policy:read"},
         ),
         RoleTemplate(
             "team_manager", "Team Manager", "Manages a team and its members", 50, GrantMode.EXPLICIT,
@@ -98,7 +107,7 @@ def _templates() -> tuple[RoleTemplate, ...]:
                 "teams.team_type:read", "teams.team_role:read", "teams.team:read",
                 "teams.team:update", "teams.membership:read", "teams.membership:assign",
                 "teams.membership:approve",
-            }),
+            }) | _FIELD_REVIEW,
         ),
         RoleTemplate(
             "auditor", "Auditor", "Read-only access to everything, plus the audit log",
@@ -117,6 +126,11 @@ def _templates() -> tuple[RoleTemplate, ...]:
                 # admin+ only, is what lets a moderator touch anyone's).
                 "comments.comment:create", "comments.comment:read",
                 "comments.comment:update", "comments.comment:delete",
+                # Field work (docs/fieldops/): run one's OWN shifts/visits and report location. What a
+                # worker MUST do is fieldops.work_policies, not a permission. Telephonic/video visits
+                # (fieldops.telephonic_visit:create) are deliberately in NO template — each organization
+                # grants it to the roles that phone customers.
+                "fieldops.field_work:use",
             }) | _OPERATIONAL,
         ),
     )

@@ -90,9 +90,13 @@ optional `address` block (postal fields + `latitude`/`longitude`) becomes a
 (`owner_type=user`, default `link_type=current`, primary) — the profile
 endpoint is a facade over the address book, never a second address store.
 
-A fix writes `user_live_locations` (upsert) and `user_location_pings` (append)
-and touches no column on `users` except `is_location_set` — that isolation is
-why the tables exist. **Addresses are not stored in this module**: they go
+The two `/me/location` routes are served by the field-ops module
+(`app/modules/fieldops/api_me.py`, [docs/fieldops/README.md](../fieldops/README.md)): a fix is a
+one-item batch into the location stream `fieldops.location_pings` (which replaced
+`user_location_pings`) and refreshes `user_live_locations` — never backwards in time, and not for
+a fix the stream flags as implausible (mock, impossible speed, too inaccurate). New field apps batch
+fixes to `POST /api/me/location-pings`. A fix touches no column on `users` except
+`is_location_set` — that isolation is why the tables exist. **Addresses are not stored in this module**: they go
 through the platform-wide address book (`/api/addresses` with
 `owner_type=user`), which the profile endpoint above delegates to.
 

@@ -185,12 +185,12 @@ Settings: `EMAIL_PROVIDER`, `EMAIL_ENABLED`, `EMAIL_LOG_ONLY`,
   service calls `users.service.refresh_primary_place` on every attach/update/
   detach, which is the only writer of that column. `GET /api/users?city=…`
   (and `state`/`country`) resolves through the address book, not the user row.
-- **Position telemetry** is two tables of its own so a GPS burst never contends
-  with the row authentication reads: `user_live_locations` (one row per user,
-  a single `INSERT … ON CONFLICT` per fix — what dispatch and beat planning
-  read) and `user_location_pings` (append-only history, monthly partitions plus
-  a DEFAULT partition so a late offline replay is never rejected).
-  `PATCH /api/me/location` records a fix, `GET /api/me/location` and
+- **Position telemetry** never touches the row authentication reads:
+  `user_live_locations` (one row per user — what dispatch and beat planning read)
+  is the last-known projection of the field-ops stream `fieldops.location_pings`,
+  which replaced `user_location_pings` (see "Field operations" below).
+  `PATCH /api/me/location` (now served by `app/modules/fieldops/api_me.py`)
+  records a fix as a one-item batch; `GET /api/me/location` and
   `GET /api/users/{id}/location` read the last one. The only `users` column a
   fix touches is `is_location_set`.
 
@@ -289,6 +289,17 @@ scope/owner-sync triggers are unnecessary.
 Slim DTO backed by `load_only`, each detail a Fat DTO with `selectinload`ed
 children. Both masters are taggable and carry documents, and are searchable
 via `search/registry.py` (`brands`, `manufacturers`).
+
+**Zoho sync** (`brands/zoho/`, migration `20260928_1700_999509053c9f`) mirrors
+Zoho Books' real but **undocumented** `/brands` (`{brand_id, name}`, unpaginated,
+no incremental filter, detail buys nothing) into `core.brands` through the
+crosswalk — a `zoho_id` echo, `match_on=()` (never auto-merge a same-named local
+brand; a genuine collision fails loudly at `uq_brands_scope_name`). INBOUND
+only: only `GET` was verified, no push is built. This reverses the table's
+original "not a Zoho mirror" design, on the user's explicit instruction once the
+endpoint was confirmed live — `docs/implementation-plan/brands-zoho-sync.md`.
+Only `name` is Zoho-owned on a linked row; everything else (slug, code, kind,
+hierarchy, …) stays fully locally editable.
 
 ## Categories & taxonomies — `app/modules/categories/` (schema `core`, migrations `20260925_1000_c7a1e9b2d4f8` + `20260925_1400_c063729f29c2`)
 
@@ -404,6 +415,36 @@ safety net (walks the registry, `STABLE`).
 Adding a field = a `field_definitions` row; adding an owner type = a
 `core.entity_types` row. No migration either way. Owner-type launch seeding and
 a Zoho field-definition sync are separate workstreams.
+
+## Field operations — `app/modules/fieldops/` (schema `fieldops`, migration `20260929_1000_5d8c2e1f7a90`)
+
+Shifts (with pauses), visits (field / telephonic / video), visit tasks, and THE location
+stream for FSA/DLP. Full reference: [docs/fieldops/README.md](fieldops/README.md); design
+and rationale: [spec](fieldops/implementation-of-shift-visits-system.md),
+[review](fieldops/improvement-document.md).
+
+- **One stream.** `fieldops.location_pings` holds every fix — continuous tracking and the
+  labelled checkpoints of shift start/pause/resume/end, visit start/end and tasks. Monthly
+  partitions on the device fix time (clamped), a DEFAULT partition, replay-proof through
+  `(tenant, user, uuid, recorded_at)`. Shifts and visits store times, never coordinates.
+- **Business time is `occurred_at`**, derived from the device's monotonic clock, else its
+  skew-corrected wall clock (`clock.py`) — an offline start at 09:02 synced at 18:40 starts
+  at 09:02. `client_timestamp` (raw device time) is kept beside it everywhere.
+- **Invariants in the database:** one open (active|paused) shift per user, one open pause per
+  shift, one in-progress visit per user. Closing a shift closes its pause and cancels its
+  stuck visits in the same transaction; auto-close never invents a long shift (a ghost closes
+  at 0 minutes and is flagged).
+- **Obligations vs permissions:** `fieldops.work_policies` (per organization × base role) says
+  what a worker MUST do; RBAC says what they MAY — `fieldops.field_work:use` (member),
+  `fieldops.telephonic_visit:create` (granted per organization role), review/read codes for
+  managers. Manager reads are narrowed to their teams and reports (`scope.py`).
+- **Geofencing** is accuracy-aware and advisory by default; soft/hard blocking never refuses a
+  start that already happened offline. Everything estimated or suspicious opens an idempotent
+  **anomaly** and puts the shift/visit in the review queue.
+- **Offline safety:** client UUIDv7s make creates replay-safe; `X-Idempotency-Key` replays
+  transitions from `core.idempotency_keys` (`app/modules/idempotency/`, platform-wide).
+- Background work in `app/tasks/fieldops.py` (auto-close, orphan linking, metrics, checkpoint
+  geocoding, missed visits, partitions/retention).
 
 ## Circuit breaker — upgraded
 

@@ -102,6 +102,13 @@ CAT_DETAIL_EXTRA = {
 }
 CATEGORIES = [CAT_HAIR, CAT_SKIN, CAT_SOAP]        # hierarchical order: parent before child
 
+# Brands, shaped like the LIVE (undocumented) /brands response (captured 2026-09-28):
+# a flat, unpaginated, two-field list; the detail document adds nothing.
+BRANDS = [
+    {"brand_id": "954919000013118046", "name": "DABUR"},
+    {"brand_id": "954919000013143235", "name": "HIMALAYA"},
+]
+
 USERS = [
     {"user_id": "982000000554041", "role_id": "982000000006005", "name": "Sujin Kumar",
      "email": "johndavid@zilliuminc.com", "user_role": "admin", "status": "active", "is_current_user": True,
@@ -120,7 +127,7 @@ class ZohoWire:
         self.data = {"currencies": copy.deepcopy(CURRENCIES), "taxes": copy.deepcopy(TAXES),
                      "tax_exemptions": copy.deepcopy(TAX_EXEMPTIONS),
                      "locations": copy.deepcopy(LOCATIONS), "users": copy.deepcopy(USERS),
-                     "categories": copy.deepcopy(CATEGORIES)}
+                     "categories": copy.deepcopy(CATEGORIES), "brands": copy.deepcopy(BRANDS)}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -151,6 +158,9 @@ class ZohoWire:
             return self._ok({"users": self.data["users"], **paged})
         if path == "/categories":
             return self._categories_list(request, paged)
+        if path == "/brands":
+            # live: per_page/page/last_modified_time are all silently ignored.
+            return self._ok({"brands": self.data["brands"]})
         if match := re.fullmatch(r"/categories/(-?\d+)", path):      # index_then_detail
             rows = [CAT_ROOT, *self.data["categories"]]
             detail = next((c for c in rows if c["category_id"] == match.group(1)), None)
@@ -255,7 +265,7 @@ async def test_the_planner_schedules_every_master_and_the_runs_mirror_them(db, w
     # `tax_groups` is registered DISABLED (Zoho documents no list endpoint), so
     # the planner schedules every master except that one.
     assert sorted(m for m, lane in enqueued if lane == "scheduled") == sorted(
-        ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users", "categories")
+        ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users", "categories", "brands")
     )
     # `categories` is the one INCREMENTAL master, so it alone also gets the weekly
     # full-reconcile lane — the only scan that can see a category Zoho deleted.
@@ -268,23 +278,25 @@ async def test_the_planner_schedules_every_master_and_the_runs_mirror_them(db, w
     assert results["tax_exemptions"]["created"] == 2
     assert results["locations"]["created"] == 1 and results["users"]["created"] == 2
     assert results["categories"]["created"] == 3          # the synthetic ROOT is NOT one of them
+    assert results["brands"]["created"] == 2
 
     # organizations: 1 list + 1 detail. taxes: 1 list + 2 details, categories: 1 list + 3 details
-    # (index_then_detail). currencies / tax_exemptions / locations / users: 1 list each.
-    assert len(wire.requests) == 13 and wire.calls_to("/organizations/10229182") == 1
+    # (index_then_detail). currencies / tax_exemptions / locations / users / brands: 1 list each.
+    assert len(wire.requests) == 14 and wire.calls_to("/organizations/10229182") == 1
     assert wire.calls_to("/settings/taxes/982000000566009") == 1
     assert wire.calls_to("/categories/-1") == 0           # ROOT was never even listed
+    assert wire.calls_to("/brands") == 1 and wire.calls_to("/brands/954919000013118046") == 0
 
     # the governor counted every call; the runs and events are recorded
-    assert (await zoho_governor.snapshot())["used"] == 13
+    assert (await zoho_governor.snapshot())["used"] == 14
     # `run_all` executes every REGISTERED module, so `tax_groups` gets a run too
     # even though the planner never schedules it (direction=disabled).
     assert set(await db.scalars(select(ZohoSyncRun.module))) == {
         "organizations", "currencies", "taxes", "tax_groups", "tax_exemptions", "locations", "users",
-        "categories",
+        "categories", "brands",
     }
     assert await db.scalar(select(func.count()).select_from(ZohoSyncEvent)
-                           .where(ZohoSyncEvent.event_type == "inserted")) == 13
+                           .where(ZohoSyncEvent.event_type == "inserted")) == 15
 
     from app.modules.locations.model import ZohoLocation
     from app.modules.zoho_users.model import ZohoUser
@@ -313,7 +325,7 @@ async def test_a_second_pass_writes_nothing_and_a_zoho_change_lands(db, wire):
     # then the detail document), so two taxes make four applies — the edited
     # CGST detail is the one update, the other three are unchanged.
     assert second["taxes"]["updated"] == 1 and second["taxes"]["unchanged"] == 3
-    for module in ("currencies", "tax_exemptions", "locations", "users", "organizations", "categories"):
+    for module in ("currencies", "tax_exemptions", "locations", "users", "organizations", "categories", "brands"):
         assert second[module]["created"] == second[module]["updated"] == 0, module
 
     # Scoped to the module: `organizations` is index-then-detail, so its own
@@ -331,7 +343,8 @@ async def test_the_cli_runs_the_same_pipeline(db, wire, capsys):
     assert await cli.cmd_runs(10, None) == 0
     out = capsys.readouterr().out
     print(out)                                               # visible with -s
-    for module in ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users", "categories"):
+    for module in ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users", "categories",
+                  "brands"):
         assert module in out
     assert "failed" not in out
 

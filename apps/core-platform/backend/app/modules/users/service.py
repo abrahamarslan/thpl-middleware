@@ -30,7 +30,6 @@ from app.modules.users.authentik_sync import AUTHENTIK_SYNCED_FIELDS, SyncResult
 from app.modules.users.model import Country, CountryTimezone, Timezone, TimezoneSource, User, UserProfile
 from app.modules.users.password_policy import validate_password
 from app.modules.users.schema import (
-    LocationUpdate,
     LoginRequest,
     RegisterRequest,
     TokenPair,
@@ -645,62 +644,6 @@ async def logout(db: AsyncSession, user: User, *, client: ClientInfo | None = No
 
 
 # ── Location telemetry ────────────────────────────────────────────────────────
-
-async def record_location(
-    db: AsyncSession, user: User, body: LocationUpdate, *, client: ClientInfo | None = None,
-) -> Any:
-    """Record one position fix: upsert the live row, append to the history.
-
-    Both writes happen in the caller's transaction, so a fix is either fully
-    recorded or not at all — dispatch reading `user_live_locations` can never
-    see a position that has no corresponding ping.
-
-    The `users` row is NOT touched (that isolation is the reason the telemetry
-    tables exist), with one exception: `is_location_set` is the flag the apps
-    read to decide whether to ask for a location, and it belongs to the user.
-    """
-    recorded_at = body.recorded_at or datetime.now(UTC)
-    coordinates = crud.point(body.latitude, body.longitude)
-
-    live_values: dict[str, Any] = {
-        "coordinates": coordinates,
-        "recorded_at": recorded_at,
-        "received_at": datetime.now(UTC),
-    }
-    # Only what the device actually sent — see the ON CONFLICT set_ in crud.
-    for field in (
-        "place_id", "accuracy_m", "altitude_m", "altitude_accuracy_m", "heading_deg",
-        "speed_mps", "location_source", "is_moving", "tracking_active",
-        "background_tracking_enabled", "device_id", "device_type", "network_type",
-    ):
-        value = getattr(body, field)
-        if value is not None:
-            live_values[field] = value
-    if client is not None and client.ip:
-        live_values["ip_address"] = client.ip
-
-    live = await crud.upsert_live_location(db, user=user, values=live_values)
-    await crud.record_location_ping(db, user=user, values={
-        "coordinates": coordinates,
-        "recorded_at": recorded_at,
-        "place_id": body.place_id,
-        "accuracy_m": body.accuracy_m,
-        "altitude_m": body.altitude_m,
-        "heading_deg": body.heading_deg,
-        "speed_mps": body.speed_mps,
-        "location_source": body.location_source,
-        "device_id": body.device_id,
-    })
-
-    if not user.is_location_set:
-        user.is_location_set = True
-    await db.flush()
-    logger.info(
-        "users.location_recorded",
-        user_id=user.id, source=body.location_source, accuracy_m=body.accuracy_m,
-    )
-    return live
-
 
 async def get_live_location(db: AsyncSession, user_id: int) -> Any:
     """The user's last known position, or ``None`` if they never reported one."""

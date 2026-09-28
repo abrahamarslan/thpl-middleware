@@ -254,6 +254,40 @@ live API, not just the vendored doc — details and evidence in
   Synced rows land in a per-organization `zoho` taxonomy auto-provisioned by
   `core.fill_category_default_taxonomy()`.
 
+## 9b. Worked example: brands (Zoho Books, undocumented endpoint)
+
+`app/modules/brands/zoho/` mirrors a **real but undocumented** Zoho Books
+resource — `/brands` is not in `docs/zoho-docs-md/` at all. Every fact below
+came from a live, read-only probe (2026-09-28), not from a spec:
+[implementation-plan/brands-zoho-sync.md](implementation-plan/brands-zoho-sync.md)
+has the full transcript.
+
+- **`GET /brands`** → `{brands: [{brand_id, name}]}`, no `page_context` →
+  `paginated=False`; `page`/`per_page` are silently ignored (confirmed
+  unpaginated, not just a small org). `GET /brands/{id}` returns the identical
+  two fields → `detail_required=False`.
+- **`last_modified_time` is accepted but does nothing** — every row still comes
+  back regardless. Declaring `INCREMENTAL` against a no-op filter would be
+  worse than not declaring it (the cursor bookkeeping would run for nothing and
+  imply narrowing that never happens) → `strategy=FULL`,
+  `modified_since_param=None`.
+- **INBOUND, no outbound seam.** Only `GET` was verified; `POST`/`PUT`/`DELETE`
+  were deliberately never attempted (no vendored contract to write against, and
+  a wrong guess against live data is worse than no adapter). No
+  `to_zoho_payload`.
+- **Crosswalk, `match_on=()`.** Same as `taxes`: two authorities can share a
+  name, so a Zoho brand is never auto-merged into a local one — a genuine
+  collision fails loudly at `core.brands`' own `uq_brands_scope_name` instead of
+  silently duplicating or merging.
+- **Reverses a documented design decision.** `core.brands` was built "not a
+  Zoho mirror"; this adapter exists because the user explicitly asked for it
+  once the endpoint was confirmed live, not because the endpoint was assumed to
+  exist. `brands/zoho/hooks.py::stamp_scope` (copied from
+  `currencies/zoho/hooks.py`, not shared — the rule-error types differ) supplies
+  the provenance pair (`owner_type`/`owner_id`) the payload cannot, plus a slug
+  fallback (Zoho sends no URL key). Only `name` becomes Zoho-owned on a linked
+  row; everything else on `Brand` stays fully local.
+
 ## 10. Async-in-Celery pattern
 
 The stack is asyncpg-only; Celery workers are synchronous. Every task runs

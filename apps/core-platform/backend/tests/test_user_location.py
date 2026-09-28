@@ -5,6 +5,10 @@ Three layers per `<testing_doctrine>`:
   unit          the WKT conversion (longitude first) and the request schema;
   integration   the live/ping write path and its isolation from `users`;
   integration   the address-book hook that keeps `users.primary_place_id` true.
+
+`/me/location` now lives in the field-ops module: each fix is a one-item batch into
+``fieldops.location_pings`` (the history that replaced ``user_location_pings``) and
+refreshes ``user_live_locations``. These tests pin that the legacy contract still holds.
 """
 
 import uuid
@@ -13,9 +17,10 @@ import pytest
 from sqlalchemy import func, select
 
 from app.database.tenancy import tenant_scope
+from app.modules.fieldops.model import LocationPing
 from app.modules.geo.schema import AddressCreate, PlaceCreate
 from app.modules.users import crud, service
-from app.modules.users.model import User, UserLiveLocation, UserLocationPing
+from app.modules.users.model import User, UserLiveLocation
 from app.modules.users.schema import LocationUpdate
 
 # Tarrina's own district — the platform's actual operating area.
@@ -47,12 +52,17 @@ def test_the_request_schema_refuses_impossible_fixes():
 # ── integration ─────────────────────────────────────────────────────────────
 
 async def test_a_fix_upserts_the_live_row_and_appends_to_the_history(worlds, db):
+    import datetime as dt
+
     client, acme, _ = worlds
     headers = acme.auth(acme.member)
 
+    # Ten minutes before the second fix: the stream rejects ~300 m in milliseconds as an impossible
+    # hop (it would not move the live position), so the fixes carry realistic device times.
     first = await client.patch("/api/me/location", headers=headers,
                                json={**GODHRA, "accuracy_m": 8.5, "location_source": "gps",
-                                     "tracking_active": True, "device_id": "dlp-001"})
+                                     "tracking_active": True, "device_id": "dlp-001",
+                                     "recorded_at": (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=10)).isoformat()})
     assert first.status_code == 200, first.text
     body = first.json()
     assert body["msg"] == "Location recorded successfully."
@@ -71,8 +81,8 @@ async def test_a_fix_upserts_the_live_row_and_appends_to_the_history(worlds, db)
 
     assert await db.scalar(select(func.count()).select_from(UserLiveLocation)
                            .where(UserLiveLocation.user_id == acme.member.id)) == 1
-    assert await db.scalar(select(func.count()).select_from(UserLocationPing)
-                           .where(UserLocationPing.user_id == acme.member.id)) == 2
+    assert await db.scalar(select(func.count()).select_from(LocationPing)
+                           .where(LocationPing.user_id == acme.member.id)) == 2
 
 
 async def test_telemetry_is_scoped_to_the_users_tenant_and_organization(worlds, db):

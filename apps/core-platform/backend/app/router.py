@@ -16,6 +16,9 @@ from app.modules.documents.api import router as documents_router
 from app.modules.emails.api import router as emails_router
 from app.modules.entities.api import router as entities_router
 from app.modules.favorites.api import router as favorites_router
+from app.modules.fieldops.api import router as fieldops_router
+from app.modules.fieldops.api_me import auth_alias_router as fieldops_auth_alias_router
+from app.modules.fieldops.api_me import router as fieldops_me_router
 from app.modules.files.api import router as files_router
 from app.modules.fleet_partners.api import router as fleet_partners_router
 from app.modules.geo.api import (
@@ -118,3 +121,8 @@ api_router.include_router(hubs_router, prefix="/hubs", tags=["hubs"])
 api_router.include_router(fleet_partners_router, prefix="/fleet-partners", tags=["fleet-partners"])
 api_router.include_router(vehicles_router, prefix="/vehicles", tags=["vehicles"])
 api_router.include_router(driving_licenses_router, prefix="/driving-licenses", tags=["driving-licenses"])
+# Field operations (docs/fieldops/): the field app's own shifts/visits/location under /me, the
+# managers' side under /fieldops. /api/auth/me/location is the historical alias of /api/me/location.
+api_router.include_router(fieldops_me_router, prefix="/me", tags=["fieldops"])
+api_router.include_router(fieldops_auth_alias_router, prefix="/auth", tags=["fieldops"])
+api_router.include_router(fieldops_router, prefix="/fieldops", tags=["fieldops"])

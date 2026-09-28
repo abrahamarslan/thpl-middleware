@@ -191,17 +191,25 @@ recreate it.
 
 `{ref}` is a uuid (preferred) or the numeric id.
 
-## 10. Deliberately not built yet
+## 10. The telemetry layer lives in field operations
 
-The reference design also carries a telemetry layer — `location_events`, `location_pings`,
-`track_segments`, `user_live_locations`. It is **not** here, because every one of those tables
-references `shifts`, `visits` or `route_stops`, none of which exist in this platform, and the
-hypertables need TimescaleDB, which this stack does not run. Building them now would mean six
-tables nothing can write to.
+The reference design also carried a telemetry layer (`location_events`, `location_pings`,
+`track_segments`, `user_live_locations`). It was held back until shifts and visits existed; it
+is now **built in `app/modules/fieldops`** ([docs/fieldops/README.md](../fieldops/README.md)),
+on plain PostgreSQL partitions rather than TimescaleDB:
 
-The address book stands on its own and is what Phase 6 (contacts, invoices, estimates) needs.
-When field tracking arrives, `LocationEvent` hangs off `geo.places` and `geo.geofences`
-unchanged — that is what the `dwell_threshold_s` policy on a fence is already for.
+* `fieldops.location_pings` is the platform's one location history (it replaced
+  `user_location_pings`); `user_live_locations` is its last-known projection;
+* visits point at `geo.places` (`visits.place_id`), and verification reads `geo.geofences`
+  unchanged — polygon or circle, `dwell_threshold_s` for entry/exit detection;
+* the only addition to this schema is `geo.geofences.visit_enforcement`, a per-fence override of
+  the field-ops policy's enforcement mode (advisory / soft_block / hard_block);
+* a place with no drawn fence is judged by its own coordinates, with a radius scaled by its
+  verification status (`field_verified` vs `geocoded_only`) — `unverified` / `disputed` places
+  never judge anyone.
+
+A place still has no telemetry of its own (Design Rule Zero holds): the stream refers to places,
+never the reverse.
 
 ## 10b. Geocoding
 
@@ -228,4 +236,4 @@ Straight-line maths with no provider and no dependency lives in
 | 3 | Resolve `places.admin_boundary_id` on write once boundaries are seeded (`boundary_for_point` exists) |
 | 4 | Add `contact`, `invoice`, `estimate` to `OWNER_TYPES` with Phase 6, and a CHECK migration |
 | 5 | CDC/search: index `geo.places` in Meilisearch for address type-ahead (the trgm indexes serve SQL search today) |
-| 6 | Telemetry layer, once shifts/visits exist (§10) |
+| 6 | ~~Telemetry layer, once shifts/visits exist~~ — done in field operations (§10) |

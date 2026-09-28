@@ -105,8 +105,25 @@ _TEST_TABLES = (
     "teams.departments",
     "org_management.organizations",   # CASCADE: every tenant table references it
     "roles",
+    # Field operations: ledgers and children before shifts/visits/devices (FK order); the stream is
+    # a partitioned parent — TRUNCATE reaches every partition. core.idempotency_keys is platform-wide.
+    "fieldops.anomalies",
+    "fieldops.state_transitions",
+    "fieldops.location_checks",
+    "fieldops.ping_batches",
+    "fieldops.location_pings",
+    "fieldops.shift_metrics",
+    "fieldops.visit_tasks",
+    "fieldops.visit_participants",
+    "fieldops.visits",
+    "fieldops.shift_pauses",
+    "fieldops.shifts",
+    "fieldops.device_events",
+    "fieldops.device_sessions",
+    "fieldops.devices",
+    "fieldops.work_policies",
+    "core.idempotency_keys",
     # Users & telemetry
-    "user_location_pings",
     "user_live_locations",
     # Hubs / fleet partners / vehicles
     "driving_licenses",

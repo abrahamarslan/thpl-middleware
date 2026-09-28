@@ -13,7 +13,6 @@ from app.modules.users.model import (
     PasswordResetToken,
     User,
     UserLiveLocation,
-    UserLocationPing,
 )
 
 
@@ -202,31 +201,9 @@ async def upsert_live_location(db: AsyncSession, *, user: User, values: dict) ->
     return result.scalar_one()
 
 
-async def record_location_ping(db: AsyncSession, *, user: User, values: dict) -> None:
-    """Append one fix to the partitioned history."""
-    await db.execute(
-        pg_insert(UserLocationPing).values(
-            tenant_id=user.tenant_id,
-            organization_id=user.organization_id,
-            user_id=user.id,
-            **values,
-        )
-    )
-
-
 async def get_live_location(db: AsyncSession, user_id: int) -> UserLiveLocation | None:
     return await db.scalar(select(UserLiveLocation).where(UserLiveLocation.user_id == user_id))
 
-
-async def list_location_pings(
-    db: AsyncSession, user_id: int, *, since: datetime | None = None, limit: int = 100,
-) -> list[UserLocationPing]:
-    """Most recent fixes first. Bounded by `limit` — this table is unbounded."""
-    query = select(UserLocationPing).where(UserLocationPing.user_id == user_id)
-    if since is not None:
-        query = query.where(UserLocationPing.recorded_at >= since)
-    query = query.order_by(UserLocationPing.recorded_at.desc()).limit(limit)
-    return list((await db.scalars(query)).all())
 
 
 # ── Password reset tokens ─────────────────────────────────────────────────────

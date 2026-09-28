@@ -48,6 +48,7 @@ class BrandOut(BrandSlimOut):
     organization_id: int
     owner_type: str | None = None
     owner_id: int | None = None
+    zoho_id: str | None = None
     description: str | None = None
     website_url: str | None = None
     logo_storage_key: str | None = None

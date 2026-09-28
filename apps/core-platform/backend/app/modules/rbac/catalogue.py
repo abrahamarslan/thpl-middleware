@@ -94,6 +94,13 @@ _ENTRIES: list[PermissionSpec] = [
     *_p("fleet", "partner", "create update delete manage", "fleet partners"),
     *_p("fleet", "vehicle", "create update delete manage", "vehicles"),
     *_p("fleet", "driving_license", "read create", "driving licences"),
+    # ── field operations (docs/fieldops/) ───────────────────────────────────
+    *_p("fieldops", "field_work", "use", "the field app: own shifts, pauses, visits, tasks and location"),
+    *_p("fieldops", "telephonic_visit", "create", "telephonic and video visits (granted per organization role)"),
+    *_p("fieldops", "shift", "read update delete approve manage", "field shifts"),
+    *_p("fieldops", "visit", "read update delete approve manage", "field visits"),
+    *_p("fieldops", "anomaly", "read approve", "field-ops anomalies (approve = resolve / dismiss)"),
+    *_p("fieldops", "policy", "create read update delete manage", "field work policies"),
     # ── location hub ────────────────────────────────────────────────────────
     *_p("geo", "place", "create update delete manage verify", "places"),
     *_p("geo", "address", "create update delete verify", "addresses"),

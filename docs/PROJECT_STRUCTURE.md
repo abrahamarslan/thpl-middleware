@@ -243,9 +243,9 @@ address/coordinate/geoname/tracking columns were decomposed onto the location hu
 | `model.py` | `zoho_organizations` mirror (strict schema + org business columns; partial unique index on live `zoho_id`). |
 | `schema.py` / `crud.py` / `service.py` / `api.py` | Local-first CRUD at `/api/zoho/organizations`: reads from Postgres, writes via the outbox, `POST /sync` triggers an engine run. |
 
-#### `app/modules/brands|manufacturers|entities/` — `core` master data (migration `20260922_0900_b1a2c3d4e5f6`)
+#### `app/modules/brands|manufacturers|entities/` — `core` master data (migrations `20260922_0900_b1a2c3d4e5f6`, `20260928_1700_999509053c9f`)
 
-Canonical (non-Zoho) masters in a dedicated `core` schema — the same shape
+Canonical masters in a dedicated `core` schema — the same shape
 `currencies` established: `OrgEntityMixin` (tenant + organization NOT NULL) +
 `PolymorphicOwnerMixin` provenance + `SoftDeleteFilteredMixin` +
 `BigIntPKWithUUIDv7Mixin`; `name_normalized`/`value_normalized`/`alias_normalized`
@@ -258,7 +258,8 @@ as triggers (brand-tree cycle, validity-window overlap, deferred alias integrity
 | Path | Purpose / usage |
 |---|---|
 | `brands/model.py` | `Brand` (name/slug/code/kind/self-referential `parent_id`/country/logo key) and `BrandManufacturer` (role, default, `[valid_from, valid_to)` window). |
-| `brands/service.py` + `api.py` | `/api/brands`: Slim list / Fat detail, create/update (`row_version` → 409), soft delete, brand↔manufacturer link surface; slug de-duplication and the parent-cycle walk. |
+| `brands/service.py` + `api.py` | `/api/brands`: Slim list / Fat detail, create/update (`row_version` → 409), soft delete, brand↔manufacturer link surface; slug de-duplication, the parent-cycle walk, `_guard_zoho_owned` (just `name`, on a linked row). |
+| `brands/zoho/` | Undocumented-but-verified Zoho Books `/brands` adapter (`spec`/`fields`/`hooks`): INBOUND, FULL, unpaginated, crosswalk with `match_on=()`. `zoho_id` echo on `Brand`. Design + live evidence: `docs/implementation-plan/brands-zoho-sync.md`. |
 | `manufacturers/model.py` | `Manufacturer` (name/legal_name/slug/code/country + verification) and `ManufacturerIdentifier` (GSTIN/PAN/CIN/FSSAI/…, statutory-format CHECKs on `value_normalized`). |
 | `manufacturers/service.py` + `api.py` | `/api/manufacturers`: CRUD + identifier add/remove; early 422 on a bad statutory format. |
 | `entities/model.py` | `EntityType` (registry) and `EntityAlias` (polymorphic names; `core.check_entity_alias()` proves the target at COMMIT). |
@@ -333,6 +334,31 @@ the populated typed column matches the definition's data type;
 | `mixins.py` | `HasCustomFieldsMixin` — viewonly, selectinload-friendly `.custom_field_values`; a model sets `custom_fields_owner_type`. |
 | `service.py` + `api.py` | `/api/custom-fields`: data-type lookup, definition CRUD (Slim list / Fat detail), value set/sync/delete, and `erase-pii`. Values are submitted as plain JSON scalars and placed in the correct column by the definition's data type. |
 | `seed.py` | The `data_types` catalog (Zoho vocabulary) and its idempotent seeder (run by the migration and `scripts/seed.py`). |
+
+#### `app/modules/fieldops/` — field operations: shifts, pauses, visits, tasks, the location stream (migration `20260929_1000_5d8c2e1f7a90`)
+
+Schema `fieldops`. The FSA/DLP work session (shift, with pauses), customer engagements (visits:
+field / telephonic / video) and what was done in them (tasks), plus THE location history of the
+platform (`location_pings`, which replaced `user_location_pings`). Reference:
+[docs/fieldops/README.md](fieldops/README.md). A leaf module (`.importlinter` `fieldops-is-a-leaf`).
+
+| Path | Purpose / usage |
+|---|---|
+| `model/` | `policy.py` WorkPolicy · `device.py` Device, DeviceSession, DeviceEvent · `shift.py` Shift, ShiftPause, ShiftMetrics · `visit.py` Visit, VisitParticipant, VisitTask · `stream.py` LocationPing (partitioned), PingBatch, LocationCheck · `ledger.py` StateTransition, Anomaly. Every table: bigint PK + `uuid`. |
+| `enums.py` | Every closed vocabulary; CHECKs are generated from it. `QualityFlag` is the ping bitmask. |
+| `clock.py` | PURE: business time from the device's monotonic / wall clocks + send-time headers; the partition-key clamp; the organization's business day. |
+| `verification.py` | PURE: accuracy-aware `classify` / `classify_polygon`, radius from place provenance, the enforcement matrix (`decide`). |
+| `trackmath.py` | PURE: impossible hops, movement, jitter-free distance, coverage/gaps, dwell, interval algebra. |
+| `state.py` | PURE: the lifecycle and review state machines. |
+| `task_types.py` | The visit-task registry: payload model, channels, reference types per `task_type`. |
+| `schema.py` · `deps.py` · `errors.py` | Transport schemas; device-clock / idempotency-key headers and row targets; domain errors with stable codes. |
+| `service/` | `ingest` (batch write path, checkpoints, live projection) · `shifts` (start/pause/resume/end/supersede/auto-close/correct/review) · `visits` · `tasks` · `verify` (the one PostGIS evaluator + dwell) · `metrics` · `anomalies` · `policy` · `devices` · `transitions` (the only status writer) · `geocode` (checkpoint labels). |
+| `crud.py` | Read queries: Slim lists (`load_only`), details, track, live map, review queue. |
+| `scope.py` | Interim data scope for managers' reads (teams, reports) until RBAC data scope exists. |
+| `partitions.py` | Monthly partitions ahead + retention (no pg_partman). |
+| `api_me.py` · `api.py` | `/api/me/…` (the field app, incl. the legacy `/me/location`) · `/api/fieldops/…` (managers). |
+| `app/tasks/fieldops.py` | Celery: auto-close, orphan linking, metrics, checkpoint geocoding, missed visits, maintenance. |
+| `app/modules/idempotency/` | `core.idempotency_keys` + `run()` — replay-safe mutations for offline clients (platform-wide). |
 
 #### `app/modules/tags|documents|media|emails|search/` — cross-cutting modules (see [docs/MODULES.md](MODULES.md))
 

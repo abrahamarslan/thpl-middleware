@@ -35,7 +35,6 @@ from app.modules.users.schema import (
     ForgotPasswordOut,
     ForgotPasswordRequest,
     LiveLocationOut,
-    LocationUpdate,
     LoginOtpRequest,
     LoginOtpVerifyRequest,
     LoginRequest,
@@ -414,34 +413,12 @@ async def get_my_organization(db: DBSession, user: CurrentUser):
 
 
 # ════════════════════════════════ ME / LOCATION ══════════════════════════════
-# The user's position lives in `user_live_locations` / `user_location_pings`,
+# `PATCH/GET /api/me/location` moved to app/modules/fieldops/api_me.py (one-item batches into the
+# field-ops stream). The user's position lives in `user_live_locations` (last known) and
+# `fieldops.location_pings` (history),
 # not on the users row. Addresses are NOT here: they go through the platform-wide
 # address book at `/api/addresses` with `owner_type=user` — one address API for
 # every entity, not one per module.
-
-@me_router.patch("/location", response_model=ResponseModel[LiveLocationOut])
-@auth_router.patch("/me/location", response_model=ResponseModel[LiveLocationOut])
-async def update_my_location(
-    db: DBSession, user: CurrentUser, body: LocationUpdate, client: ClientInfoDep
-):
-    """Report the authenticated user's current position (one fix).
-
-    Called on every GPS update from FSA/DLP, so it writes only the telemetry
-    tables — never the `users` master row that authentication reads.
-    """
-    live = await service.record_location(db, user, body, client=client)
-    return ResponseModel.ok(
-        data=LiveLocationOut.from_row(live), module="users", msg_key="location_recorded",
-    )
-
-
-@me_router.get("/location", response_model=ResponseModel[LiveLocationOut | None])
-@auth_router.get("/me/location", response_model=ResponseModel[LiveLocationOut | None])
-async def get_my_location(db: DBSession, user: CurrentUser):
-    """The authenticated user's last known position (`null` if never reported)."""
-    live = await service.get_live_location(db, user.id)
-    return ResponseModel(data=LiveLocationOut.from_row(live) if live else None)
-
 
 @users_router.get("/{user_id}/location", response_model=ResponseModel[LiveLocationOut | None])
 async def get_user_location(db: DBSession, _: Perm("users.location:read", target=_USER), user_id: int):

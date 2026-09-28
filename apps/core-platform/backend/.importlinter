@@ -1,10 +1,10 @@
-# Import contracts — the platform's dependency rules
-# (docs/zoho-sync-implementation/package-by-feature.md §3, docs/tenancy/README.md §8).
+# Import contracts â€” the platform's dependency rules
+# (docs/zoho-sync-implementation/package-by-feature.md Â§3, docs/tenancy/README.md Â§8).
 # Run:  .venv/bin/lint-imports      (also enforced by tests/test_import_contracts.py)
 #
 # Layers:
-#   tenancy core   app.modules.tenants · organizations · roles (+ users) — everyone may depend on it
-#   Zoho platform  app.modules.zoho                                    — entity-agnostic engine
+#   tenancy core   app.modules.tenants Â· organizations Â· roles (+ users) â€” everyone may depend on it
+#   Zoho platform  app.modules.zoho                                    â€” entity-agnostic engine
 
 [importlinter]
 root_package = app
@@ -19,6 +19,7 @@ forbidden_modules =
     app.modules.locations
     app.modules.zoho_users
     app.modules.categories
+    app.modules.brands
 
 [importlinter:contract:features-never-call-zoho-directly]
 name = Features never import the Zoho transport (reads = local mirror, writes = outbox)
@@ -30,6 +31,7 @@ source_modules =
     app.modules.locations
     app.modules.zoho_users
     app.modules.categories
+    app.modules.brands
     app.modules.tenants
     app.modules.roles
     app.modules.geo
@@ -45,6 +47,7 @@ modules =
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
+    app.modules.brands
 
 # A consumer of taxes (categories carry them; items, customers, invoice lines will)
 # depends on ``taxes``; ``taxes`` never depends on a consumer. That direction is what
@@ -67,6 +70,7 @@ forbidden_modules =
     app.modules.locations
     app.modules.zoho_users
     app.modules.categories
+    app.modules.brands
 
 [importlinter:contract:tenancy-core-below-masters]
 name = The tenancy core never imports a Zoho master module (they depend on it, not the reverse)
@@ -80,6 +84,7 @@ forbidden_modules =
     app.modules.locations
     app.modules.zoho_users
     app.modules.categories
+    app.modules.brands
 
 [importlinter:contract:sync-core-is-source-neutral]
 name = The sync core never imports a source connector or a feature (the engine imports IT)
@@ -94,4 +99,28 @@ forbidden_modules =
     app.modules.locations
     app.modules.zoho_users
     app.modules.categories
+    app.modules.brands
     app.modules.geo
+
+# Field operations is a LEAF: it reads the location hub, users, RBAC, comments, compliance …;
+# none of them may import it back (docs/fieldops/implementation-of-shift-visits-system.md §1).
+# That is why /me/location moved INTO fieldops instead of users calling the ingest.
+[importlinter:contract:fieldops-is-a-leaf]
+name = Nothing below field operations imports it (fieldops depends on them, not the reverse)
+type = forbidden
+source_modules =
+    app.modules.users
+    app.modules.geo
+    app.modules.rbac
+    app.modules.roles
+    app.modules.organizations
+    app.modules.tenants
+    app.modules.teams
+    app.modules.hr
+    app.modules.comments
+    app.modules.compliance
+    app.modules.vehicles
+    app.modules.entities
+    app.modules.idempotency
+forbidden_modules =
+    app.modules.fieldops

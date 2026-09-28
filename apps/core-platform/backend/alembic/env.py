@@ -51,6 +51,8 @@ from app.modules.vehicles import model as _vehicles_model  # noqa: F401
 from app.modules.compliance import model as _compliance_model  # noqa: F401
 from app.modules.kyc import model as _kyc_model  # noqa: F401
 from app.modules.hr import model as _hr_model  # noqa: F401
+from app.modules.idempotency import model as _idempotency_model  # noqa: F401
+from app.modules.fieldops import model as _fieldops_models  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
@@ -71,7 +73,7 @@ _EXTENSION_TABLES = {"layer", "topology", "spatial_ref_sys"}
 #: Zoho retention task) — autogenerate must neither drop nor recreate them.
 #: ``sync_records`` partitions are per-source and created by migration, but they
 #: are still children and must never be compared as standalone tables.
-_PARTITIONED_PARENTS = ("zoho_sync_events", "sync_records", "sync_payloads", "user_location_pings")
+_PARTITIONED_PARENTS = ("zoho_sync_events", "sync_records", "sync_payloads", "location_pings")
 
 
 def _include_object(obj, name, type_, reflected, compare_to):
@@ -92,7 +94,8 @@ def _include_object(obj, name, type_, reflected, compare_to):
 #: Schemas our migrations own. `include_schemas=True` is needed for the tenancy
 #: tables in org_management; everything else (topology, tiger, …) belongs to
 #: PostGIS extensions and is never compared.
-_OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core", "extfields", "media", "teams", "rbac"}
+_OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core", "extfields", "media", "teams",
+                  "rbac", "fieldops"}
 
 
 def _include_name(name, type_, parent_names):

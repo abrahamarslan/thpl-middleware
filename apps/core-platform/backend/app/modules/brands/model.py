@@ -1,8 +1,23 @@
 """``core`` brand master and the brand ↔ manufacturer relation.
 
-    Brand              the brand master (canonical, not a Zoho mirror).
+    Brand              the brand master — canonical, and OPTIONALLY Zoho-fed.
     BrandManufacturer  which manufacturers make/market/import a brand, in what
                        role, with a validity window.
+
+Zoho provenance (added 2026-09-28, `app/modules/brands/zoho/`). Zoho Books
+exposes a real but undocumented ``/brands`` resource — not in
+``docs/zoho-docs-md/`` — verified live as **GET (list) and GET (detail) only**;
+no write method was probed (INBOUND, no ``to_zoho_payload`` seam). The payload
+is just ``{brand_id, name}``. This was a deliberate reversal of the table's
+original design ("not a Zoho mirror"), made on the user's explicit instruction
+once the endpoint was confirmed live (see
+``docs/implementation-plan/brands-zoho-sync.md``). `Brand` is a **crosswalk**
+entity, same shape as `core.categories`: it carries no mirror columns, only the
+``zoho_id`` echo below; identity and gate state live in ``sync.sync_records``.
+``match_on=()`` — a Zoho brand is never auto-merged into a locally-created one
+of the same name (the ``taxes`` precedent: two authorities can share a name,
+never invent a match); a genuine collision fails loudly at the partial unique
+index (``uq_brands_scope_name``) instead of silently duplicating or merging.
 
 Scoping. Both tables are ``OrgEntityMixin``: ``tenant_id`` and
 ``organization_id`` are NOT NULL, so a row always belongs to one organization
@@ -72,13 +87,16 @@ class Brand(
     BigIntPKWithUUIDv7Mixin, OrgEntityMixin, DeactivationMixin, PolymorphicOwnerMixin,
     HasTagsMixin, HasDocumentsMixin, SoftDeleteFilteredMixin, Base,
 ):
-    """A brand master (own, third-party or private-label)."""
+    """A brand master (own, third-party or private-label); optionally Zoho-fed."""
 
     __tablename__ = "brands"
     __table_args__ = (
         # Target of the composite (tenant_id, organization_id, brand_id) FK on
         # brand_manufacturers, and of the self-referential parent FK.
         UniqueConstraint("tenant_id", "organization_id", "id", name="uq_brands_scope_id"),
+        # Zoho identity: one live row per Zoho record (crosswalk checklist item).
+        Index("uq_brands_zoho_id_live", "zoho_id", unique=True,
+              postgresql_where=text("deleted_at IS NULL AND zoho_id IS NOT NULL")),
         CheckConstraint(f"status IN ({values(BrandStatus)})", name="ck_brands_status"),
         CheckConstraint(f"kind IS NULL OR kind IN ({values(BrandKind)})", name="ck_brands_kind"),
         CheckConstraint(f"owner_type IN ({values(MasterOwnerType)})", name="ck_brands_owner_type"),
@@ -110,6 +128,10 @@ class Brand(
     )
 
     # ---- identity ------------------------------------------------------------
+    zoho_id: Mapped[str | None] = mapped_column(
+        Text, index=True,
+        comment="Echo of Zoho's brand_id, written by the sync engine; identity of record is sync.sync_records",
+    )
     name: Mapped[str] = mapped_column(Text, nullable=False, comment="Display/trading name")
     slug: Mapped[str | None] = mapped_column(
         Text, comment="URL-friendly identifier, unique per (tenant, organization) among live rows",

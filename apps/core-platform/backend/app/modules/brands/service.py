@@ -9,9 +9,13 @@
 | a link can never span two organizations | composite FKs (DB) |
 | no overlapping windows per (brand, manufacturer, kind) | ``core.check_brand_manufacturer_overlap()`` (DB) |
 | concurrent edits don't overwrite each other | ``row_version`` |
+| Zoho-owned fields immutable on a linked row | ``_guard_zoho_owned`` (adapter's ``FIELDS`` — just ``name``) |
 
-The brand master is canonical — it carries no source id. External identity lives
-on the sync crosswalk when a brand is eventually linked to an ERP.
+The brand master is canonical and carries no source id of its own — identity
+lives on the sync crosswalk (``sync.sync_records``); ``zoho_id`` on the row is a
+maintained echo, never matched on. A brand's OTHER fields (slug, code, kind,
+parent hierarchy, description, …) have no Zoho counterpart and stay fully
+locally editable even on a linked row.
 """
 
 from __future__ import annotations
@@ -59,6 +63,30 @@ def _slugify(name: str) -> str:
 
 def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+def _is_zoho_linked(brand: Brand) -> bool:
+    return getattr(brand, "zoho_id", None) is not None
+
+
+def _guard_zoho_owned(brand: Brand, changes: dict) -> None:
+    """Refuse a local edit to a column Zoho feeds — just ``name`` today.
+
+    Imported lazily: the adapter imports this package's model, so a module-level
+    import would be a cycle (the same shape as ``categories.service``).
+    """
+    if not _is_zoho_linked(brand):
+        return
+    from app.modules.brands.zoho.spec import ZOHO_OWNED_BRAND_FIELDS
+
+    blocked = sorted(set(changes) & ZOHO_OWNED_BRAND_FIELDS)
+    if blocked:
+        raise CoreRuleError(
+            f"{', '.join(blocked)} {'is' if len(blocked) == 1 else 'are'} owned by Zoho for this brand "
+            f"(zoho_id {brand.zoho_id}); change {'it' if len(blocked) == 1 else 'them'} in Zoho — the next "
+            "sync brings it here",
+            data={"zoho_owned": blocked},
+        )
 
 
 async def _unique_slug(
@@ -148,6 +176,7 @@ async def update_brand(
     brand = await get_brand(db, ref)
     _check_version(brand, body.row_version, f"Brand '{brand.name}'")
     changes = _stringify(body.model_dump(exclude_unset=True, exclude={"row_version"}))
+    _guard_zoho_owned(brand, changes)
 
     if changes.get("name"):
         changes["name"] = changes["name"].strip()

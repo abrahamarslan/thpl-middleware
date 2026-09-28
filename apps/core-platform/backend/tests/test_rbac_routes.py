@@ -32,13 +32,18 @@ RESOURCE_PREFIXES = (
     "/api/roles/{", "/api/organizations/{", "/api/users/{user_id}", "/api/hr/employment/{",
     "/api/locations/{", "/api/addresses/{", "/api/geofences/{", "/api/brands/{", "/api/manufacturers/{",
     "/api/hubs/{", "/api/vehicles/{", "/api/fleet-partners/{", "/api/currencies/{", "/api/documents/{",
+    "/api/fieldops/shifts/{", "/api/fieldops/visits/{", "/api/fieldops/anomalies/{", "/api/fieldops/policies/{",
 )
 #: Handled by the service's own guardrails (escalation, level, last owner), not by a row target.
 NO_TARGET_NEEDED = re.compile(r"^/api/users/\{user_id\}/(roles|base-role)")
 
 #: Sensitive READS — gated too, not only writes.
 GATED_READS = ("/api/users", "/api/activity", "/api/emails", "/api/hr/employment", "/api/hr/org-chart",
-               "/api/zoho/admin/health", "/api/documents/{document_id}", "/api/permissions")
+               "/api/zoho/admin/health", "/api/documents/{document_id}", "/api/permissions",
+               # Field data: people's shifts, visits, tracks and live positions.
+               "/api/fieldops/shifts", "/api/fieldops/shifts/{ref}", "/api/fieldops/shifts/{ref}/track",
+               "/api/fieldops/visits", "/api/fieldops/visits/{ref}", "/api/fieldops/live",
+               "/api/fieldops/anomalies", "/api/fieldops/review-queue", "/api/fieldops/policies")
 
 
 def _walk(routes, prefix=""):

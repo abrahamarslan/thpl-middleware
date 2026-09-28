@@ -146,6 +146,8 @@ class Geofence(BigIntPKWithUUIDMixin, OrgEntityMixin, DeactivationMixin, SoftDel
         CheckConstraint("status IN ('active','suspended','archived')", name="chk_geofence_status"),
         CheckConstraint("valid_to IS NULL OR valid_from IS NULL OR valid_to > valid_from",
                         name="chk_geofence_validity"),
+        CheckConstraint("visit_enforcement IS NULL OR visit_enforcement IN ('advisory','soft_block','hard_block')",
+                        name="chk_geofence_visit_enforcement"),
         Index("uq_geofences_name_live", "tenant_id", "organization_id", "name", unique=True,
               postgresql_where=text("deleted_at IS NULL")),
         Index("ix_geofences_place", "place_id", postgresql_where=text("deleted_at IS NULL")),
@@ -177,6 +179,11 @@ class Geofence(BigIntPKWithUUIDMixin, OrgEntityMixin, DeactivationMixin, SoftDel
     speed_limit_kmh: Mapped[float | None] = mapped_column(Double, comment="Max speed inside the zone")
     entry_alert: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
     exit_alert: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
+    visit_enforcement: Mapped[str | None] = mapped_column(
+        String(20),
+        comment="Per-fence override of the field-ops policy's geofence enforcement "
+                "(advisory / soft_block / hard_block); NULL = follow the policy",
+    )
     tags: Mapped[list[str] | None] = mapped_column(ARRAY(Text), comment="['high_risk','warehouse']")
     valid_from: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     valid_to: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))

@@ -31,7 +31,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    PrimaryKeyConstraint,
     SmallInteger,
     String,
     Text,
@@ -459,15 +458,18 @@ class UserProfile(BigIntPKWithUUIDMixin, TenantEntityMixin, SoftDeleteMixin, Bas
 
 
 # =============================================================================
-# Live location telemetry — isolated from the users master row.
+# Live location — the last-known-position projection of the field-ops stream.
+# The location HISTORY is fieldops.location_pings (app/modules/fieldops); it replaced
+# user_location_pings in migration 5d8c2e1f7a90.
 # =============================================================================
 class UserLiveLocation(IntPKMixin, MultiTenantMixin, AppMetaMixin, TimestampMixin, Base):
     """One row per user — the last known position.
 
     Hot (upserted on every fix) but isolated from the ``users`` row, so GPS
-    writes never contend with authentication/profile reads. Write path is a
-    single ``INSERT ... ON CONFLICT (tenant_id, user_id) DO UPDATE``. This is
-    what dispatch/beat-planning reads.
+    writes never contend with authentication/profile reads. Written ONLY by the
+    field-ops ingest (``fieldops/service/ingest.py::update_live``), recency-guarded:
+    ``recorded_at`` holds the fix's corrected business time, and an offline replay
+    of older fixes never moves it backwards. This is what dispatch/beat-planning reads.
     """
 
     __tablename__ = "user_live_locations"
@@ -507,50 +509,12 @@ class UserLiveLocation(IntPKMixin, MultiTenantMixin, AppMetaMixin, TimestampMixi
     device_type: Mapped[str | None] = mapped_column(String(50))
     network_type: Mapped[str | None] = mapped_column(String(50))
     ip_address: Mapped[str | None] = mapped_column(String(45))
-    recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), comment="Device clock")
+    recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), comment="Business time of the fix (fieldops clock.py: corrected device time)",
+    )
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()"),
     )
 
     def __repr__(self) -> str:
         return f"<UserLiveLocation user={self.user_id} recorded_at={self.recorded_at}>"
-
-
-class UserLocationPing(MultiTenantMixin, AppMetaMixin, Base):
-    """Append-only location history; monthly RANGE partitions on ``recorded_at``.
-
-    Partitions are managed by pg_partman; retention is a partition drop and the
-    window is a ``data_retention_schedules`` row (``location_history``).
-    """
-
-    __tablename__ = "user_location_pings"
-    __table_args__ = (
-        # Partitioned by recorded_at, so the PK must include it.
-        PrimaryKeyConstraint("recorded_at", "id", name="pk_user_location_pings"),
-        Index("ix_user_location_pings_user_time", "tenant_id", "user_id", text("recorded_at DESC")),
-        Index("ix_user_location_pings_time", "tenant_id", text("recorded_at DESC")),
-        {"postgresql_partition_by": "RANGE (recorded_at)",
-         "comment": "Append-only location history; monthly partitions via pg_partman."},
-    )
-
-    id: Mapped[int] = mapped_column(BigInteger, autoincrement=True, nullable=False)
-    user_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
-    )
-    coordinates: Mapped[object | None] = mapped_column(
-        Geography(geometry_type="POINT", srid=4326), nullable=True,
-    )
-    place_id: Mapped[int | None] = mapped_column(BigInteger)
-    accuracy_m: Mapped[float | None] = mapped_column(Float)
-    altitude_m: Mapped[float | None] = mapped_column(Float)
-    heading_deg: Mapped[float | None] = mapped_column(Float)
-    speed_mps: Mapped[float | None] = mapped_column(Float)
-    location_source: Mapped[str | None] = mapped_column(String(20))
-    device_id: Mapped[str | None] = mapped_column(String(255))
-    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    received_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()"),
-    )
-
-    def __repr__(self) -> str:
-        return f"<UserLocationPing user={self.user_id} recorded_at={self.recorded_at}>"

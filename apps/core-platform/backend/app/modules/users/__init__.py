@@ -14,7 +14,7 @@ fails with a NOT NULL violation.
 
 Location is deliberately NOT on the user row: addresses live in the platform-wide
 address book (`geo.place_links`, reached via `/api/addresses`) and position lives
-in `user_live_locations` / `user_location_pings`. `users.primary_place_id` and
+in `user_live_locations` (last known) / `fieldops.location_pings` (history, app/modules/fieldops). `users.primary_place_id` and
 `users.country_code` are caches of those.
 
 Auth is split into focused feature modules: `password_policy` (complexity),

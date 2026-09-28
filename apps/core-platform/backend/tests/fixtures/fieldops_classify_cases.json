@@ -1,0 +1,14 @@
+[
+  {"name": "whole accuracy circle inside", "distance_m": 40, "radius_m": 100, "accuracy_m": 20, "expected": "inside"},
+  {"name": "touching the edge from inside", "distance_m": 80, "radius_m": 100, "accuracy_m": 20, "expected": "inside"},
+  {"name": "centre inside but circle crosses the edge", "distance_m": 90, "radius_m": 100, "accuracy_m": 30, "expected": "uncertain"},
+  {"name": "centre outside but circle reaches in", "distance_m": 120, "radius_m": 100, "accuracy_m": 40, "expected": "uncertain"},
+  {"name": "whole accuracy circle outside", "distance_m": 400, "radius_m": 100, "accuracy_m": 50, "expected": "outside"},
+  {"name": "90 m out with 150 m accuracy is not evidence of outside", "distance_m": 190, "radius_m": 100, "accuracy_m": 150, "max_accuracy_m": 200, "expected": "uncertain"},
+  {"name": "accuracy worse than the policy is no fix", "distance_m": 10, "radius_m": 100, "accuracy_m": 180, "expected": "no_fix"},
+  {"name": "no accuracy reported is no fix", "distance_m": 10, "radius_m": 100, "accuracy_m": null, "expected": "no_fix"},
+  {"name": "no fix at all", "distance_m": null, "radius_m": 100, "accuracy_m": null, "expected": "no_fix"},
+  {"name": "no target is not configured", "distance_m": 10, "radius_m": null, "accuracy_m": 5, "expected": "not_configured"},
+  {"name": "telephonic has nothing to compare", "distance_m": 10, "radius_m": 100, "accuracy_m": 5, "channel": "telephonic", "expected": "not_applicable"},
+  {"name": "video has nothing to compare", "distance_m": null, "radius_m": null, "accuracy_m": null, "channel": "video", "expected": "not_applicable"}
+]

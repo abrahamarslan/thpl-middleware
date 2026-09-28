@@ -38,6 +38,7 @@ celery_app = Celery(
         "app.tasks.media",
         "app.tasks.maintenance",
         "app.tasks.authentik",
+        "app.tasks.fieldops",
     ],
 )
 
@@ -59,6 +60,8 @@ celery_app.conf.update(
         "app.tasks.emails.*": {"queue": "integrations"},
         "app.tasks.documents.*": {"queue": "documents"},
         "app.tasks.media.*": {"queue": "documents"},
+        # Reverse geocoding calls an external provider — the rate-limited lane.
+        "app.tasks.fieldops.geocode_checkpoints": {"queue": "integrations"},
     },
     # Events — required by Flower and celery-exporter
     worker_send_task_events=True,
@@ -110,6 +113,37 @@ celery_app.conf.update(
         "documents-expiry": {
             "task": "app.tasks.documents.expire_due_documents",
             "schedule": crontab(minute="30", hour="21"),
+        },
+        # Field operations (docs/fieldops/implementation-of-shift-visits-system.md §15). Every task
+        # is idempotent; `expires` keeps a stalled queue from replaying a backlog of ticks.
+        "fieldops-auto-close": {
+            "task": "app.tasks.fieldops.auto_close_shifts",
+            "schedule": timedelta(minutes=5),
+            "options": {"expires": 4 * 60},
+        },
+        "fieldops-link-orphan-pings": {
+            "task": "app.tasks.fieldops.link_orphan_pings",
+            "schedule": timedelta(minutes=10),
+            "options": {"expires": 9 * 60},
+        },
+        "fieldops-recompute-metrics": {
+            "task": "app.tasks.fieldops.recompute_stale_metrics",
+            "schedule": timedelta(minutes=15),
+            "options": {"expires": 14 * 60},
+        },
+        "fieldops-geocode-checkpoints": {
+            "task": "app.tasks.fieldops.geocode_checkpoints",
+            "schedule": timedelta(minutes=10),
+            "options": {"expires": 9 * 60},
+        },
+        "fieldops-mark-missed": {
+            "task": "app.tasks.fieldops.mark_missed_visits",
+            "schedule": crontab(minute="5"),
+        },
+        # Partitions ahead + retention + idempotency purge. 21:45 UTC = 03:15 IST (quiet hours).
+        "fieldops-maintenance": {
+            "task": "app.tasks.fieldops.maintenance",
+            "schedule": crontab(minute="45", hour="21"),
         },
     },
 )
