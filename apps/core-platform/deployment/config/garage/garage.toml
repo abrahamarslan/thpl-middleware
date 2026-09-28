@@ -1,0 +1,51 @@
+# ==============================================================================
+# Garage v2.3+ — single-node S3-compatible object storage for the media module.
+# ==============================================================================
+# Mounted read-only at /etc/garage.toml in the `garage` service.
+#
+# Secrets are injected as environment variables and OVERRIDE the placeholders
+# below (Garage supports GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN /
+# GARAGE_METRICS_TOKEN since v0.8.2). Set them in deployment/.env:
+#
+#   GARAGE_RPC_SECRET=$(openssl rand -hex 32)
+#   GARAGE_ADMIN_TOKEN=$(openssl rand -base64 32)
+#   GARAGE_METRICS_TOKEN=$(openssl rand -base64 32)
+#
+# The default bucket + access key are auto-created on first boot by
+# `garage server --single-node --default-bucket` using:
+#
+#   GARAGE_DEFAULT_ACCESS_KEY / GARAGE_DEFAULT_SECRET_KEY / GARAGE_DEFAULT_BUCKET
+#
+# On a real (multi-node) production cluster, set replication_factor = 3 and add
+# bootstrap_peers; this single-node config has no redundancy.
+# ==============================================================================
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"
+metadata_auto_snapshot_interval = "6h"
+
+replication_factor = 1
+compression_level = 2
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "garage:3901"
+# Placeholder — ALWAYS overridden by GARAGE_RPC_SECRET (compose enforces it).
+rpc_secret = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+# Path-style requests work without DNS; vhost-style needs a wildcard record.
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"
+# Placeholders — overridden by GARAGE_ADMIN_TOKEN / GARAGE_METRICS_TOKEN.
+admin_token = "0000000000000000000000000000000000000000000="
+metrics_token = "0000000000000000000000000000000000000000000="

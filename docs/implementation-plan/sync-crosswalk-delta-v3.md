@@ -269,3 +269,29 @@ once a profile shows it, not before.
    source is a WSL path silently fall back to an empty `tmpfs`, and recreating
    them fails with `distro-services/ubuntu.sock: no such file`. Restart Docker
    Desktop after terminating the distro.
+
+---
+
+## 8. Addendum (2026-09-25): `categories` on the crosswalk
+
+`categories` (Zoho Books `/categories`) is the first crosswalk module that is
+**INCREMENTAL** and the first with a **self-referential hierarchy**. Full write-up:
+[`categories-zoho-sync-review.md`](categories-zoho-sync-review.md). What it adds to
+the platform picture:
+
+* **A crosswalk entity carries no mirror columns.** The first cut composed
+  `ZohoIdentityMixin` + `ZohoMirrorMixin` under `crosswalk=True` and got fourteen
+  permanently-NULL columns. §3 stands: business columns plus, at most, the
+  `zoho_id` echo.
+* **A reference to a row of the *same module* is a hook, not a `ReferenceRule`.**
+  The page preload (§4) resolves before any row of the page exists, so a rule would
+  `DEFER` every child whose parent is in the same response. The hook runs after the
+  page flush and queues what it cannot resolve on `sync.pending_references`, so
+  the reconcile lane (§6.3) still sees it. Any table the reconcile lane writes to
+  must tolerate a bare `UPDATE … SET <fk>` — `core.categories.is_root` is now
+  trigger-derived for that reason.
+* **The first INCREMENTAL master turns the weekly-full lane on** — the only scan
+  that can see an upstream delete, and only with
+  `ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING` (§6.5 territory: off everywhere today).
+* **Check a hierarchical list for a synthetic parent.** Zoho prepends a `ROOT`
+  row (`category_id "-1"`) unless `include_root_category=false`.

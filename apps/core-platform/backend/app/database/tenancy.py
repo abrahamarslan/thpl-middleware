@@ -273,10 +273,16 @@ def _stamp_rows(session: Session, _flush_context, _instances) -> None:
             raise TenancyError(
                 f"cannot modify {type(obj).__name__} of tenant {obj.tenant_id} from tenant {tenant_id}"
             )
-        if "updated_by" in cols and actor.user_id is not None:
+        # Both columns, not just "updated_by" in cols: AuditMixin always adds the pair together (so
+        # the two never disagree — see its docstring), and that pairing is also what distinguishes
+        # the mixin's int-FK `updated_by` from an unrelated same-named column with a different shape,
+        # e.g. `system.model.SettingValue.updated_by`, a hand-rolled `String(100)` actor LABEL (no
+        # `updated_by_name` beside it) predating this mixin. Auto-stamping that with an integer user id
+        # broke it at the DB boundary (`invalid input … expected str, got int`) the first time a real,
+        # authenticated actor (not the SYSTEM default, whose user_id is None) edited an existing row.
+        if "updated_by" in cols and "updated_by_name" in cols and actor.user_id is not None:
             obj.updated_by = actor.user_id
-            if "updated_by_name" in cols:
-                obj.updated_by_name = actor.name
+            obj.updated_by_name = actor.name
         if "app_version" in cols:
             obj.app_version = settings.VERSION
 

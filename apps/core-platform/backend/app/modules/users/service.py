@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +37,11 @@ from app.modules.users.schema import (
     UserCreate,
     UserListFilters,
     UserMeOut,
+    UserOut,
+    UserPublicOut,
     UserSelfUpdate,
+    UserSettings,
+    UserSettingsUpdate,
     UserUpdate,
 )
 from app.modules.users.security import hash_password, verify_password
@@ -62,6 +67,19 @@ def _enqueue_authentik(task_name: str, *args) -> None:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _default_role_id(db: AsyncSession, where: Scope, *, code: str = "member") -> int | None:
+    """The system role a new user of ``where``'s organization starts with (``member``).
+
+    ``None`` only if the organization has no seeded roles (the migration and every organization creation
+    seed them); the user is then created role-less and a warning is logged.
+    """
+    from app.modules.rbac import service as rbac_service
+
+    return await rbac_service.default_role_id(
+        db, tenant_id=where.tenant_id, organization_id=where.organization_id, code=code,
+    )
+
 
 async def resolve_user_organization(db: AsyncSession, *, org_code: str | None = None) -> Scope:
     """Where a new user is created.
@@ -134,6 +152,9 @@ async def register(
         # in a tenant its own organization does not belong to.
         "tenant_id": where.tenant_id,
         "organization_id": where.organization_id,
+        # A self-registered user is a regular member of the organization — never role-less (a role-less
+        # user holds no grants once permissions are enforced).
+        "role_id": await _default_role_id(db, where),
     })
     await audit(
         db, Event.REGISTER, user=user, client=client,
@@ -388,6 +409,10 @@ async def provision_from_authentik(db: AsyncSession, claims: dict) -> User:
             "onboarding_status": "provisioned",
             "tenant_id": where.tenant_id,
             "organization_id": where.organization_id,
+            # SSO users get the same default role as registration, decided UP FRONT: otherwise every
+            # Authentik user would be locked out of every permission-gated endpoint on day one.
+            # (Mapping Authentik groups to richer roles is future work — docs/rbac-module.md §4.9.)
+            "role_id": await _default_role_id(db, where),
         })
         await audit(db, Event.PROVISIONED, user=user, context={"method": "authentik", "sub": sub})
 
@@ -407,9 +432,12 @@ async def get_or_create_dev_user(db: AsyncSession, email: str = "dev@local.test"
     same function every other creation path uses.
     """
     user = await crud.get_by_email(db, email)
-    if user is not None:
-        return user
     where = await resolve_user_organization(db)
+    if user is not None:
+        if user.role_id is None:                       # an older dev user, created before roles were enforced
+            user.role_id = await _default_role_id(db, where, code="owner")
+            await db.flush()
+        return user
     return await crud.create(db, {
         "email": email,
         "username": email.split("@")[0],
@@ -417,6 +445,8 @@ async def get_or_create_dev_user(db: AsyncSession, email: str = "dev@local.test"
         "password": hash_password(secrets.token_urlsafe(24)),   # unusable for login
         "tenant_id": where.tenant_id,
         "organization_id": where.organization_id,
+        # The dev token exists to exercise the API by hand: it is the organization's owner.
+        "role_id": await _default_role_id(db, where, code="owner"),
     })
 
 
@@ -431,6 +461,39 @@ async def get_user(db: AsyncSession, user_id: int, *, include_deleted: bool = Fa
     if user is None:
         raise NotFoundError(f"User {user_id} not found")
     return user
+
+
+# ── Output shaping: ``UserOut`` with public avatar URLs ────────────────────────
+
+async def user_out(db: AsyncSession, user: User) -> UserOut:
+    """``UserOut`` plus the user's avatar URLs (one media lookup)."""
+    return (await user_outs(db, [user]))[0]
+
+
+async def user_public_outs(db: AsyncSession, users: list[User]) -> list[UserPublicOut]:
+    """The directory view (id, name, avatar) — what a colleague may see. Avatars resolved in one query."""
+    from app.modules.media import service as media_service
+
+    urls = await media_service.avatar_urls_for_users(db, [u.id for u in users])
+    outs: list[UserPublicOut] = []
+    for user in users:
+        out = UserPublicOut.model_validate(user)
+        out.avatar_urls = urls.get(user.id)
+        outs.append(out)
+    return outs
+
+
+async def user_outs(db: AsyncSession, users: list[User]) -> list[UserOut]:
+    """``UserOut`` list with avatar URLs batch-resolved in a single query."""
+    from app.modules.media import service as media_service
+
+    urls = await media_service.avatar_urls_for_users(db, [u.id for u in users])
+    outs: list[UserOut] = []
+    for user in users:
+        out = UserOut.model_validate(user)
+        out.avatar_urls = urls.get(user.id)
+        outs.append(out)
+    return outs
 
 
 async def create_user(
@@ -453,7 +516,10 @@ async def create_user(
     values["last_password_change_at"] = datetime.now(UTC)
     # Admin-create runs inside a bound request, so this normally returns the
     # caller's own organization; the fallbacks only matter for a system caller.
-    values["organization_id"] = (await resolve_user_organization(db)).organization_id
+    where = await resolve_user_organization(db)
+    values["organization_id"] = where.organization_id
+    if not values.get("role_id"):
+        values["role_id"] = await _default_role_id(db, where)
     user = await crud.create(db, values)
     await audit(
         db, Event.USER_CREATED, user=user, actor_id=created_by, actor_label=actor_label,
@@ -479,6 +545,10 @@ async def update_user(
     user = await get_user(db, user_id)
 
     values = body.model_dump(exclude_unset=True)
+    if values.get("is_deactivated"):
+        from app.modules.rbac import service as rbac_service
+
+        await rbac_service.ensure_not_last_owner(db, user, what="deactivate")
     if "email" in values and values["email"]:
         existing = await crud.get_by_email(db, values["email"], include_deleted=True)
         if existing and existing.id != user.id:
@@ -521,6 +591,11 @@ async def delete_user(
     actor_label: str | None = None,
 ) -> None:
     user = await get_user(db, user_id, include_deleted=hard)
+    if deleted_by is not None and deleted_by == user.id:
+        raise ForbiddenError("You cannot delete your own account here")
+    from app.modules.rbac import service as rbac_service
+
+    await rbac_service.ensure_not_last_owner(db, user, what="delete")
     if hard:
         authentik_pk = user.authentik_pk  # capture before the row is removed
         # Audit first: hard delete removes the subject row (audit is append-only).
@@ -795,6 +870,10 @@ async def get_my_profile_view(db: AsyncSession, user: User) -> UserMeOut:
     out.country_iso2 = profile.country_iso2
     out.timezone_name = profile.timezone_name
     out.address = _address_out(primary) if primary is not None else None
+
+    from app.modules.media import service as media_service
+
+    out.avatar_urls = await media_service.avatar_urls(db, user.id)
     return out
 
 
@@ -848,6 +927,41 @@ async def _attach_user_residence(db: AsyncSession, user: User, body: Any) -> Non
     )
 
 
+class InvalidProfileValueError(AppError):
+    """A profile field names something that does not exist (422, not 404: the URL is fine)."""
+
+    status_code = 422
+    code = "invalid_profile_value"
+
+
+async def _validate_localization(
+    db: AsyncSession, *, country_code: str | None, timezone: str | None,
+) -> None:
+    """Refuse an unknown country or timezone before anything is written.
+
+    Both are checked against the reference tables — the same authority the
+    writes below use (``user_profiles`` foreign-keys them) — so passing here means
+    ``set_user_country`` / ``set_user_timezone_manually`` cannot fail later.
+    """
+    if country_code:
+        iso2 = country_code.strip().upper()
+        if not await db.scalar(select(Country.iso2).where(Country.iso2 == iso2)):
+            raise InvalidProfileValueError(
+                f"country_code '{country_code}' is not a known ISO 3166-1 alpha-2 country",
+                data={"field": "country_code", "value": country_code,
+                      "hint": "GET /api/countries lists the valid codes, e.g. IN"},
+            )
+    if timezone:
+        tz_name = timezone.strip()
+        if not await db.scalar(select(Timezone.iana_name).where(Timezone.iana_name == tz_name)):
+            raise InvalidProfileValueError(
+                f"timezone '{timezone}' is not a known IANA timezone name",
+                data={"field": "timezone", "value": timezone,
+                      "hint": "Use an IANA name such as Asia/Kolkata; "
+                              "GET /api/countries/{iso2}/timezones lists a country's timezones"},
+            )
+
+
 async def update_my_profile(
     db: AsyncSession, user: User, body: UserSelfUpdate, *, client: ClientInfo | None = None,
 ) -> UserMeOut:
@@ -862,6 +976,16 @@ async def update_my_profile(
     sent.pop("address", None)
     country_code = sent.pop("country_code", None)
     timezone = sent.pop("timezone", None)
+
+    # Everything that can be refused is refused BEFORE the first write. `update_user`
+    # audits and pushes name/phone to Authentik — an outbound call a later rollback
+    # cannot take back — so a bad country, timezone or missing organization must not
+    # be discovered after it.
+    await _validate_localization(db, country_code=country_code, timezone=timezone)
+    if body.address is not None:
+        from app.modules.geo.scope import require_organization
+
+        await require_organization(db)
 
     if ("first_name" in sent or "middle_name" in sent or "last_name" in sent) and "name" not in sent:
         sent["name"] = _compose_full_name(user, sent)
@@ -884,6 +1008,53 @@ async def update_my_profile(
 
     await db.flush()
     return await get_my_profile_view(db, user)
+
+
+# ── Self-service app settings (GET/PATCH /api/me/settings) ────────────────────
+
+_SETTINGS_SECTIONS = {"privacy", "appearance", "notifications"}
+
+
+def _settings_snapshot(user: User) -> UserSettings:
+    """Parse stored settings, falling back to defaults for out-of-band/invalid JSON."""
+    try:
+        return UserSettings.model_validate(user.application_settings or {})
+    except ValidationError:
+        return UserSettings()
+
+
+def _deep_merge(base: dict, patch: dict) -> None:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+
+
+async def get_my_settings(db: AsyncSession, user: User) -> UserSettings:
+    """The full effective settings — stored values merged over the defaults."""
+    return _settings_snapshot(user)
+
+
+async def update_my_settings(
+    db: AsyncSession, user: User, body: UserSettingsUpdate, *, client: ClientInfo | None = None,
+) -> UserSettings:
+    """Deep-merge a partial settings change into ``users.application_settings``.
+
+    Reuses ``update_user`` so the masked diff, audit row and Authentik mirror
+    apply exactly as for any other profile edit. Unknown top-level keys other
+    features may have stored are preserved.
+    """
+    stored = dict(user.application_settings or {})
+    merged = _settings_snapshot(user).model_dump()
+    merged.update({k: v for k, v in stored.items() if k not in _SETTINGS_SECTIONS})
+    _deep_merge(merged, body.model_dump(exclude_unset=True, exclude_none=True))
+
+    await update_user(
+        db, user.id, UserUpdate(application_settings=merged),
+        updated_by=user.id, actor_label=user.email, client=client,
+    )
+    return UserSettings.model_validate(merged)
 
 
 # ── Reference Data Caching (L1 In-Memory + L2 Redis DB 0) ────────────────────

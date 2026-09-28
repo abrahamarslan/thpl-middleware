@@ -203,8 +203,12 @@ async def reap_expired(db: AsyncSession) -> int:
 
 
 async def running_count(db: AsyncSession) -> int:
+    # all_tenants=True: this is only ever called from the platform-wide admin health snapshot
+    # (app/modules/zoho/admin/service.py::health), requested by an operator bound to THEIR own
+    # tenant — not the one Zoho connection's tenant that actually owns the run rows.
     return int(await db.scalar(
         select(func.count()).select_from(ZohoSyncRun).where(ZohoSyncRun.status == RunStatus.RUNNING)
+        .execution_options(all_tenants=True)
     ) or 0)
 
 

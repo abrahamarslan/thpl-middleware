@@ -4,7 +4,14 @@ from fastapi import APIRouter
 
 from app.modules.activity.api import router as activity_router
 from app.modules.brands.api import router as brands_router
+from app.modules.categories.api import (
+    categories_router,
+    categorizables_router,
+    taxonomies_router,
+)
+from app.modules.comments.api import router as comments_router
 from app.modules.currencies.api import router as currencies_router
+from app.modules.custom_fields.api import router as custom_fields_router
 from app.modules.documents.api import router as documents_router
 from app.modules.emails.api import router as emails_router
 from app.modules.entities.api import router as entities_router
@@ -18,14 +25,27 @@ from app.modules.geo.api import (
     places_router,
 )
 from app.modules.geo.geocoding.api import router as geocoding_router
+from app.modules.hr.api import router as hr_router
 from app.modules.hubs.api import router as hubs_router
 from app.modules.locations.api import router as zoho_locations_router
 from app.modules.manufacturers.api import router as manufacturers_router
-from app.modules.media.api import router as media_router
 from app.modules.organizations.api import router as organizations_router
+from app.modules.rbac.api import (
+    me_router as rbac_me_router,
+    permissions_router,
+    user_roles_router,
+)
 from app.modules.roles.api import router as roles_router
 from app.modules.search.api import router as search_router
 from app.modules.tags.api import router as tags_router
+from app.modules.teams.api import (
+    departments_router,
+    job_titles_router,
+    me_teams_router,
+    team_roles_router,
+    team_types_router,
+    teams_router,
+)
 from app.modules.tenants.api import router as tenants_router
 from app.modules.taxes.api import router as taxes_router
 from app.modules.users.api import auth_router, countries_router, me_router, users_router
@@ -49,8 +69,25 @@ api_router.include_router(organizations_router, prefix="/organizations", tags=["
 api_router.include_router(currencies_router, prefix="/currencies", tags=["currencies"])
 api_router.include_router(brands_router, prefix="/brands", tags=["brands"])
 api_router.include_router(manufacturers_router, prefix="/manufacturers", tags=["manufacturers"])
+api_router.include_router(taxonomies_router, prefix="/taxonomies", tags=["taxonomies"])
+api_router.include_router(categories_router, prefix="/categories", tags=["categories"])
+api_router.include_router(categorizables_router, prefix="/categorizables", tags=["categorizables"])
 api_router.include_router(entities_router, prefix="/entities", tags=["entities"])
+api_router.include_router(comments_router, prefix="/comments", tags=["comments"])
+api_router.include_router(custom_fields_router, prefix="/custom-fields", tags=["custom-fields"])
 api_router.include_router(roles_router, prefix="/roles", tags=["roles"])
+# RBAC (docs/rbac-module.md): the catalogue, my effective permissions, and a user's role assignments.
+api_router.include_router(permissions_router, prefix="/permissions", tags=["rbac"])
+api_router.include_router(rbac_me_router, prefix="/me", tags=["rbac"])
+api_router.include_router(user_roles_router, prefix="/users", tags=["rbac"])
+# Teams: departments, job titles, team types/roles, teams and their members; hr: employment and the org chart.
+api_router.include_router(departments_router, prefix="/departments", tags=["teams"])
+api_router.include_router(job_titles_router, prefix="/job-titles", tags=["teams"])
+api_router.include_router(team_types_router, prefix="/team-types", tags=["teams"])
+api_router.include_router(team_roles_router, prefix="/team-roles", tags=["teams"])
+api_router.include_router(teams_router, prefix="/teams", tags=["teams"])
+api_router.include_router(me_teams_router, prefix="/me", tags=["teams"])
+api_router.include_router(hr_router, prefix="/hr", tags=["hr"])
 # Location hub — our own places and addresses. /api/zoho/locations further
 # down is the read-only Zoho warehouse mirror: different thing, different prefix.
 api_router.include_router(places_router, prefix="/locations", tags=["locations"])
@@ -71,7 +108,10 @@ api_router.include_router(files_router, prefix="/files", tags=["files"])
 api_router.include_router(favorites_router, prefix="/favorites", tags=["favorites"])
 api_router.include_router(tags_router, prefix="/tags", tags=["tags"])
 api_router.include_router(emails_router, prefix="/emails", tags=["emails"])
-api_router.include_router(media_router, prefix="/media", tags=["media"])
+# Media has no generic upload surface: images enter through their owner's own
+# endpoint (e.g. POST /api/me/avatar), which validates the owner. The
+# unauthenticated public serving router is mounted at the app root — see
+# core/registrar.py and modules/media/public_api.py.
 api_router.include_router(activity_router, prefix="/activity", tags=["activity"])
 api_router.include_router(search_router, prefix="/search", tags=["search"])
 api_router.include_router(hubs_router, prefix="/hubs", tags=["hubs"])

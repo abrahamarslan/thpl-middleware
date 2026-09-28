@@ -268,6 +268,72 @@ Both masters inherit `HasTagsMixin` and `HasDocumentsMixin`; searchable via
 `search/registry.py` (`brands`, `manufacturers`); Debezium
 `table.include.list` carries `core.brands`/`core.manufacturers`.
 
+#### `app/modules/categories/` — `core` taxonomies & categories (migrations `20260925_1000_c7a1e9b2d4f8`, `20260925_1400_c063729f29c2`)
+
+Organization-scoped taxonomy trees (`taxonomies` → `categories`, nested-set
+bounds in `_lft`/`_rgt`), a per-taxonomy entity-type whitelist
+(`taxonomy_entity_types`), and a polymorphic, temporally-windowed assignment
+table (`categorizables`, registry-proved via `core.assert_entity_exists`).
+`Category` is a Zoho **crosswalk** entity (business columns + a `zoho_id` echo;
+gate state lives in `sync.sync_records`) with `HasTagsMixin`, `HasDocumentsMixin`. Composite scope FKs replace the reference
+design's owner machinery; `tree.py` owns the bounds; the deferred
+`check_categorizable_integrity()` owns the whitelist + window guards. A
+deviation from the approved DDL is recorded in the migration: the whitelist is
+enforced by trigger, not a composite FK (PostgreSQL cannot reference a partial
+unique index).
+
+| Path | Purpose / usage |
+|---|---|
+| `categories/model.py` | `Taxonomy`, `TaxonomyEntityType`, `Category`, `Categorizable`; composite scope FKs; partial uniques. |
+| `categories/tree.py` | Pure nested-set/path/depth recompute (`recompute_bounds`, `ancestors_of`, `subtree_of`) — hermetically unit-tested. |
+| `categories/service.py` + `api.py` | `/api/taxonomies`, `/api/categories`, `/api/categorizables`; org-scoped writes, advisory-locked tree recompute, activity log. |
+| `categories/schema.py` + `crud.py` | Slim list DTO backed by `load_only`; Fat detail with `selectinload`ed tags/documents. |
+| `categories/mixins.py` | `HasCategoriesMixin` — viewonly, `lazy="raise_on_sql"`; explicit `selectinload`. |
+| `categories/zoho/` | Zoho Books `/categories` adapter (`spec`/`fields`/`codecs`/`hooks`): INBOUND, INCREMENTAL + index-then-detail, crosswalk, `include_root_category=false`, tree-aware `post_upsert` with a `pending_references` queue for an unresolvable parent. |
+
+`categories` is searchable via `search/registry.py`; Debezium
+`table.include.list` carries `core.taxonomies`/`core.categories`/`core.categorizables`.
+
+#### `app/modules/taxes/` — tax assignments (the polymorphic layer; migrations `20260925_1600_84daf73430b6`, `20260925_1610_cbdb4590446e`)
+
+Beside the six tax masters, the module owns **`tax.tax_assignments`** (an owning entity →
+a tax component or exemption, in a context) and the global policy **`tax.taxable_entity_types`**.
+Consumers add `HasTaxesMixin` and register their class with
+`register_taxable_entity_type`; `taxes` never imports a consumer (`.importlinter`).
+
+| Path | Purpose / usage |
+|---|---|
+| `taxes/assignment.py` | `TaxableEntityType` (global policy), `TaxAssignment` (owner + tax/exemption + context + snapshot). |
+| `taxes/assignment_service.py` | The one writer (`replace_assignments`), `select_applicable` (pure), `resolve_taxes`, `freeze_owner`. |
+| `taxes/assignment_{crud,schema,api}.py` | Data access (owner scope via the registry), the shared `TaxAssignmentItem` input, `/api/taxes/assignments`. |
+| `taxes/mixins.py` | `HasTaxesMixin` — viewonly, `lazy="raise_on_sql"`. |
+| `taxes/registration.py` | `register_taxable_entity_type` — the one call a module makes to opt an entity in. |
+
+Design: `docs/implementation-plan/tax-assignments.md`.
+
+#### `app/modules/custom_fields/` — the `extfields` custom-field engine (migration `20260924_1000_cf0e1d2c3b4a`)
+
+A typed, registry-driven key/value store (schema `extfields`) that lets any
+registered entity type carry a growing set of custom fields without schema
+churn. `data_types` is the GLOBAL Zoho data-type → storage-column lookup (AP8 —
+the vocabulary is a seed row, the column set is a CHECK); `field_definitions`
+(Class F) and `field_values` are `OrgEntityMixin` + `SoftDeleteFilteredMixin`
+(tenant + organization NOT NULL). The owner registry is the shared
+`core.entity_types` table (`owner_type_code` is a real FK), so a new owner class
+is a registry row, not DDL. A deferred
+`extfields.check_field_value_integrity()` constraint trigger proves the
+polymorphic owner instance exists via `core.assert_entity_exists()` **and** that
+the populated typed column matches the definition's data type;
+`extfields.find_orphan_field_values()` is the scheduled safety net. DPDP:
+`field_definitions.pii_type` drives erasure.
+
+| Path | Purpose / usage |
+|---|---|
+| `model.py` | `DataType` (code → storage column), `FieldDefinition` (all Zoho rule/policy flags + `pii_type`), `FieldValue` (five typed columns, `ck_field_values_single_value`). |
+| `mixins.py` | `HasCustomFieldsMixin` — viewonly, selectinload-friendly `.custom_field_values`; a model sets `custom_fields_owner_type`. |
+| `service.py` + `api.py` | `/api/custom-fields`: data-type lookup, definition CRUD (Slim list / Fat detail), value set/sync/delete, and `erase-pii`. Values are submitted as plain JSON scalars and placed in the correct column by the definition's data type. |
+| `seed.py` | The `data_types` catalog (Zoho vocabulary) and its idempotent seeder (run by the migration and `scripts/seed.py`). |
+
 #### `app/modules/tags|documents|media|emails|search/` — cross-cutting modules (see [docs/MODULES.md](MODULES.md))
 
 | Path | Purpose / usage |

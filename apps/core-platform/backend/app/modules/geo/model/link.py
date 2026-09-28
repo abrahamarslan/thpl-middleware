@@ -88,6 +88,8 @@ from app.modules.geo.model.reference import GEO_SCHEMA
 OWNER_TYPES: tuple[str, ...] = (
     "user",
     "organization",
+    "department",      # teams.departments — where a department sits (docs/rbac-module.md §5.6)
+    "team",            # teams.teams
     "customer",
     "contact_person",
     "vendor",
@@ -125,9 +127,12 @@ class PlaceLink(
         CheckConstraint("status IN ('active','suspended','archived')", name="chk_place_link_status"),
         CheckConstraint("valid_to IS NULL OR valid_to > valid_from", name="chk_place_link_validity"),
         CheckConstraint("owner_id > 0", name="chk_place_link_owner_id"),
-        # The same place is not attached twice to an owner for the same purpose.
+        # The same place is not attached twice to an owner for the same purpose AT THE
+        # SAME TIME. Open links only: a closed one is history, and an owner may go
+        # back to an address they once left (A → B → A).
         Index("uq_place_links_dedupe", "tenant_id", "owner_type", "owner_id", "place_id",
-              "link_type", "purpose", unique=True, postgresql_where=text("deleted_at IS NULL")),
+              "link_type", "purpose", unique=True,
+              postgresql_where=text("deleted_at IS NULL AND valid_to IS NULL")),
         # One open primary per owner and link type.
         Index("uq_place_links_one_primary", "tenant_id", "owner_type", "owner_id", "link_type",
               unique=True,

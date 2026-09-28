@@ -13,7 +13,7 @@ from sqlalchemy import select
 from app.common.exception.errors import NotFoundError
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
-from app.modules.users.deps import CurrentUser
+from app.modules.rbac.deps import Perm
 from app.modules.zoho.sync.config import SyncStrategyName
 from app.modules.zoho.sync.models import ZohoQueueLog, ZohoSyncStat
 from app.modules.zoho.sync.registry import sync_registry
@@ -23,7 +23,7 @@ router = APIRouter()
 
 
 @router.get("/modules", response_model=ResponseModel[list[ModuleInfoOut]])
-async def list_modules(_: CurrentUser, db: DBSession):
+async def list_modules(_: Perm("zoho.integration:read"), db: DBSession):
     stats = {s.module_name: s for s in (await db.scalars(select(ZohoSyncStat))).all()}
     out = []
     for defn in sync_registry.all():
@@ -50,7 +50,7 @@ async def list_modules(_: CurrentUser, db: DBSession):
 
 @router.post("/modules/{module}/run", response_model=ResponseModel[SyncRunAccepted], status_code=202)
 async def trigger_run(
-    _: CurrentUser,
+    _: Perm("zoho.integration:manage"),
     module: str,
     mode: SyncStrategyName | None = Query(None, description="Override the configured strategy"),
 ):
@@ -65,7 +65,7 @@ async def trigger_run(
 
 
 @router.get("/modules/{module}/stats", response_model=ResponseModel[SyncStatOut])
-async def module_stats(_: CurrentUser, db: DBSession, module: str):
+async def module_stats(_: Perm("zoho.integration:read"), db: DBSession, module: str):
     sync_registry.get(module)
     stat = await db.scalar(select(ZohoSyncStat).where(ZohoSyncStat.module_name == module))
     if stat is None:
@@ -75,7 +75,7 @@ async def module_stats(_: CurrentUser, db: DBSession, module: str):
 
 @router.get("/modules/{module}/queue-logs", response_model=ResponseModel[list[QueueLogOut]])
 async def module_queue_logs(
-    _: CurrentUser,
+    _: Perm("zoho.integration:read"),
     db: DBSession,
     module: str,
     status: str | None = Query(None, pattern="^(queued|processing|success|failed|skipped)$"),

@@ -13,6 +13,7 @@ and registers exactly once in `app/router.py`.
 | Emails (Resend) | `/api/emails` | email.md |
 | Favorites (collections) | `/api/favorites` | favorite.md |
 | Search (Meilisearch CDC) | standalone indexer + `ScoutBuilder` | meilisearch.md |
+| Custom fields (`extfields`) | `/api/custom-fields` | ExtFields — Architecture & Implementation Guide |
 | Circuit breaker (ZSET window) | `zoho/core/circuit_breaker.py` | circuit-breaker.md |
 
 ---
@@ -288,6 +289,121 @@ scope/owner-sync triggers are unnecessary.
 Slim DTO backed by `load_only`, each detail a Fat DTO with `selectinload`ed
 children. Both masters are taggable and carry documents, and are searchable
 via `search/registry.py` (`brands`, `manufacturers`).
+
+## Categories & taxonomies — `app/modules/categories/` (schema `core`, migrations `20260925_1000_c7a1e9b2d4f8` + `20260925_1400_c063729f29c2`)
+
+Organization-scoped taxonomy trees and their polymorphic assignments. Four
+`core` tables: **`taxonomies`** (a named tree per organization; `slug` unique
+among live rows; status `draft|active|retired`), **`taxonomy_entity_types`**
+(the whitelist of categorisable types — `entity_type_code` FK →
+`core.entity_types.code` — with an `allows_multiple` cardinality switch, NULL =
+permissive), **`categories`** (tree nodes: `parent_id` + nested-set
+`_lft`/`_rgt` + `depth` + `path`, maintained by the pure `tree.py` under a
+per-taxonomy advisory lock; full approved display/SEO/flag column set per locked
+L1; a `zoho_id` echo (crosswalk shape — no mirror mixins); `HasTagsMixin` +
+`HasDocumentsMixin`), and **`categorizables`** (a polymorphic,
+temporally-windowed assignment; `categorizable_type` FK → `core.entity_types.code`;
+`categorizable_id` proved at COMMIT via `core.assert_entity_exists()`).
+
+**Database-owned guards.** Four composite scope FKs collapse the reference
+design's owner machinery (`fk_categories_taxonomy_scope`,
+`fk_categories_parent_scope`, `fk_categorizables_category`, plus the org FK).
+`core.guard_category_scope()` rejects a child under a leaf and a move that would
+cycle; `core.guard_taxonomy_organization_change()` blocks re-org of a populated
+tree; the deferred `core.check_categorizable_integrity()` skips tombstones,
+checks the whitelist and raises `23P01` on overlapping windows;
+`core.find_orphan_categorizables()` reports leaks. Known deviation (documented
+in the migration): PostgreSQL cannot reference a partial unique index, so the
+whitelist is enforced by that trigger rather than the planned composite FK.
+
+**HTTP.** `/api/taxonomies` (trees; `PUT /{ref}/entity-types` replaces the
+whitelist), `/api/categories` (Slim list carrying the full tile set, Fat detail
+with tags + documents, `POST /{ref}/move`), `/api/categorizables` (assign,
+`POST /sync` replace-set, unassign). Deferred-constraint failures surface as a
+clean envelope through the shared `IntegrityError`/`StaleDataError` handlers
+(SQLSTATE → 4xx). `categories` is searchable via `search/registry.py`; the
+Debezium `table.include.list` carries `core.taxonomies`, `core.categories` and
+`core.categorizables`.
+
+**Zoho sync** (`categories/zoho/`) mirrors Zoho Books `/categories`
+(`docs/zoho-docs-md/categories.md`) through the **crosswalk** — the same shape as
+`currencies` and `taxes` (`docs/implementation-plan/sync-crosswalk-delta-v3.md`).
+`core.categories` holds business columns plus one `zoho_id` echo; identity, the
+apply gate's fence/hash, the raw document and custom fields live in
+`sync.sync_records` / `sync.sync_payloads` (the table carries none of the
+in-place mirror columns or push state). INBOUND + INCREMENTAL on
+`last_modified_time` + index-then-detail; `include_root_category=false` keeps
+Zoho's synthetic `ROOT` row out; the weekly full lane + `soft_delete_missing`
+tombstone what Zoho deleted (behind `ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING`).
+Parent links are resolved through the crosswalk in `post_upsert` (an
+unresolvable one is queued on `sync.pending_references`) and the taxonomy's
+nested-set bounds recomputed; synced rows land in an auto-provisioned
+per-organization `zoho` taxonomy (`core.fill_category_default_taxonomy()`).
+A linked category's Zoho-fed fields, **its parent and its taxes** are read-only through the
+API. Its `category_tax_preferences` become `tax.tax_assignments` (below). `service.to_zoho_payload` is the seam for the (not-yet-built) command
+outbox. Findings, live evidence and open items:
+`docs/implementation-plan/categories-zoho-sync-review.md`.
+
+## Tax assignments — `app/modules/taxes/` (schema `tax`, migrations `20260925_1600_84daf73430b6` + `20260925_1610_cbdb4590446e`)
+
+One polymorphic table answers "which taxes does *this entity* carry?" for **any** entity —
+a category today, an item, a customer or an invoice line when they exist — so none of them
+grows its own tax column. **`tax.tax_assignments`** holds an owner (`owner_type_code` +
+`owner_id`) → a tax component (rate *or* group) **or** an exemption, in an
+inter/intra × sales/purchase context, with optional frozen snapshot for issued documents.
+**`tax.taxable_entity_types`** is the global opt-in policy (one tax per context or several;
+exemptions or not). Integrity is the platform registry's: the owner class is an FK chain to
+`core.entity_types`, and deferred triggers prove the owner exists, shares the assignment's
+tenant **and organization**, and honours the class's rule.
+
+**Making an entity taxable** is a registry row + a policy row
+(`taxes.registration.register_taxable_entity_type`, called from its migration) and
+`HasTaxesMixin` on its model — no change to the `tax` schema. Writes go through
+`taxes.assignment_service.replace_assignments`; `resolve_taxes` answers "which tax applies
+here?" for a chain of owners (line → item → category), most specific first, falling back to
+the organization default. HTTP: `/api/taxes/assignments`. Full design, recipe and evidence:
+`docs/implementation-plan/tax-assignments.md`.
+
+## Custom fields — `app/modules/custom_fields/` (schema `extfields`)
+A typed, definition-driven key/value store: any registered entity type can carry
+a growing set of custom fields without schema churn. Three tables, because the
+owner registry is the shared one:
+
+- **`extfields.data_types`** (GLOBAL) — Zoho's custom-field data-type vocabulary
+  mapped to which physical column on `field_values` holds it. `code` is open
+  (a new Zoho type is a **seed row**, `seed.py`); `storage_column` is a closed
+  CHECK over `value_text|value_numeric|value_date|value_boolean|value_json` (AP8).
+- **`extfields.field_definitions`** (ENTITY, org-scoped) — one custom field
+  (Class F): presentation, validation, mandatory/visibility policy, a
+  self-referential dependency, and the DPDP `pii_type`. `is_custom_field` is
+  dropped — every row here is a custom field by construction.
+- **`extfields.field_values`** (ENTITY, org-scoped) — one typed answer per
+  (field, owner). `owner_type_code` is a real FK to the shared
+  **`core.entity_types`** registry; `owner_id` is polymorphic with no FK.
+
+**Integrity** (the parts the database owns): `ck_field_values_single_value`
+(`num_nonnulls(...) <= 1`), the partial unique
+`uq_field_values_field_owner`, and a **deferred constraint trigger**
+`extfields.check_field_value_integrity()` that proves the owner instance exists
+via the existing `core.assert_entity_exists()` *and* that the populated column
+matches the definition's data type. Because it is deferred, a definition and its
+first value may be written in either order in one transaction; the failure
+surfaces at COMMIT. `extfields.find_orphan_field_values()` is the scheduled
+safety net (walks the registry, `STABLE`).
+
+- Read path: inherit `HasCustomFieldsMixin` (set `custom_fields_owner_type`),
+  query with `selectinload(Model.custom_field_values)`.
+- Write path: `service.set_value` / `sync_values` (or `/api/custom-fields/values`).
+  Values arrive as plain JSON scalars and are placed in the correct column by
+  the definition's data type — the five-column storage detail never reaches a
+  client.
+- DPDP: `field_definitions.pii_type` (`non_pii`/`pii`/`sensitive_pii`; NULL =
+  unclassified) drives `POST /api/custom-fields/values/erase-pii`, which blanks
+  and soft-deletes every value under a PII-classified field of one owner.
+
+Adding a field = a `field_definitions` row; adding an owner type = a
+`core.entity_types` row. No migration either way. Owner-type launch seeding and
+a Zoho field-definition sync are separate workstreams.
 
 ## Circuit breaker — upgraded
 

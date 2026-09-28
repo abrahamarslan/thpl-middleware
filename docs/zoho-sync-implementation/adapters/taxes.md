@@ -16,8 +16,10 @@
 | `tax.organization_tax_components` | `MultiTenantMixin` (org NOT NULL) | organization ↔ component grants, M:N; `is_active` is the per-organization switch |
 | `tax.org_default_tax_preferences` | scoped, audited, soft-deletable | default component per organization and `inter`/`intra`; `NULLS NOT DISTINCT` unique so a tenant-wide default is still unique |
 | `tax.gst_treatment_types` | **GLOBAL** (allow-listed in `test_tenancy.py`) | GST / tax treatment vocabulary; nullable `owner_type`/`owner_id` provenance |
+| `tax.taxable_entity_types` | **GLOBAL** policy (allow-listed) | which entity classes may carry taxes, and whether one tax or several per context, exemptions or not |
+| `tax.tax_assignments` | `OrgEntityMixin` (org NOT NULL) | **polymorphic**: an owning entity (`owner_type_code` + `owner_id`) → a tax component **or** exemption, in an inter/intra × sales/purchase context; pending rows and a frozen snapshot. Design: [`tax-assignments.md`](../../implementation-plan/tax-assignments.md) |
 
-No table carries a Zoho id: identity is `sync.sync_records`. Every child FK is composite
+No table carries a Zoho id: identity is `sync.sync_records` (`tax_assignments.external_ref` is the transient pointer of a *pending* row, not an identity). Every child FK is composite
 `(tenant_id, x_id)`, so a row can never pair components of two tenants. Lifecycle (`status`,
 deactivation) is on `tax_components` only; `status` is Zoho-fed (`lower`, empty → `active`).
 
@@ -62,6 +64,8 @@ not in `docs/zoho-docs-md`, and the master prompt forbids inventing one.
 `GET ?tax_type=&specific_type=&organization_id=` (Slim) · `GET /{ref}` (Fat: members + crosswalk
 `sources`; `ref` = local id, uuid or Zoho id) · `GET /exemptions` · `GET /gst-treatments` ·
 `GET /default-preferences?organization_id=`.
+
+**Assignments** (read + local write) — `/api/taxes/assignments`: `GET /taxable-types` · `GET /resolve?owner=type:id…` · `GET|PUT /{owner_type}/{owner_id}` · `DELETE /{ref}`. Categories carry Zoho's `category_tax_preferences` through it (the categories adapter resolves each Zoho tax id via the crosswalk; a leaf tax and a group both live in module `taxes`).
 
 ## Field catalog
 

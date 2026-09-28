@@ -126,8 +126,9 @@ async def test_a_place_in_use_cannot_be_deleted(worlds, db):
     users = await client.get(f"/api/locations/{place_uuid}/addresses", headers=acme.auth(acme.member))
     assert [a["uuid"] for a in users.json()["data"]] == [address["uuid"]]
 
+    # Archiving is a management action (geo.place:manage), deliberately admin+-only.
     archived = await client.post(f"/api/locations/{place_uuid}/archive",
-                                 params={"reason": "site closed"}, headers=acme.auth(acme.member))
+                                 params={"reason": "site closed"}, headers=acme.auth(acme.admin))
     assert archived.json()["data"]["status"] == "archived"
 
 

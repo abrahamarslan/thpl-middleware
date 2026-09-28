@@ -14,13 +14,14 @@ from app.modules.files.schema import (
     FileSlimOut,
     FileStatusUpdate,
 )
+from app.modules.rbac.deps import Perm
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
 
 
 @router.post("", response_model=ResponseModel[FileOut], status_code=201)
-async def create_file(db: DBSession, current: CurrentUser, body: FileCreate):
+async def create_file(db: DBSession, current: Perm("files.file:create"), body: FileCreate):
     file = await service.create_file(db, body, actor_id=current.id, actor_label=current.email)
     return ResponseModel(data=FileOut.model_validate(file))
 
@@ -52,12 +53,12 @@ async def get_file(db: DBSession, _: CurrentUser, file_id: uuid.UUID):
 
 
 @router.patch("/{file_id}/status", response_model=ResponseModel[FileOut])
-async def update_status(db: DBSession, current: CurrentUser, file_id: uuid.UUID, body: FileStatusUpdate):
+async def update_status(db: DBSession, current: Perm("files.file:update"), file_id: uuid.UUID, body: FileStatusUpdate):
     file = await service.update_status(db, file_id, body, actor_id=current.id, actor_label=current.email)
     return ResponseModel(data=FileOut.model_validate(file))
 
 
 @router.delete("/{file_id}", response_model=ResponseModel[dict])
-async def delete_file(db: DBSession, current: CurrentUser, file_id: uuid.UUID):
+async def delete_file(db: DBSession, current: Perm("files.file:delete"), file_id: uuid.UUID):
     await service.delete_file(db, file_id, actor_id=current.id, actor_label=current.email)
     return ResponseModel(data={"deleted": True})

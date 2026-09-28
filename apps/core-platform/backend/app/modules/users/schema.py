@@ -9,7 +9,7 @@ Conventions:
 """
 
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -101,10 +101,6 @@ class UserProfileBase(BaseModel):
     onboarding_status: str | None = None
 
     # == Profile customization ==
-    image: str | None = None
-    avatar: str | None = None
-    thumbnail: str | None = None
-    preview_image: str | None = None
     profile_completion_percentage: int | None = Field(default=None, ge=0, le=100)
     other_details: dict | None = None
     other_information: dict | None = None
@@ -202,6 +198,52 @@ class UserOut(UserProfileBase):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     deleted_at: datetime | None = None
+    # Public URL per avatar variant (original/thumb/medium/large); a variant is
+    # null until its conversion has finished. null overall = no avatar set.
+    # Populated on every UserOut response (batch-resolved on lists, so no N+1).
+    avatar_urls: dict[str, str | None] | None = None
+
+
+class UserPublicOut(BaseModel):
+    """What a colleague sees in the directory — enough to pick a person, nothing sensitive.
+
+    ``UserOut`` carries medical history, PAN/GSTIN, bank and payment details, emergency and family
+    contacts: fine for the account holder and for an administrator with ``users.user:read``, never for
+    every signed-in user. Everyone else gets this.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str | None = None
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    avatar_urls: dict[str, str | None] | None = None
+
+
+class UserAdminCreate(UserCreate):
+    """Create a user through the API: the role is NOT settable here (a new user is a ``member``).
+
+    Granting a role is its own guarded operation — ``PUT /api/users/{id}/base-role`` — because it is the
+    step that can escalate privilege.
+    """
+
+    @model_validator(mode="after")
+    def _no_role(self) -> "UserAdminCreate":
+        if "role_id" in self.model_fields_set and self.role_id is not None:
+            raise ValueError("set a user's role with PUT /api/users/{id}/base-role, not here")
+        return self
+
+
+class UserAdminUpdate(UserUpdate):
+    """Admin edit of a user's profile. ``role_id`` is refused here — see ``UserAdminCreate``."""
+
+    @model_validator(mode="after")
+    def _no_role(self) -> "UserAdminUpdate":
+        if "role_id" in self.model_fields_set:
+            raise ValueError("change a user's role with PUT /api/users/{id}/base-role, not here")
+        return self
 
 
 class UserListFilters(BaseModel):
@@ -518,10 +560,7 @@ class UserSelfUpdate(BaseModel):
     date_of_joining: datetime | None = None
 
     # Profile customization
-    image: str | None = None
-    avatar: str | None = None
-    thumbnail: str | None = None
-    preview_image: str | None = None
+    # (profile pictures are media rows, not a users column — see avatar_urls on UserOut)
 
     # Preferences
     language: str | None = None
@@ -558,6 +597,82 @@ class UserMeOut(UserOut):
     country_iso2: str | None = None
     timezone_name: str | None = None
     address: UserAddressOut | None = None
+    # avatar_urls is inherited from UserOut.
+
+
+# ── Self-service app settings (GET/PATCH /api/me/settings) ────────────────────
+#
+# Stored in the existing `users.application_settings` JSONB (no new column).
+# GET returns the full effective settings — stored values merged over defaults —
+# and PATCH accepts any subset and deep-merges it, so an app can send just the
+# one toggle it changed. The `*Update` models are `extra="forbid"` allowlists,
+# exactly like `UserSelfUpdate`, so an unknown key is a 422 rather than a
+# silently stored blob. Stored JSON may carry keys written by other features, so
+# `UserSettings` itself ignores unknown keys instead of refusing them.
+
+ProfileVisibility = Literal["public", "organization", "contacts", "private"]
+Theme = Literal["light", "dark", "system"]
+
+
+class PrivacySettings(BaseModel):
+    """Who can see the user's profile and which contact fields are exposed."""
+
+    profile_visibility: ProfileVisibility = "organization"
+    show_email: bool = False
+    show_phone: bool = False
+
+
+class AppearanceSettings(BaseModel):
+    theme: Theme = "system"
+
+
+class NotificationSettings(BaseModel):
+    email: bool = True
+    push: bool = True
+    sms: bool = False
+    in_app: bool = True
+
+
+class UserSettings(BaseModel):
+    """The full effective shape persisted under ``users.application_settings``."""
+
+    privacy: PrivacySettings = Field(default_factory=PrivacySettings)
+    appearance: AppearanceSettings = Field(default_factory=AppearanceSettings)
+    notifications: NotificationSettings = Field(default_factory=NotificationSettings)
+
+
+class PrivacySettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_visibility: ProfileVisibility | None = None
+    show_email: bool | None = None
+    show_phone: bool | None = None
+
+
+class AppearanceSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    theme: Theme | None = None
+
+
+class NotificationSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: bool | None = None
+    push: bool | None = None
+    sms: bool | None = None
+    in_app: bool | None = None
+
+
+class UserSettingsUpdate(BaseModel):
+    """A partial settings change; every section/field is optional and merged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    privacy: PrivacySettingsUpdate | None = None
+    appearance: AppearanceSettingsUpdate | None = None
+    notifications: NotificationSettingsUpdate | None = None
+
 
 
 # ── Location telemetry ────────────────────────────────────────────────────────

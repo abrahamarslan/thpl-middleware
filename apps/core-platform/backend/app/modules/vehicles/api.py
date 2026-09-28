@@ -4,7 +4,7 @@ from fastapi import APIRouter, Query
 
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm, org_of
 from app.modules.users.deps import CurrentUser
 from app.modules.vehicles import service
 from app.modules.vehicles.schema import (
@@ -51,7 +51,7 @@ async def get_vehicle(_: CurrentUser, db: DBSession, ref: str):
 
 
 @vehicles_router.post("", response_model=ResponseModel[VehicleOut], status_code=201)
-async def create_vehicle(user: CurrentUser, db: DBSession, body: VehicleCreate):
+async def create_vehicle(user: Perm("fleet.vehicle:create"), db: DBSession, body: VehicleCreate):
     vehicle = await service.create_vehicle(db, body, actor_id=user.id)
     return ResponseModel.ok(
         data=VehicleOut.model_validate(vehicle), module=_M, msg_key="created", code=vehicle.registration_number
@@ -59,7 +59,7 @@ async def create_vehicle(user: CurrentUser, db: DBSession, body: VehicleCreate):
 
 
 @vehicles_router.patch("/{ref}", response_model=ResponseModel[VehicleOut])
-async def update_vehicle(user: CurrentUser, db: DBSession, ref: str, body: VehicleUpdate):
+async def update_vehicle(user: Perm("fleet.vehicle:update", target=org_of("app.modules.vehicles.model:Vehicle", "registration_number")), db: DBSession, ref: str, body: VehicleUpdate):
     vehicle = await service.update_vehicle(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(
         data=VehicleOut.model_validate(vehicle), module=_M, msg_key="updated", code=vehicle.registration_number
@@ -67,7 +67,7 @@ async def update_vehicle(user: CurrentUser, db: DBSession, ref: str, body: Vehic
 
 
 @vehicles_router.post("/{ref}/archive", response_model=ResponseModel[VehicleOut])
-async def archive_vehicle(admin: TenantAdmin, db: DBSession, ref: str,
+async def archive_vehicle(admin: Perm("fleet.vehicle:manage", target=org_of("app.modules.vehicles.model:Vehicle", "registration_number")), db: DBSession, ref: str,
                           reason: str = Query(..., min_length=3, max_length=500)):
     vehicle = await service.archive_vehicle(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(
@@ -76,7 +76,7 @@ async def archive_vehicle(admin: TenantAdmin, db: DBSession, ref: str,
 
 
 @vehicles_router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_vehicle(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_vehicle(admin: Perm("fleet.vehicle:delete", target=org_of("app.modules.vehicles.model:Vehicle", "registration_number")), db: DBSession, ref: str,
                          reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_vehicle(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="deleted", code=ref)
@@ -91,7 +91,7 @@ async def list_compliance(_: CurrentUser, db: DBSession, ref: str, compliance_ty
 
 
 @vehicles_router.post("/{ref}/compliance", response_model=ResponseModel[VehicleComplianceOut], status_code=201)
-async def add_compliance(user: CurrentUser, db: DBSession, ref: str, body: VehicleComplianceCreate):
+async def add_compliance(user: Perm("fleet.vehicle:update", target=org_of("app.modules.vehicles.model:Vehicle", "registration_number")), db: DBSession, ref: str, body: VehicleComplianceCreate):
     doc = await service.add_compliance(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(
         data=VehicleComplianceOut.model_validate(doc), module=_M, msg_key="compliance_added"
@@ -99,7 +99,7 @@ async def add_compliance(user: CurrentUser, db: DBSession, ref: str, body: Vehic
 
 
 @driving_licenses_router.get("/{user_id}", response_model=ResponseModel[list[DrivingLicenseOut]])
-async def list_driving_licenses(_: CurrentUser, db: DBSession, user_id: int):
+async def list_driving_licenses(_: Perm("fleet.driving_license:read"), db: DBSession, user_id: int):
     rows = await service.list_driving_licenses(db, user_id)
     return ResponseModel.ok(
         data=[DrivingLicenseOut.model_validate(r) for r in rows], module=_M, msg_key="licenses_listed"
@@ -107,6 +107,6 @@ async def list_driving_licenses(_: CurrentUser, db: DBSession, user_id: int):
 
 
 @driving_licenses_router.post("", response_model=ResponseModel[DrivingLicenseOut], status_code=201)
-async def add_driving_license(user: CurrentUser, db: DBSession, body: DrivingLicenseCreate):
+async def add_driving_license(user: Perm("fleet.driving_license:create"), db: DBSession, body: DrivingLicenseCreate):
     dl = await service.add_driving_license(db, body, actor_id=user.id)
     return ResponseModel.ok(data=DrivingLicenseOut.model_validate(dl), module=_M, msg_key="license_added")

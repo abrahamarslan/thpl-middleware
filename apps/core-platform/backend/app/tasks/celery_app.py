@@ -19,9 +19,11 @@ ADR‑3) — run the prefork pool (the default). ``-P threads`` / ``gevent``
 would share a loop between concurrent tasks and is not supported.
 """
 
+from datetime import timedelta
+
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
+from celery.signals import setup_logging, worker_init, worker_process_init, worker_process_shutdown
 
 from app.core.conf import settings
 
@@ -72,6 +74,20 @@ celery_app.conf.update(
             "task": "app.tasks.maintenance.cleanup_old_media",
             "schedule": crontab(minute="30", hour="3"),
         },
+        # Purge media soft-deleted more than 24h ago (docs/media-storage.md).
+        # A replaced avatar keeps its bytes for the grace window so cached
+        # public URLs elsewhere do not break mid page-load.
+        # Re-queue media a crash / broker outage left in pending|processing.
+        "requeue-stuck-media": {
+            "task": "app.tasks.media.requeue_stuck_media",
+            "schedule": timedelta(minutes=10),
+            "options": {"expires": 9 * 60},
+        },
+        "gc-deleted-media": {
+            "task": "app.tasks.media.gc_deleted_media",
+            "schedule": timedelta(minutes=15),
+            "options": {"expires": 14 * 60},     # never pile up behind a stalled queue
+        },
         # The Zoho planner is the ONLY Zoho scheduler. It replaced
         # `zoho-sync-dispatcher` (every 5 min, no running guard → overlapping
         # runs) and `zoho-full-sync-weekly` (every module forced to a full scan
@@ -105,6 +121,23 @@ def _setup_celery_logging(**_kwargs) -> None:
     from app.common.log import configure_logging
 
     configure_logging()
+
+
+@worker_init.connect
+def _register_every_model(**_kwargs) -> None:
+    """Load every module's models before any task touches the ORM.
+
+    The API gets this for free (``app.main`` imports every router, and each
+    router imports its module's models). A worker imports only what its task
+    modules reach: ``app.tasks.documents`` pulls in ``documents.model``, whose
+    tenant/organization foreign keys name tables no worker import ever loaded,
+    so the FIRST ORM query in any task — ``planner_tick`` above all — died with
+    ``NoReferencedTableError: One or more mappers failed to initialize`` and no
+    scheduled Zoho sync ran. Importing the router registers everything, in the
+    main process, once, before the pool forks; a new module cannot be forgotten
+    because its router is already required to exist.
+    """
+    import app.router  # noqa: F401 — imported for its side effect: every model is mapped
 
 
 @worker_process_init.connect

@@ -15,8 +15,14 @@ _MAX_AGE_DAYS = 14
 
 @shared_task(name="app.tasks.maintenance.cleanup_old_media")
 def cleanup_old_media() -> dict:
-    """Delete generated PDFs older than _MAX_AGE_DAYS from the media volume."""
-    media = Path(settings.MEDIA_DIR)
+    """Delete generated PDFs older than _MAX_AGE_DAYS from the media volume.
+
+    Scoped to ``<MEDIA_DIR>/pdf`` (where documents.service renders to). The
+    media library lives under the same volume (``MEDIA_LOCAL_BASE_PATH``,
+    ``<MEDIA_DIR>/library``); sweeping the whole volume by mtime would silently
+    delete every locally-stored avatar after two weeks.
+    """
+    media = Path(settings.MEDIA_DIR) / "pdf"
     if not media.exists():
         return {"deleted": 0}
 

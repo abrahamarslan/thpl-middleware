@@ -18,6 +18,7 @@ forbidden_modules =
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
+    app.modules.categories
 
 [importlinter:contract:features-never-call-zoho-directly]
 name = Features never import the Zoho transport (reads = local mirror, writes = outbox)
@@ -28,6 +29,7 @@ source_modules =
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
+    app.modules.categories
     app.modules.tenants
     app.modules.roles
     app.modules.geo
@@ -44,6 +46,17 @@ modules =
     app.modules.locations
     app.modules.zoho_users
 
+# A consumer of taxes (categories carry them; items, customers, invoice lines will)
+# depends on ``taxes``; ``taxes`` never depends on a consumer. That direction is what
+# keeps "an entity can carry taxes" a registry row + a mixin instead of an import.
+[importlinter:contract:taxes-never-import-a-consumer]
+name = Taxes never imports a module that consumes it (consumers import taxes, not the reverse)
+type = forbidden
+source_modules =
+    app.modules.taxes
+forbidden_modules =
+    app.modules.categories
+
 [importlinter:contract:location-hub-below-masters]
 name = The location hub never imports a Zoho master (locations projects INTO geo, not the reverse)
 type = forbidden
@@ -53,6 +66,7 @@ forbidden_modules =
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
+    app.modules.categories
 
 [importlinter:contract:tenancy-core-below-masters]
 name = The tenancy core never imports a Zoho master module (they depend on it, not the reverse)
@@ -65,6 +79,7 @@ forbidden_modules =
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
+    app.modules.categories
 
 [importlinter:contract:sync-core-is-source-neutral]
 name = The sync core never imports a source connector or a feature (the engine imports IT)
@@ -78,4 +93,5 @@ forbidden_modules =
     app.modules.taxes
     app.modules.locations
     app.modules.zoho_users
+    app.modules.categories
     app.modules.geo

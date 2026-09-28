@@ -18,7 +18,7 @@ from app.modules.brands.schema import (
     BrandSlimOut,
     BrandUpdate,
 )
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm, org_of
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -44,7 +44,7 @@ async def list_brands(
 
 
 @router.post("", response_model=ResponseModel[BrandOut], status_code=201)
-async def create_brand(user: CurrentUser, db: DBSession, body: BrandCreate):
+async def create_brand(user: Perm("core.brand:create"), db: DBSession, body: BrandCreate):
     brand = await service.create_brand(db, body, actor_id=user.id)
     return ResponseModel.ok(data=BrandOut.model_validate(brand), module=_M, msg_key="brand_created",
                             msg="Brand created", name=brand.name)
@@ -56,14 +56,14 @@ async def get_brand(_: CurrentUser, db: DBSession, ref: str):
 
 
 @router.patch("/{ref}", response_model=ResponseModel[BrandOut])
-async def update_brand(user: CurrentUser, db: DBSession, ref: str, body: BrandUpdate):
+async def update_brand(user: Perm("core.brand:update", target=org_of("app.modules.brands.model:Brand", "slug", "code")), db: DBSession, ref: str, body: BrandUpdate):
     brand = await service.update_brand(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=BrandOut.model_validate(brand), module=_M, msg_key="brand_updated",
                             msg="Brand updated", name=brand.name)
 
 
 @router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_brand(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_brand(admin: Perm("core.brand:delete", target=org_of("app.modules.brands.model:Brand", "slug", "code")), db: DBSession, ref: str,
                        reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_brand(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="brand_deleted", msg="Brand deleted", name=ref)
@@ -78,7 +78,7 @@ async def list_brand_manufacturers(_: CurrentUser, db: DBSession, ref: str):
 
 
 @router.post("/{ref}/manufacturers", response_model=ResponseModel[BrandManufacturerLinkOut], status_code=201)
-async def link_brand_manufacturer(user: CurrentUser, db: DBSession, ref: str,
+async def link_brand_manufacturer(user: Perm("core.brand:update", target=org_of("app.modules.brands.model:Brand", "slug", "code")), db: DBSession, ref: str,
                                   body: BrandManufacturerLinkCreate):
     link = await service.link_manufacturer(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=BrandManufacturerLinkOut.model_validate(link), module=_M,
@@ -87,7 +87,7 @@ async def link_brand_manufacturer(user: CurrentUser, db: DBSession, ref: str,
 
 
 @router.delete("/{ref}/manufacturers/{link_ref}", response_model=ResponseModel[None])
-async def unlink_brand_manufacturer(admin: TenantAdmin, db: DBSession, ref: str, link_ref: str,
+async def unlink_brand_manufacturer(admin: Perm("core.brand:update", target=org_of("app.modules.brands.model:Brand", "slug", "code")), db: DBSession, ref: str, link_ref: str,
                                     reason: str = Query(..., min_length=3, max_length=500)):
     await service.unlink_manufacturer(db, ref, link_ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="brand_manufacturer_unlinked",

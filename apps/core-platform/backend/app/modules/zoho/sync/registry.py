@@ -39,6 +39,8 @@ _ADAPTER_PACKAGES = [
     "app.modules.taxes.zoho",
     "app.modules.locations.zoho",
     "app.modules.zoho_users.zoho",
+    # categories mirrors Zoho Books /categories into core.categories.
+    "app.modules.categories.zoho",
 ]
 _ENTITY_PACKAGES = _ADAPTER_PACKAGES      # v1 name, kept for existing references
 

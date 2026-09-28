@@ -68,6 +68,18 @@ class Settings(BaseSettings):
                 return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
+    # A typo'd driver must stop the app at boot, not surface as a 500 on the
+    # first upload. Compose passes an unset variable as "" → the default.
+    @field_validator("MEDIA_STORAGE_DRIVER", mode="before")
+    @classmethod
+    def _normalise_media_driver(cls, v: object) -> object:
+        if not isinstance(v, str) or not v.strip():
+            return "local"
+        driver = {"s3": "garage"}.get(v.strip().lower(), v.strip().lower())
+        if driver not in ("local", "garage"):
+            raise ValueError(f"MEDIA_STORAGE_DRIVER must be 'local' or 'garage', got {v!r}")
+        return driver
+
     # --- Tenancy (docs/tenancy/README.md) ---
     # Rows written outside any tenant context (seeders, system tasks, the
     # single-tenant default) belong to this tenant. Created by the migration.
@@ -80,6 +92,10 @@ class Settings(BaseSettings):
     # Platform administrators (manage tenants): comma-separated emails.
     # Empty = nobody in production, any authenticated user when DEBUG=true.
     PLATFORM_ADMIN_EMAILS: str = ""
+    # RBAC (docs/rbac-module.md): how long a user's evaluated grants stay in Redis. The cache is also
+    # invalidated on every role/assignment/membership/tree change and clipped to the next grant
+    # start/expiry, so this is only a safety net. 0 disables the cache (tests do this).
+    RBAC_CACHE_TTL_SECONDS: int = 300
 
     # --- Seeded tenant + root organization (app/modules/tenants/seed.py) ---
     # `scripts/seed.py` creates this tenant and its root organization
@@ -442,14 +458,22 @@ class Settings(BaseSettings):
     SEARCH_CDC_GROUP_ID: str = "meilisearch-indexer"
     SEARCH_INDEX_BATCH_SIZE: int = 500
 
-    # --- Media library (storage strategy; see app/modules/media/storage.py) ---
-    MEDIA_STORAGE_DRIVER: str = "local"       # local | s3
+    # --- Media library (docs/media-storage.md; app/modules/media/storage.py) ---
+    # The driver is the default for NEW uploads only: every media row records
+    # its own `disk`, so flipping this never breaks URLs already issued.
+    MEDIA_STORAGE_DRIVER: str = "local"       # local | garage  ("s3" is accepted as an alias for garage)
     MEDIA_LOCAL_BASE_PATH: str = "/app/media/library"
-    MEDIA_PUBLIC_BASE_URL: str = "/media/library"
-    AWS_ACCESS_KEY_ID: str = ""
-    AWS_SECRET_ACCESS_KEY: str = ""
-    AWS_REGION: str = ""
-    MEDIA_S3_BUCKET: str = ""
+    # Origin that public media URLs are built on (https://dlp.tarrinahealth.com).
+    # Must be absolute for other applications to embed the images; empty falls
+    # back to same-origin relative URLs, which only work for our own frontend.
+    MEDIA_PUBLIC_BASE_URL: str = ""
+    # Garage / any S3-compatible backend. Two buckets: public + private.
+    S3_ENDPOINT_URL: str = "http://garage:3900"
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    S3_BUCKET_PUBLIC: str = "core-platform-media-public"
+    S3_BUCKET_PRIVATE: str = "core-platform-media-private"
+    S3_REGION: str = "garage"
 
     # --- Document rendering (Typst, in-process via typst-py — no service) ---
     # Slim images ship almost no fonts: bundle brand fonts and point

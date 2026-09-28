@@ -11,7 +11,7 @@ from app.modules.fleet_partners.schema import (
     FleetPartnerSlim,
     FleetPartnerUpdate,
 )
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm, org_of
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -42,7 +42,7 @@ async def get_partner(_: CurrentUser, db: DBSession, ref: str):
 
 
 @router.post("", response_model=ResponseModel[FleetPartnerOut], status_code=201)
-async def create_partner(user: CurrentUser, db: DBSession, body: FleetPartnerCreate):
+async def create_partner(user: Perm("fleet.partner:create"), db: DBSession, body: FleetPartnerCreate):
     partner = await service.create_partner(db, body, actor_id=user.id)
     return ResponseModel.ok(
         data=FleetPartnerOut.model_validate(partner), module=_M, msg_key="created", code=partner.code
@@ -50,7 +50,7 @@ async def create_partner(user: CurrentUser, db: DBSession, body: FleetPartnerCre
 
 
 @router.patch("/{ref}", response_model=ResponseModel[FleetPartnerOut])
-async def update_partner(user: CurrentUser, db: DBSession, ref: str, body: FleetPartnerUpdate):
+async def update_partner(user: Perm("fleet.partner:update", target=org_of("app.modules.fleet_partners.model:FleetPartner", "code")), db: DBSession, ref: str, body: FleetPartnerUpdate):
     partner = await service.update_partner(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(
         data=FleetPartnerOut.model_validate(partner), module=_M, msg_key="updated", code=partner.code
@@ -58,7 +58,7 @@ async def update_partner(user: CurrentUser, db: DBSession, ref: str, body: Fleet
 
 
 @router.post("/{ref}/archive", response_model=ResponseModel[FleetPartnerOut])
-async def archive_partner(admin: TenantAdmin, db: DBSession, ref: str,
+async def archive_partner(admin: Perm("fleet.partner:manage", target=org_of("app.modules.fleet_partners.model:FleetPartner", "code")), db: DBSession, ref: str,
                           reason: str = Query(..., min_length=3, max_length=500)):
     partner = await service.archive_partner(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(
@@ -67,7 +67,7 @@ async def archive_partner(admin: TenantAdmin, db: DBSession, ref: str,
 
 
 @router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_partner(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_partner(admin: Perm("fleet.partner:delete", target=org_of("app.modules.fleet_partners.model:FleetPartner", "code")), db: DBSession, ref: str,
                          reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_partner(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="deleted", code=ref)

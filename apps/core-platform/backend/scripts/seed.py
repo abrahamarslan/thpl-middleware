@@ -4,7 +4,8 @@
 Runs all domain seeders in topological dependency order:
   1. users.reference (Countries, Timezones, Country-Timezone mappings)
   2. documents.types (the document-type catalog; never overwrites edited rows)
-  3. company (the deployment's tenant + root organization, from COMPANY_* settings)
+  3. custom_fields.data_types (the Zoho custom-field data-type lookup)
+  4. company (the deployment's tenant + root organization, from COMPANY_* settings)
 
 Usage:
   python scripts/seed.py
@@ -25,6 +26,7 @@ sys.path.insert(0, str(backend_dir))
 
 from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 
+from app.modules.custom_fields.seed import seed_data_types  # noqa: E402
 from app.modules.documents.seed import seed_document_types  # noqa: E402
 from app.modules.tenants.seed import run_seed_company  # noqa: E402
 from app.modules.users.seeders.reference import seed_reference_on_connection  # noqa: E402
@@ -48,7 +50,8 @@ async def _run_sync(db_url: str, fn):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Master seeder orchestrator.")
-    parser.add_argument("--only", choices=["users.reference", "documents.types", "company"],
+    parser.add_argument("--only",
+                        choices=["users.reference", "documents.types", "custom_fields.data_types", "company"],
                         help="Run a specific seeder only")
     parser.add_argument("--database-url", default=None, help="Database URL")
     args = parser.parse_args()
@@ -59,11 +62,12 @@ def main() -> None:
 
     run_reference = not args.only or args.only == "users.reference"
     run_documents = not args.only or args.only == "documents.types"
+    run_data_types = not args.only or args.only == "custom_fields.data_types"
     run_company = not args.only or args.only == "company"
 
     print("=== Running Seeders ===")
     if run_reference:
-        print("[1/3] Seeding reference data (countries & timezones)...")
+        print("[1/4] Seeding reference data (countries & timezones)...")
         json_file = str(backend_dir / "data" / "countries" / "countries.json")
         if not os.path.exists(json_file):
             json_file = str(backend_dir / "data" / "countries.json")
@@ -73,12 +77,17 @@ def main() -> None:
         print(f"      ✓ {results['countries']} countries, {results['timezones']} timezones, {results['mappings']} mappings seeded.")
 
     if run_documents:
-        print("[2/3] Seeding the document-type catalog...")
+        print("[2/4] Seeding the document-type catalog...")
         added = asyncio.run(_run_sync(db_url, seed_document_types))
         print(f"      ✓ {added} document types added (existing rows are never overwritten).")
 
+    if run_data_types:
+        print("[3/4] Seeding the custom-field data-type lookup...")
+        added = asyncio.run(_run_sync(db_url, seed_data_types))
+        print(f"      ✓ {added} custom-field data types added (existing rows are never overwritten).")
+
     if run_company:
-        print("[3/3] Seeding the tenant + root organization (COMPANY_* settings)...")
+        print("[4/4] Seeding the tenant + root organization (COMPANY_* settings)...")
         result = asyncio.run(run_seed_company(db_url))
         tenant, org = result["tenant"], result["organization"]
         verb = "created" if result["tenant_created"] else "updated"

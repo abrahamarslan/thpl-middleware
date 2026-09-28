@@ -32,7 +32,11 @@ async def test_platform_admin_creates_a_tenant_with_its_root_organization(worlds
     })
     assert response.status_code == 201, response.text
     tenant = response.json()["data"]
-    assert tenant["status"] == "trial" and tenant["row_version"] == 1
+    # row_version is 2, not 1: creating a tenant now also creates its root organization and an initial
+    # administrator, and linking that admin back via tenants.primary_user_id is a second write to the
+    # tenant row (docs/rbac-module.md §12) — the insert (v1) plus that update (v2).
+    assert tenant["status"] == "trial" and tenant["row_version"] == 2
+    assert tenant["initial_admin"]["role"] == "owner" and tenant["initial_admin"]["tenant_wide"] is True
 
     org = await db.scalar(select(Organization).where(Organization.tenant_id == tenant["id"])
                           .execution_options(all_tenants=True))
@@ -66,12 +70,19 @@ async def test_tenant_status_change_and_optimistic_update(worlds, db):
 async def test_roles_live_inside_their_tenant(worlds):
     client, acme, globex = worlds
     listed = (await client.get("/api/roles", headers=acme.auth(acme.member))).json()["data"]
-    assert {r["code"] for r in listed} == {"owner", "admin", "member"}
+    assert {r["code"] for r in listed} == {
+        "owner", "admin", "member", "department_head", "team_manager", "auditor",
+    }
     assert {r["tenant_id"] for r in listed} == {acme.tenant.id}
 
     created = await client.post("/api/roles", headers=acme.auth(acme.admin),
-                                json={"code": "sales_rep", "name": "Sales rep", "permissions": ["orders.read"]})
+                                json={"code": "sales_rep", "name": "Sales rep", "permissions": ["teams.team:read"]})
     assert created.status_code == 201
+    assert created.json()["data"]["permissions"] == ["teams.team:read"]
+    # An unknown permission is refused — a typo would otherwise be silently inert forever.
+    typo = await client.post("/api/roles", headers=acme.auth(acme.admin),
+                             json={"code": "typo_role", "name": "Typo", "permissions": ["orders.read"]})
+    assert typo.status_code == 422 and typo.json()["code"] == "rbac_rule_violation"
     assert "sales_rep" not in {r["code"] for r in
                                (await client.get("/api/roles", headers=globex.auth(globex.member))).json()["data"]}
     # the same code in another tenant is fine

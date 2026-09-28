@@ -97,6 +97,14 @@ SEARCHABLE_ENTITIES: dict[str, SearchableEntity] = {
         filterable=["tenant_id", "organization_id", "status", "country_code", "is_verified"],
         sortable=["name", "created_at"],
     ),
+    "categories": SearchableEntity(
+        index_name="categories",
+        model_path=("app.modules.categories.model", "Category"),
+        schema_path=("app.modules.categories.schema", "CategorySlimOut"),
+        searchable=["name", "slug", "code"],
+        filterable=["tenant_id", "organization_id", "taxonomy_id", "is_active", "status"],
+        sortable=["name", "display_order", "created_at"],
+    ),
 }
 
 

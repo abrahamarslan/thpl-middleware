@@ -90,11 +90,17 @@ def test_the_extras_on_the_component_are_exactly_the_documented_ones():
     assert have - paste == DOCUMENTED_EXTRAS[TaxComponent]
 
 
-def test_all_six_tables_live_in_the_tax_schema_and_no_table_carries_a_source_id():
+def test_all_eight_tables_live_in_the_tax_schema_and_no_table_carries_a_source_id():
+    """Six masters + the polymorphic assignment layer (``tax_assignments`` + its global policy).
+
+    ``tax_assignments.external_ref`` is NOT a source id in this sense: it is the transient pointer of a
+    *pending* row (a source named a tax we have not synced yet) and is cleared to a real FK by the
+    reconcile lane. Identity of a tax is still the crosswalk's.
+    """
     tables = {t.name: t for t in Base.metadata.tables.values() if t.schema == "tax"}
     assert set(tables) == {"tax_components", "tax_group_members", "tax_exemptions",
                            "organization_tax_components", "org_default_tax_preferences",
-                           "gst_treatment_types"}
+                           "gst_treatment_types", "taxable_entity_types", "tax_assignments"}
     for table in tables.values():
         assert not {"zoho_id", "external_id", "zoho_raw"} & set(table.c.keys()), table.fullname
 

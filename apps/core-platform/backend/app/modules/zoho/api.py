@@ -16,7 +16,7 @@ from fastapi import APIRouter
 from app.common.exception.errors import NotFoundError
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
-from app.modules.users.deps import CurrentUser
+from app.modules.rbac.deps import Perm
 from app.modules.zoho import service
 from app.modules.zoho.schema import SyncStateOut
 
@@ -24,7 +24,7 @@ router = APIRouter()
 
 
 @router.get("/sync/{entity}", response_model=ResponseModel[SyncStateOut])
-async def sync_status(_: CurrentUser, db: DBSession, entity: str):
+async def sync_status(_: Perm("zoho.integration:read"), db: DBSession, entity: str):
     state = await service.get_sync_status(db, entity)
     if state is None:
         raise NotFoundError(f"No sync state for entity '{entity}'")

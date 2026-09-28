@@ -72,6 +72,11 @@ Jinja2>=3.1.5
 # https://pypi.org/project/typst/ | https://github.com/messense/typst-py
 typst==0.15.0
 
+# --- Object storage (GarageFS / any S3-compatible). aioboto3 serves the API request
+#     path; it pins a matching boto3, which the Celery workers use synchronously
+#     (app/modules/media/storage_sync.py). Do not add boto3 separately. ---
+aioboto3>=13,<16
+
 # --- Imaging ---
 Pillow>=11.0
 

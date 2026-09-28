@@ -72,6 +72,12 @@ DATABASE
   reset-db [--dev]   Backup all DBs then reset the postgres_data volume (one command)
                      Pass --dev when running in dev mode
 
+MEDIA STORAGE (Garage / S3)
+  garage-init        Create the public+private media buckets and grant the app key
+                     (idempotent; run once after the first `start`/`prod`)
+  garage-backup      Mirror both media buckets to backups/garage/ (shipped to GCS by
+                     scripts/sync-backups-gcs.sh); run nightly from cron
+
 DEBEZIUM (CDC)
   register-debezium  Register/update the zoho-mirror Postgres connector
   debezium-status    Show connector list + status
@@ -389,6 +395,16 @@ case "$COMMAND" in
         echo -e "${YELLOW}Restoring database from: $ARG1${NC}"
         cat "$ARG1" | compose exec -T postgres bash -lc 'PGPASSWORD="$POSTGRES_PASS" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DBNAME"'
         echo -e "${GREEN}Database restored!${NC}"
+        ;;
+
+    # -- Media storage (Garage) ---------------------------------------------------
+    garage-init)
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        bash "$SCRIPT_DIR/scripts/garage-init.sh"
+        ;;
+    garage-backup)
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        bash "$SCRIPT_DIR/scripts/garage-backup.sh"
         ;;
 
     # -- Debezium (CDC) -----------------------------------------------------------

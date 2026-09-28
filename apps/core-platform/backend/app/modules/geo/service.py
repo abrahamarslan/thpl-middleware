@@ -434,6 +434,61 @@ async def _refresh_owner_caches(db: AsyncSession, link: PlaceLink) -> None:
     await users_service.refresh_primary_place(db, link.owner_id)
 
 
+#: Per-link overrides a repeated attach may refresh. Identity (owner, place, link
+#: type, purpose) is what matched, so it is never rewritten here.
+_LINK_OVERRIDES = ("label", "attention", "landmark", "delivery_instructions", "contact_phone",
+                   "custom_attributes", "app_metadata")
+
+
+async def _open_link(db: AsyncSession, body: AddressCreate, place: Place) -> PlaceLink | None:
+    """The owner's OPEN link to this place for this type and purpose, if any.
+
+    "Open" (``valid_to IS NULL``) is the point: a closed link is history and does
+    not stop the owner returning to an old address.
+    """
+    return await db.scalar(
+        select(PlaceLink).where(
+            PlaceLink.owner_type == body.owner_type, PlaceLink.owner_id == body.owner_id,
+            PlaceLink.place_id == place.id, PlaceLink.link_type == body.link_type.value,
+            PlaceLink.purpose == body.purpose, PlaceLink.valid_to.is_(None),
+        ).limit(1)
+    )
+
+
+async def _reaffirm_link(
+    db: AsyncSession, link: PlaceLink, body: AddressCreate, place: Place, *, actor_id: int | None,
+) -> PlaceLink:
+    """Attach of an address the owner already holds: refresh what was sent, add nothing.
+
+    Only fields the caller actually sent are applied, and ``is_primary`` can
+    promote but never demote — a default ``false`` on a repeat call is silence,
+    not a request to lose primary status.
+    """
+    changes: dict[str, Any] = {}
+    for field in _LINK_OVERRIDES:
+        value = getattr(body, field)
+        if field in body.model_fields_set and value is not None and getattr(link, field) != value:
+            changes[field] = value
+    if body.is_primary and not link.is_primary:
+        await _clear_other_primary_links(db, link)
+        changes["is_primary"] = True
+    if body.freeze and not link.is_frozen:
+        changes["snapshot"] = build_snapshot(place)
+
+    if changes:
+        for field, value in changes.items():
+            setattr(link, field, value)
+        await db.flush()
+        await record_activity(
+            db, action="address_updated", actor_id=actor_id, subject_type="PlaceLink", subject_id=link.id,
+            changes={"after": {k: _jsonable(v) for k, v in changes.items() if k != "snapshot"}},
+        )
+        await _refresh_owner_caches(db, link)
+    logger.info("geo.address.reaffirmed", link_id=link.id, owner=f"{link.owner_type}:{link.owner_id}",
+                changed=sorted(changes))
+    return await get_address(db, link.uuid)          # loads .place (lazy="raise")
+
+
 async def attach_address(
     db: AsyncSession, body: AddressCreate, *, actor_id: int | None = None,
 ) -> PlaceLink:
@@ -444,6 +499,14 @@ async def attach_address(
     )
     if place.status != PlaceStatus.ACTIVE.value:
         raise GeoRuleError(f"Place '{place.location_name or place.uuid}' is {place.status}")
+
+    # Saving an address the owner already holds is not a new fact. `create_place`
+    # reuses a near-duplicate place, so the same doorway comes back here — and
+    # inserting a second identical link would break `uq_place_links_dedupe`
+    # (a 500 before this check existed).
+    already = await _open_link(db, body, place)
+    if already is not None:
+        return await _reaffirm_link(db, already, body, place, actor_id=actor_id)
 
     values = body.model_dump(
         exclude={"place", "new_place", "freeze", "owner_type", "link_type", "valid_from"},

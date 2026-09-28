@@ -1,37 +1,15 @@
 """Who may operate the Zoho integration.
 
-⚠ Interim authorisation. The platform has no RBAC yet (``users.role_id``
-references a roles table that does not exist), so operators are an explicit
-allow-list of emails in ``ZOHO_OPERATOR_EMAILS``:
+RBAC now (docs/rbac-module.md): the admin routes declare ``Perm("zoho.integration:read")`` /
+``Perm("zoho.integration:manage")`` directly. ``ZohoOperator`` is kept as an alias for the manage
+permission so existing imports keep working.
 
-  * listed email            → allowed
-  * list empty + DEBUG=true  → any authenticated user (local development)
-  * otherwise               → 403
-
-Replace with a role/permission check (Authentik group → local role) when RBAC
-lands; the dependency name stays the same so routes do not change.
+The old ``ZOHO_OPERATOR_EMAILS`` allow-list (and its "empty + DEBUG = anyone" rule) is retired: an
+operator is a user whose role carries ``zoho.integration:manage`` — grant it with a role assignment.
 """
 
-from typing import Annotated
+from app.modules.rbac.deps import Perm
 
-from fastapi import Depends
+ZohoOperator = Perm("zoho.integration:manage")
 
-from app.common.exception.errors import ForbiddenError
-from app.core.conf import settings
-from app.modules.users.deps import CurrentUser
-from app.modules.users.model import User
-
-
-def _operator_emails() -> set[str]:
-    return {e.strip().lower() for e in settings.ZOHO_OPERATOR_EMAILS.split(",") if e.strip()}
-
-
-async def require_zoho_operator(user: CurrentUser) -> User:
-    allowed = _operator_emails()
-    email = (getattr(user, "email", None) or "").lower()
-    if (allowed and email in allowed) or (not allowed and settings.DEBUG):
-        return user
-    raise ForbiddenError("Zoho integration operations require an operator account")
-
-
-ZohoOperator = Annotated[User, Depends(require_zoho_operator)]
+__all__ = ["ZohoOperator"]

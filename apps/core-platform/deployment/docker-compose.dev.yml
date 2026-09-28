@@ -74,6 +74,14 @@ services:
     ports:
       - "${MEILISEARCH_PORT:-7700}:7700"
 
+  # Direct host access to Garage (S3 API, RPC, web, admin) for awscli/rclone.
+  garage:
+    ports:
+      - "${GARAGE_S3_PORT:-3900}:3900"
+      - "${GARAGE_RPC_PORT:-3901}:3901"
+      - "${GARAGE_WEB_PORT:-3902}:3902"
+      - "${GARAGE_ADMIN_PORT:-3903}:3903"
+
   kafka:
     ports:
       - "${KAFKA_EXTERNAL_PORT:-19092}:19092"

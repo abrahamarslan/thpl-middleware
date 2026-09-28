@@ -1,0 +1,28 @@
+"""Teams — English messages."""
+
+MESSAGES: dict[str, str] = {
+    "department_created": "Department '{name}' created.",
+    "department_updated": "Department '{name}' updated.",
+    "department_moved": "Department '{name}' moved.",
+    "department_deleted": "Department '{name}' deleted.",
+    "job_title_created": "Job title '{name}' created.",
+    "job_title_updated": "Job title '{name}' updated.",
+    "job_title_deleted": "Job title '{name}' deleted.",
+    "team_type_created": "Team type '{name}' created.",
+    "team_type_updated": "Team type '{name}' updated.",
+    "team_type_moved": "Team type '{name}' moved.",
+    "team_type_deleted": "Team type '{name}' deleted.",
+    "team_role_created": "Team role '{name}' created.",
+    "team_role_updated": "Team role '{name}' updated.",
+    "team_role_deleted": "Team role '{name}' deleted.",
+    "team_created": "Team '{name}' created.",
+    "team_updated": "Team '{name}' updated.",
+    "team_moved": "Team '{name}' moved.",
+    "team_deleted": "Team '{name}' deleted.",
+    "member_added": "Member added to '{name}'.",
+    "members_added": "{count} member(s) added to '{name}'.",
+    "member_updated": "Membership updated.",
+    "member_removed": "Member removed from '{name}'.",
+    "member_approved": "Membership approved.",
+    "member_rejected": "Membership rejected.",
+}

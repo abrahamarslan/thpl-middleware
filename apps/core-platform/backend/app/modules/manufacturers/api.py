@@ -17,7 +17,7 @@ from app.modules.manufacturers.schema import (
     ManufacturerSlimOut,
     ManufacturerUpdate,
 )
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm, org_of
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -40,7 +40,7 @@ async def list_manufacturers(
 
 
 @router.post("", response_model=ResponseModel[ManufacturerOut], status_code=201)
-async def create_manufacturer(user: CurrentUser, db: DBSession, body: ManufacturerCreate):
+async def create_manufacturer(user: Perm("core.manufacturer:create"), db: DBSession, body: ManufacturerCreate):
     manufacturer = await service.create_manufacturer(db, body, actor_id=user.id)
     return ResponseModel.ok(data=ManufacturerOut.model_validate(manufacturer), module=_M,
                             msg_key="manufacturer_created", msg="Manufacturer created",
@@ -53,7 +53,7 @@ async def get_manufacturer(_: CurrentUser, db: DBSession, ref: str):
 
 
 @router.patch("/{ref}", response_model=ResponseModel[ManufacturerOut])
-async def update_manufacturer(user: CurrentUser, db: DBSession, ref: str, body: ManufacturerUpdate):
+async def update_manufacturer(user: Perm("core.manufacturer:update", target=org_of("app.modules.manufacturers.model:Manufacturer", "slug", "code")), db: DBSession, ref: str, body: ManufacturerUpdate):
     manufacturer = await service.update_manufacturer(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=ManufacturerOut.model_validate(manufacturer), module=_M,
                             msg_key="manufacturer_updated", msg="Manufacturer updated",
@@ -61,7 +61,7 @@ async def update_manufacturer(user: CurrentUser, db: DBSession, ref: str, body: 
 
 
 @router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_manufacturer(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_manufacturer(admin: Perm("core.manufacturer:delete", target=org_of("app.modules.manufacturers.model:Manufacturer", "slug", "code")), db: DBSession, ref: str,
                               reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_manufacturer(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="manufacturer_deleted",
@@ -77,7 +77,7 @@ async def list_identifiers(_: CurrentUser, db: DBSession, ref: str):
 
 
 @router.post("/{ref}/identifiers", response_model=ResponseModel[ManufacturerIdentifierOut], status_code=201)
-async def add_identifier(user: CurrentUser, db: DBSession, ref: str, body: ManufacturerIdentifierCreate):
+async def add_identifier(user: Perm("core.manufacturer:update", target=org_of("app.modules.manufacturers.model:Manufacturer", "slug", "code")), db: DBSession, ref: str, body: ManufacturerIdentifierCreate):
     identifier = await service.add_identifier(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=ManufacturerIdentifierOut.model_validate(identifier), module=_M,
                             msg_key="manufacturer_identifier_added", msg="Identifier added",
@@ -85,7 +85,7 @@ async def add_identifier(user: CurrentUser, db: DBSession, ref: str, body: Manuf
 
 
 @router.delete("/{ref}/identifiers/{identifier_ref}", response_model=ResponseModel[None])
-async def remove_identifier(admin: TenantAdmin, db: DBSession, ref: str, identifier_ref: str,
+async def remove_identifier(admin: Perm("core.manufacturer:update", target=org_of("app.modules.manufacturers.model:Manufacturer", "slug", "code")), db: DBSession, ref: str, identifier_ref: str,
                             reason: str = Query(..., min_length=3, max_length=500)):
     await service.remove_identifier(db, ref, identifier_ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="manufacturer_identifier_removed",

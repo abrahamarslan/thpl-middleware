@@ -45,6 +45,31 @@ async def lifespan(app: FastAPI):
     from app.database.redis import close_redis, redis_client
 
     await redis_client.ping()
+    # With the garage driver both buckets must already exist: verify, never
+    # provision (`manage.sh garage-init` owns that). Fails the boot loudly
+    # instead of the first avatar upload failing at runtime.
+    from app.modules.media.storage import verify_storage_ready
+
+    await verify_storage_ready()
+    # RBAC boot check: make sure every code in rbac/catalogue.py has a row (insert-missing, catalogue only —
+    # never touches a role's grants). Forgetting to seed can therefore not become a permanent 403.
+    try:
+        from app.database.db import async_session_factory
+        from app.modules.rbac.seed import ensure_permissions
+
+        async with async_session_factory() as session:
+            inserted = await ensure_permissions(session)
+            await session.commit()
+        if inserted:
+            logger.info("rbac_catalogue_seeded", inserted=inserted)
+    except Exception as exc:  # noqa: BLE001 — never block boot on a seed hiccup; the migration also seeds
+        logger.warning("rbac_catalogue_check_failed", error=str(exc))
+    if settings.ENVIRONMENT == "production" and not settings.MEDIA_PUBLIC_BASE_URL.startswith(("http://", "https://")):
+        logger.warning(
+            "media_public_base_url_not_absolute",
+            value=settings.MEDIA_PUBLIC_BASE_URL,
+            hint="set MEDIA_PUBLIC_BASE_URL=https://<host> so other applications can embed public media",
+        )
     # Zoho gauges on /metrics, copied from the planner's snapshot (never computed
     # at scrape time). docs/zoho-sync-implementation/control-plane.md §7
     import asyncio
@@ -102,6 +127,13 @@ def register_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(system_router, prefix=settings.API_PREFIX)
     app.include_router(api_router, prefix=settings.API_PREFIX)
+
+    # The one intentionally UNAUTHENTICATED router (public media). Root-mounted,
+    # not under /api, so ingress can route it separately from the authenticated API
+    # (docker-compose.yml: router `public-media`). Keep it out of api_router.
+    from app.modules.media.public_api import router as public_media_router
+
+    app.include_router(public_media_router)
 
     # Prometheus /metrics — scraped over the internal network only
     Instrumentator(

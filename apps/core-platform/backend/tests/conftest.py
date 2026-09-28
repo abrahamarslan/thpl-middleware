@@ -24,6 +24,9 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:56379/0")
 os.environ.setdefault("CELERY_BROKER_URL", "redis://localhost:56379/2")
 os.environ.setdefault("CELERY_RESULT_BACKEND", "redis://localhost:56379/3")
 os.environ.setdefault("ZOHO_ORGANIZATION_ID", "10234695")
+# Tests change roles/assignments straight in the database; a cached grant would go stale under them.
+# The cache itself is tested explicitly (tests/test_rbac_engine.py) by turning it on.
+os.environ.setdefault("RBAC_CACHE_TTL_SECONDS", "0")
 
 import pytest  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -32,7 +35,8 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.core.conf import settings  # noqa: E402
 from app.database.tenancy import clear_default_cache  # noqa: E402
-from tests.tenancy_fixtures import worlds  # noqa: E402,F401 — shared tenancy API fixture
+from tests.media_fixtures import media_env  # noqa: E402,F401 — shared media stack fixture
+from tests.tenancy_fixtures import tree_world, worlds  # noqa: E402,F401 — shared tenancy API fixtures
 
 #: Tables integration tests write to — truncated between tests for isolation.
 _TEST_TABLES = (
@@ -64,7 +68,9 @@ _TEST_TABLES = (
     # Currency: rates before the currency (FK order).
     "currency.exchange_rates",
     "currency.currencies",
-    # Tax: children before the component (composite FK order).
+    # Tax: children before the component (composite FK order). `tax.taxable_entity_types` is
+    # policy data seeded by the migration — NOT truncated (like core.entity_types).
+    "tax.tax_assignments",
     "tax.tax_group_members",
     "tax.org_default_tax_preferences",
     "tax.organization_tax_components",
@@ -78,6 +84,25 @@ _TEST_TABLES = (
     "core.brand_manufacturers",
     "core.brands",
     "core.manufacturers",
+    # Categories: assignments before nodes before whitelists before trees.
+    "core.categorizables",
+    "core.categories",
+    "core.taxonomy_entity_types",
+    "core.taxonomies",
+    # Custom fields: values before definitions (FK order). extfields.data_types is
+    # reference data seeded by the migration — NOT truncated.
+    "extfields.field_values",
+    "extfields.field_definitions",
+    # Teams & RBAC: memberships/grants before what they point at (FK order). rbac.permissions is the
+    # catalogue seeded by its migration (reference data, like document_types) — NOT truncated.
+    "rbac.user_roles",
+    "rbac.role_permissions",
+    "teams.user_teams",
+    "teams.teams",
+    "teams.team_roles",
+    "teams.team_types",
+    "teams.job_titles",
+    "teams.departments",
     "org_management.organizations",   # CASCADE: every tenant table references it
     "roles",
     # Users & telemetry
@@ -122,7 +147,7 @@ _TEST_TABLES = (
     "document_links",
     "document_files",
     "documents",
-    "media",
+    "media.items",
     "user_profiles",
     "country_timezones",
     "timezones",

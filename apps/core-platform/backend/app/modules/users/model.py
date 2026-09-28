@@ -54,13 +54,14 @@ from app.database.mixins import (
     TenantEntityMixin,
     TimestampMixin,
 )
+from app.modules.comments.mixins import HasCommentsMixin
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class User(MultiTenantMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, Base):
+class User(MultiTenantMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, HasCommentsMixin, Base):
     """A person who signs in. Belongs to ONE tenant (``tenant_id``) AND one
     organization (``organization_id``, NOT NULL); holds a role OF THAT
     ORGANIZATION (composite FK ``(tenant_id, organization_id, role_id)`` →
@@ -176,10 +177,9 @@ class User(MultiTenantMixin, RowVersionMixin, AppMetaMixin, DeactivationMixin, B
     onboarding_status = mapped_column(String(255), nullable=True, comment="Status of the user's onboarding process")
 
     # == Profile Customization ==
-    image = mapped_column(String(255), nullable=True, default="default.png", comment="Filename of the main profile picture")
-    avatar = mapped_column(String(255), nullable=True, default="avatar.png", comment="Filename of the avatar image")
-    thumbnail = mapped_column(String(255), nullable=True, default="default.png", comment="Filename of the profile picture thumbnail")
-    preview_image = mapped_column(String(255), nullable=True, default="default.png", comment="Filename of a preview-sized profile image")
+    # The legacy image/avatar/thumbnail/preview_image filename columns are gone:
+    # profile pictures are media.items rows (model_type="user", collection="avatar"),
+    # reached as public URLs through media.service.avatar_urls.
     profile_completion_percentage = mapped_column(SmallInteger, nullable=True, default=0, comment="Profile completion percentage (0-100)")
     other_details = mapped_column(JSONB, nullable=True, comment="JSON object for miscellaneous user details")
     other_information = mapped_column(JSONB, nullable=True, comment="JSON object for other structured information")

@@ -139,6 +139,12 @@ child's local id / zoho_id onto the parent's FK columns.
 
 ## 5. Outbound — the transactional outbox
 
+> **Not built in the current tree.** The v1 command outbox (`push_outbound`,
+> `zoho_queue_logs` push state) was retired with the crosswalk redesign; no
+> module dispatches outbound writes today. `service.to_zoho_payload`
+> (currencies, categories) is the seam it will call; the push-state columns
+> (`ZohoPushableMixin`) are added to a table when its push lands, not before.
+
 ```
 service writes local row ──┐ same transaction
 journal zoho_queue_logs  ──┘        │ commit
@@ -204,6 +210,49 @@ queue logs appear automatically.
 - Endpoints: list / get-by-local-or-zoho-id / create / update / soft-delete /
   trigger sync. Reads are ALWAYS local (fast, offline-tolerant, zero rate
   budget).
+
+## 9a. Worked example: categories (Zoho Books)
+
+`app/modules/categories/zoho/` mirrors
+[docs/zoho-docs-md/categories.md](zoho-docs-md/categories.md) into
+`core.categories`:
+
+A **crosswalk** module (`contract.crosswalk=True`): `core.categories` carries
+business columns and a `zoho_id` echo only; identity, gate state and the raw
+document are on `sync.sync_records`. Every choice below was checked against the
+live API, not just the vendored doc — details and evidence in
+[implementation-plan/categories-zoho-sync-review.md](implementation-plan/categories-zoho-sync-review.md).
+
+- **INCREMENTAL** (`modified_since_param="last_modified_time"`; the live API
+  takes the engine's `…+0000` cursor and answers a `…Z` with a 400; `sort_column`
+  left `None` because Zoho's default sort is `sibling_order`, not time-ordered,
+  and the engine only advances its watermark page-by-page for a time-ordered
+  scan) + **index-then-detail** (the list row carries the tree fields; the
+  detail document adds the SEO block, `custom_fields` and
+  `category_tax_preferences`).
+- **`list_params={"include_root_category": "false"}`** — Zoho prepends a
+  synthetic `ROOT` row (`category_id "-1"`, blank timestamps) that nobody
+  created; without the flag it became a fake top-level category and an
+  incremental run re-listed it every time.
+- **INBOUND.** Zoho masters the tree, so local edits to a linked row's Zoho-fed
+  fields *and its parent* are refused by the service. (BIDIRECTIONAL was declared
+  first and contradicted that guard; nothing would have pushed anyway — the
+  outbox is not built, §5.) `service.to_zoho_payload` remains the seam.
+- **Deletes**: an incremental list never shows one. The weekly-full lane
+  (`weekly_full_enabled`) re-lists everything and `soft_delete_missing=True`
+  tombstones what is gone — both sides (`deleted_at` + crosswalk
+  `remote_deleted_at`) — but only with `ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING=true`
+  (off in every environment by default) and under the mass-delete guard.
+- **Tree-aware**: the list is returned in hierarchical order;
+  `parent_category_id` is resolved through the crosswalk in `post_upsert`
+  (Zoho's `-1` sentinel means "root"). It is a hook and not a `ReferenceRule`
+  because a category's parent is a row of its own module that usually arrives in
+  the same page, and the page's reference preload runs before any row of that
+  page exists. A parent that still cannot be resolved is queued on
+  `sync.pending_references` (`python -m app.modules.zoho.cli reconcile` links
+  it); the affected taxonomy's nested-set bounds are recomputed by the hook.
+  Synced rows land in a per-organization `zoho` taxonomy auto-provisioned by
+  `core.fill_category_default_taxonomy()`.
 
 ## 10. Async-in-Celery pattern
 

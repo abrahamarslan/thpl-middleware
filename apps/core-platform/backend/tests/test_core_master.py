@@ -28,10 +28,11 @@ from app.modules.manufacturers.schema import ManufacturerIdentifierCreate
 
 # ── hermetic: schema shape ──────────────────────────────────────────────────
 
-def test_the_six_core_tables_live_in_the_core_schema():
+def test_the_nine_core_tables_live_in_the_core_schema():
     tables = {t.name for t in Base.metadata.tables.values() if t.schema == "core"}
     assert tables == {"entity_types", "brands", "manufacturers",
-                      "brand_manufacturers", "manufacturer_identifiers", "entity_aliases"}
+                      "brand_manufacturers", "manufacturer_identifiers", "entity_aliases",
+                      "taxonomies", "taxonomy_entity_types", "categories", "categorizables"}
 
 
 def test_normalized_columns_are_stored_generated_columns():

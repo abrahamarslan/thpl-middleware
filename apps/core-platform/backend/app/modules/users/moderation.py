@@ -125,6 +125,12 @@ async def ban_user(
     until: datetime | None = None,
     actor_id: int | None = None,
 ) -> User:
+    if actor_id is not None and actor_id == user.id:
+        raise ForbiddenError("You cannot ban yourself")
+    from app.modules.rbac import service as rbac_service
+
+    # Banning the last active owner would leave the organization with nobody who can administer it.
+    await rbac_service.ensure_not_last_owner(db, user, what="ban")
     now = datetime.now(UTC)
     user.is_banned = True
     user.ban_reason = reason

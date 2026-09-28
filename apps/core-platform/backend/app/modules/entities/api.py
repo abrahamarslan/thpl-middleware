@@ -6,7 +6,7 @@ from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
 from app.modules.entities import service
 from app.modules.entities.schema import EntityAliasCreate, EntityAliasOut, EntityTypeOut
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm, org_of
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -32,14 +32,14 @@ async def list_aliases(
 
 
 @router.post("/aliases", response_model=ResponseModel[EntityAliasOut], status_code=201)
-async def create_alias(user: CurrentUser, db: DBSession, body: EntityAliasCreate):
+async def create_alias(user: Perm("core.alias:create"), db: DBSession, body: EntityAliasCreate):
     alias = await service.create_alias(db, body, actor_id=user.id)
     return ResponseModel.ok(data=EntityAliasOut.model_validate(alias), module="entities",
                             msg_key="entity_alias_created", msg="Entity alias created", name=alias.alias)
 
 
 @router.delete("/aliases/{ref}", response_model=ResponseModel[None])
-async def delete_alias(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_alias(admin: Perm("core.alias:delete", target=org_of("app.modules.entities.model:EntityAlias")), db: DBSession, ref: str,
                        reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_alias(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module="entities", msg_key="entity_alias_deleted",

@@ -38,6 +38,7 @@ from app.database.mixins import (
     PolymorphicOwnerMixin,
 )
 from app.database.soft_delete import SoftDeleteFilteredMixin
+from app.modules.teams import model as _teams_model  # noqa: F401 — placement FK targets must exist in metadata
 from app.modules.hr.enums import (
     AggregatorSyncStatus,
     BankAccountOwnerType,
@@ -76,6 +77,22 @@ class EmploymentRecord(IntPKMixin, OrgEntityMixin, SoftDeleteFilteredMixin, Base
         CheckConstraint("date_of_exit IS NULL OR date_of_exit >= date_of_joining", name="chk_employment_dates"),
         Index("uq_employment_records_employee_code", "tenant_id", "employee_code", unique=True,
               postgresql_where=text("deleted_at IS NULL")),
+        # Placement: a department / job title of the SAME organization (composite, tenant-safe).
+        ForeignKeyConstraint(
+            ["tenant_id", "organization_id", "department_id"],
+            ["teams.departments.tenant_id", "teams.departments.organization_id", "teams.departments.id"],
+            name="fk_employment_records_department", ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "organization_id", "job_title_id"],
+            ["teams.job_titles.tenant_id", "teams.job_titles.organization_id", "teams.job_titles.id"],
+            name="fk_employment_records_job_title", ondelete="RESTRICT",
+        ),
+        CheckConstraint("reporting_manager_user_id IS NULL OR reporting_manager_user_id <> user_id",
+                        name="chk_employment_not_self_manager"),
+        Index("ix_employment_records_department", "department_id", postgresql_where=text("department_id IS NOT NULL")),
+        Index("ix_employment_records_manager", "reporting_manager_user_id",
+              postgresql_where=text("reporting_manager_user_id IS NOT NULL AND deleted_at IS NULL")),
         {"comment": "Employment stints (history); is_current marks the active one."},
     )
 
@@ -98,9 +115,19 @@ class EmploymentRecord(IntPKMixin, OrgEntityMixin, SoftDeleteFilteredMixin, Base
         server_default=text(f"'{EmploymentStatus.PENDING_ONBOARDING.value}'"),
     )
     work_location_type: Mapped[str | None] = mapped_column(String(20))
-    department: Mapped[str | None] = mapped_column(String(100))
-    designation: Mapped[str | None] = mapped_column(String(100))
+    department: Mapped[str | None] = mapped_column(
+        String(100), comment="LEGACY free text — superseded by department_id (teams.departments)",
+    )
+    designation: Mapped[str | None] = mapped_column(
+        String(100), comment="LEGACY free text — superseded by job_title_id (teams.job_titles)",
+    )
     cost_center: Mapped[str | None] = mapped_column(String(50))
+    department_id: Mapped[int | None] = mapped_column(
+        BigInteger, comment="teams.departments of THIS organization (composite FK)",
+    )
+    job_title_id: Mapped[int | None] = mapped_column(
+        BigInteger, comment="teams.job_titles of THIS organization (composite FK)",
+    )
 
     hub_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("hubs.id", ondelete="SET NULL"))
     reporting_manager_user_id: Mapped[int | None] = mapped_column(

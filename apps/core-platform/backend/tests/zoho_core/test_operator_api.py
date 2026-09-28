@@ -2,41 +2,34 @@
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
 from app.core.conf import settings
-from app.database.db import get_db
 from app.main import app
-from app.modules.users.deps import get_current_user
-from app.modules.zoho.admin.deps import require_zoho_operator
 from app.modules.zoho.control.metrics import QUOTA_STATE, QUOTA_USED, SWITCH, apply_snapshot
+
+HEADERS = {"X-Organization-Code": "ACME-HQ"}
 
 
 # ── authorisation ───────────────────────────────────────────────────────────
+# The operator allow-list (ZOHO_OPERATOR_EMAILS, "empty + DEBUG = anyone") is retired: an operator is a
+# user whose role carries `zoho.integration:manage` (read-only screens need `zoho.integration:read`).
 
-async def test_operator_allow_list(monkeypatch):
-    from app.common.exception.errors import ForbiddenError
+async def test_a_plain_member_cannot_operate_the_integration(worlds):
+    client, acme, _ = worlds
+    headers = acme.auth(acme.member, **HEADERS)
+    assert (await client.get("/api/zoho/admin/switches", headers=headers)).status_code == 403
+    refused = await client.put("/api/zoho/admin/switches/engine_paused", headers=headers,
+                               json={"value": True, "reason": "member tries"})
+    assert refused.status_code == 403
+    assert refused.json()["data"]["permission"] == "zoho.integration:manage"
 
-    monkeypatch.setattr(settings, "ZOHO_OPERATOR_EMAILS", "ops@tarrinahealth.com")
-    monkeypatch.setattr(settings, "DEBUG", False)
-    assert await require_zoho_operator(SimpleNamespace(id=1, email="OPS@tarrinahealth.com"))
-    with pytest.raises(ForbiddenError):
-        await require_zoho_operator(SimpleNamespace(id=2, email="someone@else.com"))
 
-
-async def test_empty_allow_list_is_closed_in_production(monkeypatch):
-    from app.common.exception.errors import ForbiddenError
-
-    monkeypatch.setattr(settings, "ZOHO_OPERATOR_EMAILS", "")
-    monkeypatch.setattr(settings, "DEBUG", False)
-    with pytest.raises(ForbiddenError):
-        await require_zoho_operator(SimpleNamespace(id=1, email="anyone@x.com"))
-
-    monkeypatch.setattr(settings, "DEBUG", True)
-    assert await require_zoho_operator(SimpleNamespace(id=1, email="anyone@x.com"))
+async def test_an_administrator_can_operate_the_integration(worlds):
+    client, acme, _ = worlds
+    response = await client.get("/api/zoho/admin/switches", headers=acme.auth(acme.admin, **HEADERS))
+    assert response.status_code == 200, response.text
 
 
 def test_admin_routes_are_mounted():
@@ -47,36 +40,17 @@ def test_admin_routes_are_mounted():
         assert path in paths, path
 
 
-def test_admin_routes_reject_non_operators(monkeypatch):
-    monkeypatch.setattr(settings, "ZOHO_OPERATOR_EMAILS", "ops@x.com")
-    monkeypatch.setattr(settings, "DEBUG", False)
-    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=9, email="user@x.com")
-    try:
-        response = TestClient(app).get("/api/zoho/admin/switches")
-        assert response.status_code == 403
-    finally:
-        app.dependency_overrides.clear()
-
-
 # ── end-to-end against the scratch services ─────────────────────────────────
 # httpx.ASGITransport keeps requests on the test's own event loop, so the
 # route can share the `db` fixture's session (TestClient would run the app on
 # another loop and asyncpg would refuse the connection — ERRORS E06).
+# The caller is a real organization administrator (the `worlds` fixture), authorised by RBAC.
 
 @pytest.fixture
-async def operator_client(db, redis_available):
-    import httpx
-
-    operator = SimpleNamespace(id=1, email="ops@x.com")
-
-    async def _db():
-        yield db
-
-    app.dependency_overrides[require_zoho_operator] = lambda: operator
-    app.dependency_overrides[get_db] = _db
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        yield client
-    app.dependency_overrides.clear()
+async def operator_client(worlds):
+    client, acme, _ = worlds
+    client.headers.update(acme.auth(acme.admin, **HEADERS))
+    yield client
 
 
 async def test_switch_change_is_audited_and_visible(operator_client, db):

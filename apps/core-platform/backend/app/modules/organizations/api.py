@@ -30,7 +30,12 @@ from app.modules.organizations.schema import (
     OrganizationStatusChange,
     OrganizationUpdate,
 )
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm
+from app.modules.organizations.deps import (
+    organization_create_target,
+    organization_move_target,
+    organization_target,
+)
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -58,7 +63,7 @@ async def tree(_: CurrentUser, db: DBSession, include_archived: bool = Query(Fal
 
 
 @router.post("/sync", response_model=ResponseModel[dict], status_code=202)
-async def sync_from_zoho(_: TenantAdmin, mode: str | None = Query(None, pattern="^(full|index)$")):
+async def sync_from_zoho(_: Perm("org.organization:manage"), mode: str | None = Query(None, pattern="^(full|index)$")):
     return ResponseModel.ok(data={"task_id": service.trigger_zoho_sync(mode)}, module=_M, msg_key="sync_queued")
 
 
@@ -86,32 +91,32 @@ async def get_ancestors(_: CurrentUser, db: DBSession, ref: str):
 
 
 @router.post("", response_model=ResponseModel[OrganizationOut], status_code=201)
-async def create_organization(admin: TenantAdmin, db: DBSession, body: OrganizationCreate):
+async def create_organization(admin: Perm("org.organization:create", target=organization_create_target), db: DBSession, body: OrganizationCreate):
     org = await service.create_organization(db, body, actor_id=admin.id)
     return ResponseModel.ok(data=OrganizationOut.model_validate(org), module=_M, msg_key="created", code=org.org_code)
 
 
 @router.patch("/{ref}", response_model=ResponseModel[OrganizationOut])
-async def update_organization(admin: TenantAdmin, db: DBSession, ref: str, body: OrganizationUpdate):
+async def update_organization(admin: Perm("org.organization:update", target=organization_target), db: DBSession, ref: str, body: OrganizationUpdate):
     org = await service.update_organization(db, ref, body, actor_id=admin.id)
     return ResponseModel.ok(data=OrganizationOut.model_validate(org), module=_M, msg_key="updated", code=org.org_code)
 
 
 @router.post("/{ref}/move", response_model=ResponseModel[OrganizationOut])
-async def move_organization(admin: TenantAdmin, db: DBSession, ref: str, body: OrganizationMove):
+async def move_organization(admin: Perm("org.organization:manage", target=organization_move_target), db: DBSession, ref: str, body: OrganizationMove):
     org = await service.move_organization(db, ref, body, actor_id=admin.id)
     return ResponseModel.ok(data=OrganizationOut.model_validate(org), module=_M, msg_key="moved", code=org.org_code)
 
 
 @router.post("/{ref}/status", response_model=ResponseModel[OrganizationOut])
-async def change_status(admin: TenantAdmin, db: DBSession, ref: str, body: OrganizationStatusChange):
+async def change_status(admin: Perm("org.organization:manage", target=organization_target), db: DBSession, ref: str, body: OrganizationStatusChange):
     org = await service.change_status(db, ref, body, actor_id=admin.id)
     return ResponseModel.ok(data=OrganizationOut.model_validate(org), module=_M, msg_key="status_changed",
                             code=org.org_code, status=org.status)
 
 
 @router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_organization(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_organization(admin: Perm("org.organization:delete", target=organization_target), db: DBSession, ref: str,
                               reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_organization(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="deleted", code=ref)

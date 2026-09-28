@@ -113,7 +113,8 @@ async def test_ban_records_activity(db):
     from app.modules.activity.model import ActivityLog
 
     user = await _user(db)
-    await moderation.ban_user(db, user, reason="abuse", actor_id=user.id)
+    admin = await _user(db)                            # a distinct actor: nobody may ban themselves
+    await moderation.ban_user(db, user, reason="abuse", actor_id=admin.id)
     rows = (
         await db.scalars(select(ActivityLog).where(ActivityLog.action == "user.moderation.ban"))
     ).all()

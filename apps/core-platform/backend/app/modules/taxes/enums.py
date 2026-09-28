@@ -67,6 +67,18 @@ class TaxSpecification(enum.StrEnum):
     INTRA = "intra"                    # intra-state (typically CGST + SGST)
 
 
+class TaxTransactionType(enum.StrEnum):
+    """Which side of a transaction a tax assignment applies to.
+
+    ``NULL`` on the assignment means "both" — the common case. Zoho keeps a
+    separate purchase-side tax for some owners (items, mostly), so the value is
+    part of an assignment's context rather than something to bolt on later.
+    """
+
+    SALES = "sales"
+    PURCHASE = "purchase"
+
+
 class GstTreatmentCategory(enum.StrEnum):
     """Broad bucket of a GST treatment."""
 
@@ -80,6 +92,7 @@ __all__ = [
     "TaxOwnerType",
     "TaxSpecificType",
     "TaxSpecification",
+    "TaxTransactionType",
     "TaxType",
     "values",
 ]

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
 from app.modules.taxes import service
+from app.modules.taxes.assignment_api import router as assignment_router
 from app.modules.taxes.enums import GstTreatmentCategory, TaxType
 from app.modules.taxes.schema import (
     GstTreatmentTypeOut,
@@ -21,6 +22,8 @@ from app.modules.taxes.schema import (
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
+# Registered FIRST: `/{ref}` below would otherwise read "assignments" as a tax reference.
+router.include_router(assignment_router, prefix="/assignments", tags=["tax assignments"])
 
 
 @router.get("", response_model=ResponseModel[list[TaxComponentSlimOut]])

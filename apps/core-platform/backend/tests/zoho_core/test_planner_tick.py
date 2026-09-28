@@ -21,7 +21,9 @@ async def test_tick_enqueues_due_lanes_persists_quota_and_publishes_health(db, r
     # organizations, currencies and taxes are FULL-strategy modules → scheduled lane only
     for module in ("organizations", "currencies", "taxes"):
         assert (module, planner.LANE_SCHEDULED, None) in enqueued
-    assert all(lane != planner.LANE_WEEKLY_FULL for _, lane, _ in enqueued)
+    # Only an INCREMENTAL module needs the weekly full-reconcile lane (its
+    # scheduled scan is itself full for the rest). `categories` is the one.
+    assert {m for m, lane, _ in enqueued if lane == planner.LANE_WEEKLY_FULL} == {"categories"}
 
     quota = (await db.scalars(select(ZohoQuotaDay))).all()
     assert len(quota) == 1 and quota[0].daily_hard_limit == settings.ZOHO_DAILY_HARD_LIMIT

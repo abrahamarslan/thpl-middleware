@@ -42,7 +42,7 @@ from app.modules.geo.schema import (
     PlaceUpdate,
     PlaceVerify,
 )
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm, org_of
 from app.modules.users.deps import CurrentUser
 
 places_router = APIRouter()
@@ -91,7 +91,7 @@ async def nearby(
 
 @places_router.post("", response_model=ResponseModel[PlaceOut], status_code=201)
 async def create_place(
-    user: CurrentUser, db: DBSession, body: PlaceCreate,
+    user: Perm("geo.place:create"), db: DBSession, body: PlaceCreate,
     reuse_duplicates: bool = Query(True, description="Return the existing place when one is within 25 m"),
 ):
     place = await service.create_place(db, body, actor_id=user.id, reuse_duplicates=reuse_duplicates)
@@ -105,14 +105,14 @@ async def get_place(_: CurrentUser, db: DBSession, ref: str):
 
 
 @places_router.patch("/{ref}", response_model=ResponseModel[PlaceOut])
-async def update_place(user: CurrentUser, db: DBSession, ref: str, body: PlaceUpdate):
+async def update_place(user: Perm("geo.place:update", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str, body: PlaceUpdate):
     place = await service.update_place(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=PlaceOut.model_validate(place), module=_M, msg_key="place_updated",
                             name=place.location_name or str(place.uuid))
 
 
 @places_router.post("/{ref}/geocode", response_model=ResponseModel[PlaceOut])
-async def geocode_place(_: CurrentUser, db: DBSession, ref: str, body: PlaceGeocodeRequest):
+async def geocode_place(_: Perm("geo.place:update", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str, body: PlaceGeocodeRequest):
     """Fill this place's coordinates from its postal fields.
 
     Sets `verification_status` to `geocoded_only` and leaves `is_verified`
@@ -135,7 +135,7 @@ async def geocode_place(_: CurrentUser, db: DBSession, ref: str, body: PlaceGeoc
 
 
 @places_router.post("/{ref}/reverse-geocode", response_model=ResponseModel[PlaceOut])
-async def reverse_geocode_place(_: CurrentUser, db: DBSession, ref: str, body: PlaceGeocodeRequest):
+async def reverse_geocode_place(_: Perm("geo.place:update", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str, body: PlaceGeocodeRequest):
     """Fill this place's postal fields from its coordinates."""
     place = await service.get_place(db, ref)
     try:
@@ -152,14 +152,14 @@ async def reverse_geocode_place(_: CurrentUser, db: DBSession, ref: str, body: P
 
 
 @places_router.post("/{ref}/verify", response_model=ResponseModel[PlaceOut])
-async def verify_place(user: CurrentUser, db: DBSession, ref: str, body: PlaceVerify):
+async def verify_place(user: Perm("geo.place:verify", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str, body: PlaceVerify):
     place = await service.verify_place(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=PlaceOut.model_validate(place), module=_M, msg_key="place_verified",
                             name=place.location_name or str(place.uuid))
 
 
 @places_router.post("/{ref}/archive", response_model=ResponseModel[PlaceOut])
-async def archive_place(user: CurrentUser, db: DBSession, ref: str,
+async def archive_place(user: Perm("geo.place:manage", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str,
                         reason: str = Query(..., min_length=3, max_length=500)):
     place = await service.archive_place(db, ref, reason=reason, actor_id=user.id)
     return ResponseModel.ok(data=PlaceOut.model_validate(place), module=_M, msg_key="place_archived",
@@ -167,7 +167,7 @@ async def archive_place(user: CurrentUser, db: DBSession, ref: str,
 
 
 @places_router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_place(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_place(admin: Perm("geo.place:delete", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str,
                        reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_place(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="place_deleted", name=ref)
@@ -189,7 +189,7 @@ async def place_relationships(_: CurrentUser, db: DBSession, ref: str):
 
 @places_router.post("/{ref}/relationships", response_model=ResponseModel[PlaceRelationshipOut],
                     status_code=201)
-async def relate_places(user: CurrentUser, db: DBSession, ref: str, body: PlaceRelationshipCreate):
+async def relate_places(user: Perm("geo.place:update", target=org_of("app.modules.geo.model:Place")), db: DBSession, ref: str, body: PlaceRelationshipCreate):
     relation = await service.relate_places(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=PlaceRelationshipOut.model_validate(relation), module=_M,
                             msg_key="relationship_created")
@@ -228,7 +228,7 @@ async def history(
 
 
 @addresses_router.post("", response_model=ResponseModel[AddressOut], status_code=201)
-async def attach_address(user: CurrentUser, db: DBSession, body: AddressCreate):
+async def attach_address(user: Perm("geo.address:create"), db: DBSession, body: AddressCreate):
     """Attach an address to any entity — pass an existing ``place`` uuid or a
     ``new_place`` to create and link in one call. ``freeze: true`` copies it
     into an immutable snapshot, which is what a document needs."""
@@ -243,21 +243,21 @@ async def get_address(_: CurrentUser, db: DBSession, ref: str):
 
 
 @addresses_router.patch("/{ref}", response_model=ResponseModel[AddressOut])
-async def update_address(user: CurrentUser, db: DBSession, ref: str, body: AddressUpdate):
+async def update_address(user: Perm("geo.address:update", target=org_of("app.modules.geo.model:PlaceLink")), db: DBSession, ref: str, body: AddressUpdate):
     link = await service.update_address(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=AddressOut.model_validate(link), module=_M, msg_key="address_updated",
                             owner=f"{link.owner_type} {link.owner_id}")
 
 
 @addresses_router.post("/{ref}/verify", response_model=ResponseModel[AddressOut])
-async def verify_address(user: CurrentUser, db: DBSession, ref: str, body: PlaceVerify):
+async def verify_address(user: Perm("geo.address:verify", target=org_of("app.modules.geo.model:PlaceLink")), db: DBSession, ref: str, body: PlaceVerify):
     link = await service.verify_address(db, ref, body, actor_id=user.id)
     return ResponseModel.ok(data=AddressOut.model_validate(link), module=_M, msg_key="address_verified",
                             owner=f"{link.owner_type} {link.owner_id}")
 
 
 @addresses_router.delete("/{ref}", response_model=ResponseModel[None])
-async def detach_address(user: CurrentUser, db: DBSession, ref: str,
+async def detach_address(user: Perm("geo.address:delete", target=org_of("app.modules.geo.model:PlaceLink")), db: DBSession, ref: str,
                          reason: str = Query(..., min_length=3, max_length=500)):
     await service.detach_address(db, ref, reason=reason, actor_id=user.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="address_detached", owner=ref)
@@ -287,7 +287,7 @@ async def containing(
 
 
 @geofences_router.post("", response_model=ResponseModel[GeofenceOut], status_code=201)
-async def create_geofence(admin: TenantAdmin, db: DBSession, body: GeofenceCreate):
+async def create_geofence(admin: Perm("geo.geofence:create"), db: DBSession, body: GeofenceCreate):
     fence = await service.create_geofence(db, body, actor_id=admin.id)
     return ResponseModel.ok(data=GeofenceOut.model_validate(fence), module=_M, msg_key="geofence_created",
                             name=fence.name)
@@ -299,14 +299,14 @@ async def get_geofence(_: CurrentUser, db: DBSession, ref: str):
 
 
 @geofences_router.patch("/{ref}", response_model=ResponseModel[GeofenceOut])
-async def update_geofence(admin: TenantAdmin, db: DBSession, ref: str, body: GeofenceUpdate):
+async def update_geofence(admin: Perm("geo.geofence:update", target=org_of("app.modules.geo.model:Geofence")), db: DBSession, ref: str, body: GeofenceUpdate):
     fence = await service.update_geofence(db, ref, body, actor_id=admin.id)
     return ResponseModel.ok(data=GeofenceOut.model_validate(fence), module=_M, msg_key="geofence_updated",
                             name=fence.name)
 
 
 @geofences_router.delete("/{ref}", response_model=ResponseModel[None])
-async def delete_geofence(admin: TenantAdmin, db: DBSession, ref: str,
+async def delete_geofence(admin: Perm("geo.geofence:delete", target=org_of("app.modules.geo.model:Geofence")), db: DBSession, ref: str,
                           reason: str = Query(..., min_length=3, max_length=500)):
     await service.delete_geofence(db, ref, reason=reason, actor_id=admin.id)
     return ResponseModel.ok(data=None, module=_M, msg_key="geofence_deleted", name=ref)
@@ -342,7 +342,7 @@ async def resolve_boundary(
 
 
 @boundaries_router.post("", response_model=ResponseModel[AdminBoundaryOut], status_code=201)
-async def create_boundary(_: TenantAdmin, db: DBSession, body: AdminBoundaryCreate):
+async def create_boundary(_: Perm("geo.boundary:create"), db: DBSession, body: AdminBoundaryCreate):
     boundary = await service.create_boundary(db, body)
     return ResponseModel.ok(data=AdminBoundaryOut.model_validate(boundary), module=_M,
                             msg_key="boundary_created", name=boundary.name)

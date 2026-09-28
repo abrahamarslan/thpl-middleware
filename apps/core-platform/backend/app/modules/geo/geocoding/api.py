@@ -38,7 +38,7 @@ from app.modules.geo.geocoding.types import (
     ProviderNotConfigured,
     ReverseQuery,
 )
-from app.modules.tenants.deps import TenantAdmin
+from app.modules.rbac.deps import Perm
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -64,7 +64,7 @@ def _response(outcome: service.GeocodeOutcome) -> GeocodeResponse:
 
 
 @router.post("/forward", response_model=ResponseModel[GeocodeResponse])
-async def forward(_: CurrentUser, db: DBSession, body: ForwardRequest):
+async def forward(_: Perm("geo.geocoding:use"), db: DBSession, body: ForwardRequest):
     """Find the coordinates of an address."""
     bias = (body.latitude, body.longitude) if body.latitude is not None else None
     try:
@@ -78,7 +78,7 @@ async def forward(_: CurrentUser, db: DBSession, body: ForwardRequest):
 
 
 @router.post("/reverse", response_model=ResponseModel[GeocodeResponse])
-async def reverse(_: CurrentUser, db: DBSession, body: ReverseRequest):
+async def reverse(_: Perm("geo.geocoding:use"), db: DBSession, body: ReverseRequest):
     """Find the address at a point."""
     try:
         outcome = await service.reverse_geocode(db, ReverseQuery(
@@ -91,7 +91,7 @@ async def reverse(_: CurrentUser, db: DBSession, body: ReverseRequest):
 
 
 @router.post("/route", response_model=ResponseModel[RouteResponse | None])
-async def route(_: CurrentUser, db: DBSession, body: RouteRequest):
+async def route(_: Perm("geo.geocoding:use"), db: DBSession, body: RouteRequest):
     """Distance and duration between two points.
 
     With no routing provider configured this answers with the straight-line
@@ -127,14 +127,14 @@ async def providers(_: CurrentUser):
 
 
 @router.post("/providers/{name}/reset", response_model=ResponseModel[None])
-async def reset_provider(_: TenantAdmin, name: str):
+async def reset_provider(_: Perm("geo.geocoding:manage"), name: str):
     """Close a tripped circuit without waiting out the recovery window."""
     await transport.reset_breaker(name)
     return ResponseModel.ok(data=None, module=_M, msg_key="provider_reset", name=name)
 
 
 @router.post("/purge", response_model=ResponseModel[dict])
-async def purge(_: TenantAdmin, db: DBSession,
+async def purge(_: Perm("geo.geocoding:manage"), db: DBSession,
                 older_than_days: int = Query(0, ge=0, le=365)):
     """Delete provider payloads past their licence window.
 

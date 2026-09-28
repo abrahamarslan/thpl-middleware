@@ -65,6 +65,43 @@ LOCATIONS = [{
     "associated_series_ids": ["982000000870911", "982000000870915"], "auto_number_generation_id": "982000000870911",
     "is_all_users_selected": False, "associated_users": [{"user_id": "460000000036868", "user_name": "John Doe"}],
 }]
+# Categories, shaped like the LIVE /categories response (captured 2026-09-25):
+# the list is hierarchical, top-level rows name parent "-1", and — unless the
+# caller passes include_root_category=false — Zoho prepends a synthetic ROOT row
+# (id "-1", blank timestamps) that nobody created.
+CAT_ROOT = {"category_id": "-1", "name": "ROOT", "url": "rootcategory", "parent_category_id": "-1",
+            "visibility": True, "show_in_menu": True, "sibling_order": 1, "depth": 0,
+            "created_time": "", "last_modified_time": "", "description": "", "ondc_category_type": "",
+            "custom_fields": [], "documents": [], "has_active_items": False}
+CAT_SKIN = {"category_id": "954919000013143071", "name": "Skin Care", "url": "skin_care",
+            "parent_category_id": "-1", "visibility": True, "show_in_menu": True, "sibling_order": 2,
+            "depth": 0, "created_time": "2024-10-22T16:53:19+0530",
+            "last_modified_time": "2026-09-19T10:07:53+0530", "description": "", "ondc_category_type": "",
+            "custom_fields": [], "documents": [], "has_active_items": True}
+CAT_SOAP = {"category_id": "954919000061486002", "name": "Bathing Soap & Bodywash", "url": "bathing_soap_bodywash",
+            "parent_category_id": "954919000013143071", "visibility": True, "show_in_menu": True,
+            "sibling_order": 1, "depth": 1, "created_time": "2026-08-04T21:47:33+0530",
+            "last_modified_time": "2026-09-07T16:54:23+0530", "description": "", "ondc_category_type": "",
+            "custom_fields": [], "documents": [], "has_active_items": True}
+CAT_HAIR = {"category_id": "954919000013118048", "name": "Hair Care", "url": "hair_care",
+            "parent_category_id": "-1", "visibility": True, "show_in_menu": True, "sibling_order": 1,
+            "depth": 0, "created_time": "2024-10-22T16:23:25+0530",
+            "last_modified_time": "2026-09-19T10:07:28+0530", "description": "", "ondc_category_type": "",
+            "custom_fields": [], "documents": [], "has_active_items": True}
+#: What only the DETAIL document adds (SEO block, GST defaults) — live shape. The tax ids are the
+#: ones this wire's own /settings/taxes serves, so the `taxes` module (run first) has synced them.
+CAT_DETAIL_EXTRA = {
+    "seo_title": "", "seo_keyword": "", "seo_description": "", "parent_category_name": "",
+    "category_tax_preferences": [
+        {"tax_specification": "inter", "tax_specific_type": "igst", "tax_id": "982000000566009",
+         "tax_name": "IGST18", "tax_percentage": 18.0, "new_tax_type": "tax"},
+        {"tax_specification": "intra", "tax_specific_type": "tax", "tax_id": "982000000566010",
+         "tax_name": "CGST9", "tax_percentage": 9.0, "new_tax_type": "tax"},
+    ],
+    "ancestors": [], "children": [],
+}
+CATEGORIES = [CAT_HAIR, CAT_SKIN, CAT_SOAP]        # hierarchical order: parent before child
+
 USERS = [
     {"user_id": "982000000554041", "role_id": "982000000006005", "name": "Sujin Kumar",
      "email": "johndavid@zilliuminc.com", "user_role": "admin", "status": "active", "is_current_user": True,
@@ -82,7 +119,8 @@ class ZohoWire:
         self.requests: list[httpx.Request] = []
         self.data = {"currencies": copy.deepcopy(CURRENCIES), "taxes": copy.deepcopy(TAXES),
                      "tax_exemptions": copy.deepcopy(TAX_EXEMPTIONS),
-                     "locations": copy.deepcopy(LOCATIONS), "users": copy.deepcopy(USERS)}
+                     "locations": copy.deepcopy(LOCATIONS), "users": copy.deepcopy(USERS),
+                     "categories": copy.deepcopy(CATEGORIES)}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -111,7 +149,34 @@ class ZohoWire:
         if path == "/users":
             assert request.url.params["filter_by"] == "Status.All"
             return self._ok({"users": self.data["users"], **paged})
+        if path == "/categories":
+            return self._categories_list(request, paged)
+        if match := re.fullmatch(r"/categories/(-?\d+)", path):      # index_then_detail
+            rows = [CAT_ROOT, *self.data["categories"]]
+            detail = next((c for c in rows if c["category_id"] == match.group(1)), None)
+            if detail is None:
+                return httpx.Response(404, json={"code": 1001, "message": "Category not found"})
+            return self._ok({"category": {**detail, **CAT_DETAIL_EXTRA}})
         return httpx.Response(404, json={"code": 5, "message": f"Invalid URL {path}"})
+
+    def _categories_list(self, request: httpx.Request, paged: dict) -> httpx.Response:
+        """Live behaviour: ROOT unless include_root_category=false; a modified-since
+        filter that only accepts the ``+0000`` spelling (``…Z`` is a 400)."""
+        params = request.url.params
+        rows = list(self.data["categories"])
+        if params.get("include_root_category") != "false":
+            rows = [CAT_ROOT, *rows]
+        since = params.get("last_modified_time")
+        if since is not None:
+            if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}", since):
+                return httpx.Response(400, json={"code": 2, "message": "Invalid value passed for last_modified_time"})
+            from app.modules.sync.translation import CODECS
+
+            floor = CODECS["zoho_datetime"].decode(since)
+            # Live: ROOT (blank time) is returned by every filtered call unless excluded.
+            rows = [r for r in rows if not r["last_modified_time"]
+                    or CODECS["zoho_datetime"].decode(r["last_modified_time"]) >= floor]
+        return self._ok({"categories": rows, **paged})
 
     @staticmethod
     def _ok(body: dict) -> httpx.Response:
@@ -189,10 +254,12 @@ async def test_the_planner_schedules_every_master_and_the_runs_mirror_them(db, w
     await planner.tick(db, enqueue=lambda module, lane, mode: enqueued.append((module, lane)))
     # `tax_groups` is registered DISABLED (Zoho documents no list endpoint), so
     # the planner schedules every master except that one.
-    assert sorted(enqueued) == sorted(
-        (m, "scheduled") for m in
-        ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users")
+    assert sorted(m for m, lane in enqueued if lane == "scheduled") == sorted(
+        ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users", "categories")
     )
+    # `categories` is the one INCREMENTAL master, so it alone also gets the weekly
+    # full-reconcile lane — the only scan that can see a category Zoho deleted.
+    assert [m for m, lane in enqueued if lane == "weekly_full"] == ["categories"]
 
     results = await run_all(db)
     assert {m: r["status"] for m, r in results.items()} == dict.fromkeys(results, RunStatus.SUCCEEDED)
@@ -200,21 +267,24 @@ async def test_the_planner_schedules_every_master_and_the_runs_mirror_them(db, w
     assert results["currencies"]["created"] == 2 and results["taxes"]["created"] == 2
     assert results["tax_exemptions"]["created"] == 2
     assert results["locations"]["created"] == 1 and results["users"]["created"] == 2
+    assert results["categories"]["created"] == 3          # the synthetic ROOT is NOT one of them
 
-    # organizations: 1 list + 1 detail. taxes: 1 list + 2 details (index_then_detail).
-    # currencies / tax_exemptions / locations / users: 1 list each.
-    assert len(wire.requests) == 9 and wire.calls_to("/organizations/10229182") == 1
+    # organizations: 1 list + 1 detail. taxes: 1 list + 2 details, categories: 1 list + 3 details
+    # (index_then_detail). currencies / tax_exemptions / locations / users: 1 list each.
+    assert len(wire.requests) == 13 and wire.calls_to("/organizations/10229182") == 1
     assert wire.calls_to("/settings/taxes/982000000566009") == 1
+    assert wire.calls_to("/categories/-1") == 0           # ROOT was never even listed
 
     # the governor counted every call; the runs and events are recorded
-    assert (await zoho_governor.snapshot())["used"] == 9
+    assert (await zoho_governor.snapshot())["used"] == 13
     # `run_all` executes every REGISTERED module, so `tax_groups` gets a run too
     # even though the planner never schedules it (direction=disabled).
     assert set(await db.scalars(select(ZohoSyncRun.module))) == {
         "organizations", "currencies", "taxes", "tax_groups", "tax_exemptions", "locations", "users",
+        "categories",
     }
     assert await db.scalar(select(func.count()).select_from(ZohoSyncEvent)
-                           .where(ZohoSyncEvent.event_type == "inserted")) == 10
+                           .where(ZohoSyncEvent.event_type == "inserted")) == 13
 
     from app.modules.locations.model import ZohoLocation
     from app.modules.zoho_users.model import ZohoUser
@@ -243,7 +313,7 @@ async def test_a_second_pass_writes_nothing_and_a_zoho_change_lands(db, wire):
     # then the detail document), so two taxes make four applies — the edited
     # CGST detail is the one update, the other three are unchanged.
     assert second["taxes"]["updated"] == 1 and second["taxes"]["unchanged"] == 3
-    for module in ("currencies", "tax_exemptions", "locations", "users", "organizations"):
+    for module in ("currencies", "tax_exemptions", "locations", "users", "organizations", "categories"):
         assert second[module]["created"] == second[module]["updated"] == 0, module
 
     # Scoped to the module: `organizations` is index-then-detail, so its own
@@ -261,7 +331,7 @@ async def test_the_cli_runs_the_same_pipeline(db, wire, capsys):
     assert await cli.cmd_runs(10, None) == 0
     out = capsys.readouterr().out
     print(out)                                               # visible with -s
-    for module in ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users"):
+    for module in ("organizations", "currencies", "taxes", "tax_exemptions", "locations", "users", "categories"):
         assert module in out
     assert "failed" not in out
 
@@ -292,3 +362,84 @@ async def test_the_read_endpoints_serve_locations_and_users(db, wire):
             assert (await api.get("/api/zoho/locations/404404")).status_code == 404
     finally:
         app.dependency_overrides.clear()
+
+
+async def test_categories_end_to_end_through_the_real_transport(db, wire, monkeypatch):
+    """The live-verified behaviours of the categories adapter, on the real pipeline.
+
+    Each assertion here is something the first cut of the adapter got wrong on
+    the live API and the unit-level FakeZohoClient could not show: the synthetic
+    ROOT row, the modified-since spelling, the hierarchy landing through the
+    crosswalk, and a Zoho-side delete reaching the tree.
+    """
+    from app.core.conf import settings
+    from app.modules.categories.model import Category
+    from app.modules.sync.models import SyncRecord
+    from app.tasks.zoho_sync import execute_leased_run
+
+    await run_all(db)
+
+    # 1. ROOT is asked NOT to be listed, and did not become a category.
+    first_list = next(r for r in wire.requests if r.url.path.endswith("/categories"))
+    assert first_list.url.params["include_root_category"] == "false"
+    rows = {c.zoho_id: c for c in (await db.scalars(select(Category))).all()}
+    assert set(rows) == {CAT_HAIR["category_id"], CAT_SKIN["category_id"], CAT_SOAP["category_id"]}
+
+    # 2. The hierarchy landed through the crosswalk, with coherent bounds.
+    hair, skin, soap = (rows[c["category_id"]] for c in (CAT_HAIR, CAT_SKIN, CAT_SOAP))
+    assert hair.parent_id is None and hair.is_root and skin.is_root
+    assert soap.parent_id == skin.id and not soap.is_root and soap.depth == 1
+    assert skin.lft < soap.lft < soap.rgt < skin.rgt
+    assert soap.slug == "bathing_soap_bodywash" and soap.position == 1 and soap.meta_keywords is None
+
+    # 3. Identity, gate state and the raw DETAIL document live on the crosswalk,
+    #    tax preferences included (they have no column yet).
+    record = await db.scalar(select(SyncRecord).where(SyncRecord.module == "categories",
+                                                       SyncRecord.external_id == CAT_SOAP["category_id"]))
+    assert record.entity_id == soap.id and record.raw_source == "detail_fetch"
+    assert [p["tax_specification"] for p in record.raw["category_tax_preferences"]] == ["inter", "intra"]
+
+    # 3b. …and they are ALSO real assignments now: every category carries one tax per context, resolved
+    #     through the crosswalk to the components the `taxes` module synced, marked as Zoho's.
+    from app.modules.taxes.assignment import TaxAssignment
+    from app.modules.taxes.component import TaxComponent
+
+    names = {c.id: c.tax_name for c in (await db.scalars(select(TaxComponent))).all()}
+    assignments = (await db.scalars(select(TaxAssignment).where(TaxAssignment.owner_type_code == "category"))).all()
+    assert len(assignments) == 6 and all(a.source_system == "zoho" and not a.is_pending for a in assignments)
+    assert {(a.owner_id, a.tax_specification): names[a.tax_component_id] for a in assignments} == {
+        (c.id, spec): tax for c in (hair, skin, soap) for spec, tax in (("inter", "IGST18"), ("intra", "CGST9"))}
+
+    # 4. A Zoho-side rename arrives through the modified-since filter — and only
+    #    that row is rewritten. (Live: the filter takes +0000 and 400s on a "Z".)
+    wire.data["categories"][2].update(name="Bath Soaps", last_modified_time="2026-09-25T10:00:00+0530")
+    await run_all(db)
+    filtered = [r for r in wire.requests if r.url.path.endswith("/categories") and "last_modified_time" in r.url.params]
+    assert filtered and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}",
+                                     filtered[-1].url.params["last_modified_time"])
+    await db.refresh(soap)
+    assert soap.name == "Bath Soaps"
+    updated_ids = set(await db.scalars(select(ZohoSyncEvent.local_id).where(
+        ZohoSyncEvent.module == "categories", ZohoSyncEvent.event_type == "updated",
+        ZohoSyncEvent.zoho_id == CAT_SOAP["category_id"])))
+    assert updated_ids == {soap.id}
+
+    # 5. A category deleted in Zoho is only ever visible to a FULL scan; with the
+    #    operator switch on, that scan tombstones it on BOTH sides.
+    monkeypatch.setattr(settings, "ZOHO_SYNC_ALLOW_SOFT_DELETE_MISSING", True)
+    del wire.data["categories"][2]
+    client = transport_module.ZohoClient(default_module="categories")
+    try:
+        result = await execute_leased_run(db, client, module_name="categories", lane="weekly_full",
+                                          mode="full", trigger="planner")
+    finally:
+        await client.aclose()
+    assert result["status"] == RunStatus.SUCCEEDED and result["soft_deleted"] == 1
+    db.expire_all()
+    gone = await db.scalar(select(Category).where(Category.zoho_id == CAT_SOAP["category_id"])
+                           .execution_options(include_deleted=True))
+    assert gone.deleted_at is not None
+    tombstone = await db.scalar(select(SyncRecord).where(SyncRecord.module == "categories",
+                                                          SyncRecord.external_id == CAT_SOAP["category_id"]))
+    assert tombstone.remote_deleted_at is not None
+    assert await db.scalar(select(func.count()).select_from(Category)) == 2      # hair, skin live

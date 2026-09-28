@@ -16,8 +16,8 @@ from fastapi import APIRouter, Query, Request
 from app.common.client_info import client_ip_from_request
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
+from app.modules.rbac.deps import Perm
 from app.modules.zoho.admin import crud, service
-from app.modules.zoho.admin.deps import ZohoOperator
 from app.modules.zoho.admin.schema import (
     ConfigUpdate,
     HealthOut,
@@ -37,24 +37,24 @@ _M = "zoho.admin"
 
 
 @router.get("/health", response_model=ResponseModel[HealthOut])
-async def health(_: ZohoOperator, db: DBSession):
+async def health(_: Perm("zoho.integration:read"), db: DBSession):
     return ResponseModel.ok(data=await service.health(db))
 
 
 @router.get("/governor", response_model=ResponseModel[dict])
-async def governor(_: ZohoOperator):
+async def governor(_: Perm("zoho.integration:read")):
     return ResponseModel.ok(data=await zoho_governor.snapshot())
 
 
 @router.get("/switches", response_model=ResponseModel[dict])
-async def switches(_: ZohoOperator):
+async def switches(_: Perm("zoho.integration:read")):
     from app.modules.zoho.control.switches import zoho_switches
 
     return ResponseModel.ok(data=(await zoho_switches.snapshot()).as_dict())
 
 
 @router.put("/switches/{name}", response_model=ResponseModel[dict])
-async def set_switch(operator: ZohoOperator, db: DBSession, request: Request, name: str, body: SwitchUpdate):
+async def set_switch(operator: Perm("zoho.integration:manage"), db: DBSession, request: Request, name: str, body: SwitchUpdate):
     data = await service.set_switch(
         db, name, body.value, operator=operator, reason=body.reason, ip=client_ip_from_request(request)
     )
@@ -62,7 +62,7 @@ async def set_switch(operator: ZohoOperator, db: DBSession, request: Request, na
 
 
 @router.post("/modules/{module}/pause", response_model=ResponseModel[dict])
-async def pause_module(operator: ZohoOperator, db: DBSession, request: Request, module: str,
+async def pause_module(operator: Perm("zoho.integration:manage"), db: DBSession, request: Request, module: str,
                        body: ModulePauseRequest):
     data = await service.pause_module(db, module, pause=True, operator=operator, reason=body.reason,
                                       ip=client_ip_from_request(request))
@@ -70,7 +70,7 @@ async def pause_module(operator: ZohoOperator, db: DBSession, request: Request, 
 
 
 @router.post("/modules/{module}/resume", response_model=ResponseModel[dict])
-async def resume_module(operator: ZohoOperator, db: DBSession, request: Request, module: str,
+async def resume_module(operator: Perm("zoho.integration:manage"), db: DBSession, request: Request, module: str,
                         body: ModulePauseRequest):
     data = await service.pause_module(db, module, pause=False, operator=operator, reason=body.reason,
                                       ip=client_ip_from_request(request))
@@ -78,14 +78,14 @@ async def resume_module(operator: ZohoOperator, db: DBSession, request: Request,
 
 
 @router.post("/modules/{module}/runs", response_model=ResponseModel[dict], status_code=202)
-async def request_run(operator: ZohoOperator, db: DBSession, module: str, body: RunRequest):
+async def request_run(operator: Perm("zoho.integration:manage"), db: DBSession, module: str, body: RunRequest):
     data = await service.request_run(db, module, mode=body.mode, operator=operator, reason=body.reason)
     return ResponseModel.ok(data=data, module=_M, msg_key="run_requested", name=module)
 
 
 @router.get("/runs", response_model=ResponseModel[list[RunSlimOut]])
 async def list_runs(
-    _: ZohoOperator,
+    _: Perm("zoho.integration:read"),
     db: DBSession,
     module: str | None = Query(None),
     lane: str | None = Query(None),
@@ -97,13 +97,13 @@ async def list_runs(
 
 
 @router.get("/runs/{run_id}", response_model=ResponseModel[RunOut])
-async def get_run(_: ZohoOperator, db: DBSession, run_id: uuid.UUID):
+async def get_run(_: Perm("zoho.integration:read"), db: DBSession, run_id: uuid.UUID):
     return ResponseModel.ok(data=RunOut.model_validate(await service.get_run(db, run_id)))
 
 
 @router.get("/records/{module}/{ref}/events", response_model=ResponseModel[list[SyncEventOut]])
 async def record_events(
-    _: ZohoOperator,
+    _: Perm("zoho.integration:read"),
     db: DBSession,
     module: str,
     ref: str,
@@ -117,12 +117,12 @@ async def record_events(
 
 
 @router.get("/retention", response_model=ResponseModel[list[RetentionPolicyOut]])
-async def list_retention(_: ZohoOperator, db: DBSession):
+async def list_retention(_: Perm("zoho.integration:read"), db: DBSession):
     return ResponseModel.ok(data=[RetentionPolicyOut.model_validate(p) for p in await crud.list_policies(db)])
 
 
 @router.put("/retention/{policy_id}", response_model=ResponseModel[RetentionPolicyOut])
-async def update_retention(operator: ZohoOperator, db: DBSession, policy_id: int, body: RetentionPolicyUpdate):
+async def update_retention(operator: Perm("zoho.integration:manage"), db: DBSession, policy_id: int, body: RetentionPolicyUpdate):
     policy = await service.update_policy(
         db, policy_id, keep_days=body.keep_days, enabled=body.enabled, operator=operator, reason=body.reason
     )
@@ -130,13 +130,13 @@ async def update_retention(operator: ZohoOperator, db: DBSession, policy_id: int
 
 
 @router.get("/config/{module}", response_model=ResponseModel[dict])
-async def get_module_config(_: ZohoOperator, db: DBSession, module: str):
+async def get_module_config(_: Perm("zoho.integration:read"), db: DBSession, module: str):
     """Every runtime knob: effective value and the layer that supplied it."""
     return ResponseModel.ok(data=await service.module_config(db, module))
 
 
 @router.put("/config/{module}/{knob}", response_model=ResponseModel[dict])
-async def set_module_config(operator: ZohoOperator, db: DBSession, request: Request, module: str, knob: str,
+async def set_module_config(operator: Perm("zoho.integration:manage"), db: DBSession, request: Request, module: str, knob: str,
                             body: ConfigUpdate):
     data = await service.set_module_config(
         db, module, knob, body.value, operator=operator, reason=body.reason, ip=client_ip_from_request(request)
@@ -145,7 +145,7 @@ async def set_module_config(operator: ZohoOperator, db: DBSession, request: Requ
 
 
 @router.delete("/config/{module}/{knob}", response_model=ResponseModel[dict])
-async def clear_module_config(operator: ZohoOperator, db: DBSession, request: Request, module: str, knob: str,
+async def clear_module_config(operator: Perm("zoho.integration:manage"), db: DBSession, request: Request, module: str, knob: str,
                               reason: str = Query(..., min_length=3, max_length=500)):
     """Remove an override — the module's declared value applies again."""
     data = await service.clear_module_config(
@@ -155,6 +155,6 @@ async def clear_module_config(operator: ZohoOperator, db: DBSession, request: Re
 
 
 @router.post("/breakers/{group}/reset", response_model=ResponseModel[dict])
-async def reset_breaker(operator: ZohoOperator, db: DBSession, group: str):
+async def reset_breaker(operator: Perm("zoho.integration:manage"), db: DBSession, group: str):
     data = await service.reset_breaker(group, operator=operator, db=db)
     return ResponseModel.ok(data=data, module=_M, msg_key="breaker_reset", name=group)

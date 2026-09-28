@@ -1,33 +1,23 @@
-"""Who may manage tenants and tenant-level structure.
+"""Who may manage tenants.
 
-Interim authorisation until full RBAC (roles exist now; permission checks
-arrive with the permissions work):
+Tenant-level authorization is RBAC now (docs/rbac-module.md): every route declares the permission it
+needs with ``rbac.deps.Perm(...)``. What remains here:
 
 | Dependency | Allowed |
 |---|---|
-| ``PlatformAdmin`` | email in ``PLATFORM_ADMIN_EMAILS``; when that list is empty, any authenticated user if ``DEBUG`` (dev) |
-| ``TenantAdmin`` | a platform admin, or a user whose role code is ``admin`` / ``owner`` **in their own tenant** |
+| ``PlatformAdmin`` | email in ``PLATFORM_ADMIN_EMAILS``; when that list is empty, any authenticated user **only if** ``DEBUG`` (dev). Platform staff sit OUTSIDE every tenant's RBAC — they manage tenants themselves |
+| ``TenantAdmin`` | **deprecated alias** for ``Perm("org.organization:manage")`` — kept so old imports keep working; new code declares the specific permission instead |
 """
 
 from typing import Annotated
 
 from fastapi import Depends
-from sqlalchemy import select
 
 from app.common.exception.errors import ForbiddenError
-from app.core.conf import settings
-from app.database.db import DBSession
+from app.modules.rbac.deps import Perm
+from app.modules.rbac.platform import is_platform_admin
 from app.modules.users.deps import CurrentUser
 from app.modules.users.model import User
-
-TENANT_ADMIN_ROLES = frozenset({"admin", "owner"})
-
-
-def is_platform_admin(user: User) -> bool:
-    allowed = {e.strip().lower() for e in settings.PLATFORM_ADMIN_EMAILS.split(",") if e.strip()}
-    if allowed:
-        return (getattr(user, "email", "") or "").lower() in allowed
-    return bool(settings.DEBUG)
 
 
 async def require_platform_admin(user: CurrentUser) -> User:
@@ -36,18 +26,9 @@ async def require_platform_admin(user: CurrentUser) -> User:
     return user
 
 
-async def require_tenant_admin(user: CurrentUser, db: DBSession) -> User:
-    if is_platform_admin(user):
-        return user
-    role_id = getattr(user, "role_id", None)
-    if role_id:
-        from app.modules.roles.model import Role
-
-        code = await db.scalar(select(Role.code).where(Role.id == role_id))
-        if code in TENANT_ADMIN_ROLES:
-            return user
-    raise ForbiddenError("Tenant administrator access required")
-
-
 PlatformAdmin = Annotated[User, Depends(require_platform_admin)]
-TenantAdmin = Annotated[User, Depends(require_tenant_admin)]
+
+#: Deprecated: declare the specific ``Perm("module.resource:action")`` instead.
+TenantAdmin = Perm("org.organization:manage")
+
+__all__ = ["PlatformAdmin", "TenantAdmin", "is_platform_admin", "require_platform_admin"]

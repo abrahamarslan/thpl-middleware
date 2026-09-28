@@ -7,13 +7,13 @@ from fastapi import APIRouter, Query, Request
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
 from app.modules.emails import crud, schema, service
-from app.modules.users.deps import CurrentUser
+from app.modules.rbac.deps import Perm
 
 router = APIRouter()
 
 
 @router.post("/send", response_model=ResponseModel[schema.EmailOut], status_code=202)
-async def send_email(user: CurrentUser, db: DBSession, email_in: schema.EmailCreate, request: Request):
+async def send_email(user: Perm("emails.email:send"), db: DBSession, email_in: schema.EmailCreate, request: Request):
     """Compose + persist + queue for async delivery via Resend."""
     email = await service.compose_and_queue_email(
         db, email_in, actor_id=user.id, user_agent=request.headers.get("user-agent")
@@ -23,7 +23,7 @@ async def send_email(user: CurrentUser, db: DBSession, email_in: schema.EmailCre
 
 
 @router.post("/send-template", response_model=ResponseModel[schema.EmailOut], status_code=202)
-async def send_template_email(user: CurrentUser, db: DBSession, body: schema.EmailTemplateSend):
+async def send_template_email(user: Perm("emails.email:send"), db: DBSession, body: schema.EmailTemplateSend):
     """Render a registered template and queue it — the reusable send path."""
     email = await service.send_template_email(
         db,
@@ -46,7 +46,7 @@ async def send_template_email(user: CurrentUser, db: DBSession, body: schema.Ema
 
 @router.get("/stats", response_model=ResponseModel[schema.EmailStatsOut])
 async def email_stats(
-    _: CurrentUser,
+    _: Perm("emails.email:read"),
     db: DBSession,
     date_from: datetime | None = Query(None, description="Inclusive lower bound (ISO 8601)"),
     date_to: datetime | None = Query(None, description="Inclusive upper bound (ISO 8601)"),
@@ -58,7 +58,7 @@ async def email_stats(
 
 @router.get("", response_model=ResponseModel[list[schema.EmailSlimOut]])
 async def list_emails(
-    _: CurrentUser,
+    _: Perm("emails.email:read"),
     db: DBSession,
     status: str | None = Query(None),
     recipient: str | None = Query(None, description="Matches To/CC/BCC"),
@@ -80,7 +80,7 @@ async def list_emails(
 
 
 @router.get("/{email_id}", response_model=ResponseModel[schema.EmailOut])
-async def get_email(_: CurrentUser, db: DBSession, email_id: int):
+async def get_email(_: Perm("emails.email:read"), db: DBSession, email_id: int):
     email = await service.get_email(db, email_id)
     return ResponseModel(data=schema.EmailOut.model_validate(email))
 

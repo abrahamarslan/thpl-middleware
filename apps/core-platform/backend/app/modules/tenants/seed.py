@@ -307,6 +307,13 @@ async def _upsert_admin_user(
             user.password = hash_password(p.admin_password)
             user.last_password_change_at = datetime.now(UTC)
     await db.flush()
+    if role.code == "owner":
+        # Same as a tenant created through the API: the owner of the root organization is also the
+        # tenant-wide owner (may create further organizations). Idempotent.
+        from app.modules.rbac import service as rbac_service
+
+        if org.parent_id is None:
+            await rbac_service.ensure_tenant_owner(db, user, role)
     return user, created
 
 

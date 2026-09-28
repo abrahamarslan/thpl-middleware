@@ -1,14 +1,47 @@
-"""Global exception handlers — single JSON error envelope for all clients."""
+"""Global exception handlers — single JSON error envelope for all clients.
+
+Deferred database constraints (the polymorphic integrity triggers built in
+``core``) fire at COMMIT, which happens inside ``get_db`` — after the service
+returned. Without a handler there, the client sees an opaque 500 even though
+the database rejected the write for a reason it can act on. The
+``IntegrityError`` handler maps SQLSTATE to a clean envelope; services still
+pre-flight the common cases (brands/categories pattern) so the normal path
+never reaches it.
+"""
 
 import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import ORJSONResponse
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.common.exception.errors import AppError
 
 logger = structlog.get_logger("app.exception")
+
+#: SQLSTATE → (status_code, code, message). The reference design's deferred
+#: triggers raise 23503 (missing polymorphic target), 23514 (check) and 23P01
+#: (exclusion / overlapping window); 23505 is a unique violation.
+_SQLSTATE_MAP: dict[str, tuple[int, str, str]] = {
+    "23505": (status.HTTP_409_CONFLICT, "conflict", "A record with these values already exists"),
+    "23503": (status.HTTP_422_UNPROCESSABLE_ENTITY, "reference_violation",
+              "The record references a row that does not exist"),
+    "23514": (status.HTTP_422_UNPROCESSABLE_ENTITY, "check_violation",
+              "The record violates a data rule"),
+    "23P01": (status.HTTP_409_CONFLICT, "conflict", "The record overlaps an existing one"),
+}
+
+
+def _sqlstate(exc: Exception) -> str | None:
+    """The Postgres SQLSTATE behind a SQLAlchemy error, if there is one."""
+    orig = getattr(exc, "orig", None)
+    return (
+        getattr(orig, "sqlstate", None)
+        or getattr(orig, "pgcode", None)
+        or getattr(getattr(orig, "__cause__", None), "sqlstate", None)
+    )
 
 
 def _envelope(request: Request, *, status_code: int, code: str, msg: str, data=None) -> ORJSONResponse:
@@ -64,6 +97,30 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         return _envelope(request, status_code=exc.status_code, code="http_error", msg=str(exc.detail))
+
+    @app.exception_handler(IntegrityError)
+    async def integrity_error_handler(request: Request, exc: IntegrityError):
+        sqlstate = _sqlstate(exc)
+        status_code, code, msg = _SQLSTATE_MAP.get(
+            sqlstate or "", (status.HTTP_422_UNPROCESSABLE_ENTITY, "integrity_error",
+                             "The write violates a database constraint")
+        )
+        # Parameters can carry secrets; log only the SQLSTATE and the driver's
+        # own text, never the statement with bound values.
+        logger.warning("integrity_error", sqlstate=sqlstate, path=request.url.path,
+                       detail=str(getattr(exc, "orig", exc))[:300])
+        return _envelope(request, status_code=status_code, code=code, msg=msg,
+                         data={"sqlstate": sqlstate} if sqlstate else None)
+
+    @app.exception_handler(StaleDataError)
+    async def stale_data_handler(request: Request, exc: StaleDataError):
+        logger.warning("stale_data", path=request.url.path, detail=str(exc)[:200])
+        return _envelope(
+            request,
+            status_code=status.HTTP_409_CONFLICT,
+            code="conflict",
+            msg="The record changed since you loaded it; reload and retry",
+        )
 
     @app.exception_handler(Exception)
     async def unhandled_handler(request: Request, exc: Exception):

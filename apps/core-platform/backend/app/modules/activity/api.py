@@ -12,13 +12,13 @@ from app.common.response.schema import PageModel, ResponseModel
 from app.database.db import DBSession
 from app.modules.activity import service
 from app.modules.activity.schema import ActivityListFilters, ActivityLogOut
-from app.modules.users.deps import CurrentUser
+from app.modules.rbac.deps import Perm
 
 router = APIRouter()
 
 
 @router.get("", response_model=ResponseModel[PageModel[ActivityLogOut]])
-async def list_activity(db: DBSession, _: CurrentUser, filters: ActivityListFilters = Query()):
+async def list_activity(db: DBSession, _: Perm("activity.log:read"), filters: ActivityListFilters = Query()):
     rows, total = await service.list_activity(db, filters)
     return ResponseModel(
         data=PageModel(
@@ -32,6 +32,6 @@ async def list_activity(db: DBSession, _: CurrentUser, filters: ActivityListFilt
 
 
 @router.get("/{activity_id}", response_model=ResponseModel[ActivityLogOut])
-async def get_activity(db: DBSession, _: CurrentUser, activity_id: uuid.UUID):
+async def get_activity(db: DBSession, _: Perm("activity.log:read"), activity_id: uuid.UUID):
     row = await service.get_activity(db, activity_id)
     return ResponseModel(data=ActivityLogOut.model_validate(row))

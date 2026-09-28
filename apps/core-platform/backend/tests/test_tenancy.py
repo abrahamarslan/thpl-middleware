@@ -161,6 +161,22 @@ GLOBAL_TABLES = {
     "document_types": "platform-wide catalog of document kinds (AADHAAR, DRIVING_LICENSE, …) — reference "
                       "data like countries; a per-tenant catalog would need tenant_id and a new code uniqueness",
     "core.entity_types": "platform-wide catalogue of polymorphic entity type codes (brand, manufacturer, …)",
+    "extfields.data_types": (
+        "Zoho custom-field data_type vocabulary (amount, text, multiselect, …) mapped to a physical "
+        "storage column — identical for every tenant, reference data like countries; the definitions and "
+        "values that use it ARE organization-scoped"
+    ),
+    "tax.taxable_entity_types": (
+        "platform-wide policy: which entity classes may carry tax assignments and under what rule — "
+        "a property of the class (item, category, …), not of a tenant; written by the owning module's "
+        "migration. The assignments that use it ARE organization-scoped"
+    ),
+    "comments.commentable_entity_types": (
+        "platform-wide policy: which entity classes may carry comments — a property of the class "
+        "(user, vehicle, …), not of a tenant; written by the owning module's migration "
+        "(comments.registration.register_commentable_entity_type). The comments that use it ARE "
+        "organization-scoped"
+    ),
     "tax.gst_treatment_types": (
         "CBIC-defined GST treatment vocabulary (business_gst, consumer, overseas, …), identical for "
         "every tenant — reference data like countries; provenance is the nullable owner_type/owner_id pair"
@@ -169,6 +185,12 @@ GLOBAL_TABLES = {
         "administrative reference geometry (states, districts, PIN codes) — not one tenant's "
         "data, and a per-tenant copy would duplicate multi-megabyte polygons. Tenant-drawn "
         "areas are geo.geofences, which IS tenant-scoped"
+    ),
+    "rbac.permissions": (
+        "the permission catalogue (module.resource:action) — platform-wide reference data like "
+        "countries or document_types, code-owned by app/modules/rbac/catalogue.py and "
+        "inserted-if-missing by app/modules/rbac/seed.py. What a role of a tenant's organization "
+        "HOLDS (rbac.role_permissions, rbac.user_roles) IS tenant-scoped"
     ),
 }
 DEACTIVATABLE = {

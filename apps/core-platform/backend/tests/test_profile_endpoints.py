@@ -91,6 +91,7 @@ def test_get_my_profile_endpoint(mocker):
         new_callable=AsyncMock,
         return_value=[],
     )
+    mocker.patch("app.modules.media.service.avatar_urls", new_callable=AsyncMock, return_value=None)
 
     app.dependency_overrides[get_current_user] = lambda: mock_user
     app.dependency_overrides[get_db] = lambda: AsyncMock()
@@ -170,6 +171,7 @@ async def test_update_my_profile_recomposes_full_name(mocker):
         ),
     )
     mocker.patch("app.modules.geo.service.list_addresses", new_callable=AsyncMock, return_value=[])
+    mocker.patch("app.modules.media.service.avatar_urls", new_callable=AsyncMock, return_value=None)
 
     await service.update_my_profile(
         AsyncMock(), mock_user, UserSelfUpdate(first_name="Jane", last_name="Doe"),
@@ -193,7 +195,10 @@ async def test_update_my_profile_writes_address_through_geo(mocker):
             updated_at=datetime.now(UTC),
         ),
     )
+    mocker.patch("app.modules.users.service._validate_localization", new_callable=AsyncMock)
+    mock_org = mocker.patch("app.modules.geo.scope.require_organization", new_callable=AsyncMock)
     mocker.patch("app.modules.geo.service.list_addresses", new_callable=AsyncMock, return_value=[])
+    mocker.patch("app.modules.media.service.avatar_urls", new_callable=AsyncMock, return_value=None)
     mock_attach = mocker.patch("app.modules.geo.service.attach_address", new_callable=AsyncMock)
 
     body = UserSelfUpdate(address=ProfileAddressIn(
@@ -202,6 +207,7 @@ async def test_update_my_profile_writes_address_through_geo(mocker):
     ))
     await service.update_my_profile(AsyncMock(), mock_user, body)
 
+    mock_org.assert_awaited_once()
     assert mock_attach.await_count == 1
     address = mock_attach.await_args.args[1]
     assert address.owner_type == "user"
@@ -457,3 +463,137 @@ def test_get_my_organization_endpoint(mocker):
         assert body["data"]["legal_name"] == "Acme HQ"
     finally:
         app.dependency_overrides.clear()
+
+
+def test_auth_me_includes_avatar_urls(mocker):
+    """GET /api/auth/me must carry the profile-picture URLs, not just the profile
+    endpoint — the same `UserOut` shape is what clients already bind to."""
+    from app.modules.users.schema import UserOut
+
+    mock_out = UserOut(
+        id=1, email="test@example.com", name="Test User",
+        avatar_urls={"original": "https://cdn.test/1/original", "thumb": None},
+    )
+    mocker.patch("app.modules.users.service.user_out", new_callable=AsyncMock, return_value=mock_out)
+
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
+    app.dependency_overrides[get_db] = lambda: AsyncMock()
+
+    try:
+        client = TestClient(app)
+        response = client.get("/api/auth/me")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["data"]["avatar_urls"] == {
+            "original": "https://cdn.test/1/original", "thumb": None,
+        }
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_user_outs_batch_attaches_avatar_urls(mocker):
+    from app.modules.users import service
+
+    users = [
+        User(id=1, email="a@example.com", name="A"),
+        User(id=2, email="b@example.com", name="B"),
+    ]
+    mocker.patch(
+        "app.modules.media.service.avatar_urls_for_users",
+        new_callable=AsyncMock,
+        return_value={1: {"original": "https://cdn.test/1/original", "thumb": None}},
+    )
+
+    outs = await service.user_outs(AsyncMock(), users)
+
+    assert outs[0].avatar_urls == {"original": "https://cdn.test/1/original", "thumb": None}
+    assert outs[1].avatar_urls is None  # user 2 has no avatar
+
+
+def test_get_my_settings_endpoint(mocker):
+    from app.modules.users.schema import UserSettings
+
+    mocker.patch(
+        "app.modules.users.service.get_my_settings",
+        new_callable=AsyncMock,
+        return_value=UserSettings(),
+    )
+
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
+    app.dependency_overrides[get_db] = lambda: AsyncMock()
+
+    try:
+        client = TestClient(app)
+        response = client.get("/api/me/settings")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["code"] == "ok"
+        assert body["msg"] == "Settings retrieved successfully."
+        assert body["data"]["privacy"]["profile_visibility"] == "organization"
+        assert body["data"]["appearance"]["theme"] == "system"
+        assert body["data"]["notifications"]["email"] is True
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_patch_my_settings_endpoint(mocker):
+    from app.modules.users.schema import UserSettings
+
+    result = UserSettings.model_validate({"appearance": {"theme": "dark"}})
+    mock_update = mocker.patch(
+        "app.modules.users.service.update_my_settings",
+        new_callable=AsyncMock,
+        return_value=result,
+    )
+
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
+    app.dependency_overrides[get_db] = lambda: AsyncMock()
+
+    try:
+        client = TestClient(app)
+        response = client.patch("/api/me/settings", json={"appearance": {"theme": "dark"}})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["msg"] == "Your settings have been updated successfully."
+        assert body["data"]["appearance"]["theme"] == "dark"
+        mock_update.assert_awaited_once()
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_patch_my_settings_rejects_unknown_keys(mocker):
+    app.dependency_overrides[get_current_user] = lambda: User(id=1, email="test@example.com", name="Test User")
+    app.dependency_overrides[get_db] = lambda: AsyncMock()
+
+    try:
+        client = TestClient(app)
+        response = client.patch("/api/me/settings", json={"bogus": True})
+        assert response.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_update_my_settings_deep_merges(mocker):
+    from app.modules.users import service
+    from app.modules.users.schema import UserSettingsUpdate
+
+    mock_user = User(
+        id=1, email="test@example.com", name="Test User",
+        application_settings={"appearance": {"theme": "dark"}, "privacy": {"show_email": True}},
+    )
+    mock_update = mocker.patch("app.modules.users.service.update_user", new_callable=AsyncMock)
+
+    result = await service.update_my_settings(
+        AsyncMock(), mock_user, UserSettingsUpdate(privacy={"profile_visibility": "private"}),
+    )
+
+    sent = mock_update.await_args.args[2]
+    # Unrelated stored values survive; only the sent field changes.
+    assert sent.application_settings["appearance"]["theme"] == "dark"
+    assert sent.application_settings["privacy"]["show_email"] is True
+    assert sent.application_settings["privacy"]["profile_visibility"] == "private"
+    assert result.appearance.theme == "dark"
+    assert result.privacy.profile_visibility == "private"
+

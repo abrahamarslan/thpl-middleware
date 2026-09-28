@@ -75,6 +75,8 @@ x-backend-env: &backend-env
   DEFAULT_ORGANIZATION_CODE: ${DEFAULT_ORGANIZATION_CODE:-}
   # Platform administrators (manage tenants), comma-separated emails
   PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
+  # RBAC grant cache lifetime in seconds (0 = off). Compose passes variables explicitly, so it is listed here.
+  RBAC_CACHE_TTL_SECONDS: ${RBAC_CACHE_TTL_SECONDS:-300}
   # Zoho
   ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID}
   ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET}
@@ -179,6 +181,25 @@ x-backend-env: &backend-env
   TYPST_FONT_PATHS: ${TYPST_FONT_PATHS:-}
   TYPST_PDF_STANDARDS: ${TYPST_PDF_STANDARDS:-}
   MEDIA_DIR: /app/media
+  # Media storage — configurable, per-row (docs/media-storage.md).
+  #   MEDIA_STORAGE_DRIVER picks the disk for NEW uploads only; every media row
+  #   records its own `disk`, so flipping it never breaks a URL already issued.
+  #     local  : bytes on the backend_media volume under MEDIA_LOCAL_BASE_PATH
+  #     garage : S3-compatible object storage (the `garage` service below);
+  #              needs `./manage.sh garage-init` once, and the backend then
+  #              refuses to boot if either bucket is missing.
+  MEDIA_STORAGE_DRIVER: ${MEDIA_STORAGE_DRIVER:-local}
+  MEDIA_LOCAL_BASE_PATH: ${MEDIA_LOCAL_BASE_PATH:-/app/media/library}
+  # Origin public media URLs are built on. Must be absolute — other applications
+  # embed <img src="{this}/public/m/{id}/medium">. Defaults to the app's own host.
+  MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-https://${APP_DOMAIN:-app.local}}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://garage:3900}
+  # The app's key defaults to the key Garage creates on first boot.
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-${GARAGE_DEFAULT_ACCESS_KEY:-}}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-${GARAGE_DEFAULT_SECRET_KEY:-}}
+  S3_BUCKET_PUBLIC: ${S3_BUCKET_PUBLIC:-core-platform-media-public}
+  S3_BUCKET_PRIVATE: ${S3_BUCKET_PRIVATE:-core-platform-media-private}
+  S3_REGION: ${S3_REGION:-garage}
   # Rate limiting
   RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
   # Observability
@@ -401,6 +422,63 @@ services:
         limits: { memory: 1G, cpus: "1.00" }
 
   # ============================================================================
+  #  DATA LAYER — Garage (S3-compatible object storage for media)
+  # ============================================================================
+  # Single-node S3 endpoint (Garage v2.3.0+). On first boot `--single-node`
+  # assigns the cluster layout and `--default-access-key` creates the app's key
+  # from GARAGE_DEFAULT_ACCESS_KEY / GARAGE_DEFAULT_SECRET_KEY, so the credentials
+  # are yours (from .env), never scraped from command output.
+  #
+  # Buckets are NOT created here: `./manage.sh garage-init` creates the public
+  # and private media buckets, grants the key, and denies it bucket creation.
+  # (No `--default-bucket` on purpose: it makes exactly ONE bucket, and this
+  # design needs two, physically separate, so a policy bug on one collection
+  # cannot expose the other.)
+  #
+  # The backend reaches it at http://garage:3900 (path-style S3). The admin API
+  # (:3903) is consumed by the prod-only garage-webui. Secrets from
+  # GARAGE_RPC_SECRET / GARAGE_ADMIN_TOKEN / GARAGE_METRICS_TOKEN override the
+  # placeholders in config/garage/garage.toml (Garage reads them from the
+  # environment itself — no template rendering needed).
+  #
+  # There is NO public Traefik router for the S3 API: public media is served by
+  # the backend at /public/m (router `public-media` on the backend service).
+  #
+  # NOTE: single-node = replication_factor 1 (no redundancy) — the same
+  # single-point-of-failure profile as local disk. Keep `local` for dev; for a
+  # resilient production run a 3-node cluster and set replication_factor to 3.
+  # ============================================================================
+  garage:
+    image: dxflrs/garage:v2.3.0
+    container_name: garage
+    restart: unless-stopped
+    command: ["/garage", "server", "--single-node", "--default-access-key"]
+    environment:
+      GARAGE_CONFIG_FILE: /etc/garage.toml
+      # DEV DEFAULTS ARE INSECURE — docker-compose.prod.yml enforces real values.
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:-0000000000000000000000000000000000000000000000000000000000000000}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:-change-me-dev-admin-token}
+      GARAGE_METRICS_TOKEN: ${GARAGE_METRICS_TOKEN:-change-me-dev-metrics-token}
+      GARAGE_DEFAULT_ACCESS_KEY: ${GARAGE_DEFAULT_ACCESS_KEY:-GK00000000000000000000000000000000}
+      GARAGE_DEFAULT_SECRET_KEY: ${GARAGE_DEFAULT_SECRET_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./config/garage/garage.toml:/etc/garage.toml:ro
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+    networks:
+      - app-backend
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "1.00" }
+
+  # ============================================================================
   #  APPLICATION — Backend API (FastAPI, baked image)
   # ============================================================================
   backend:
@@ -444,6 +522,20 @@ services:
       traefik.http.routers.api.tls: "true"
       traefik.http.routers.api.middlewares: security-headers@file,gzip@file
       traefik.http.services.api.loadbalancer.server.port: "8000"
+      # Public media — the ONE deliberately unauthenticated path (FastAPI router
+      # app/modules/media/public_api.py). Kept as its own router, on its own line
+      # here, so it is auditable at a glance. There is no auth middleware at the
+      # edge in this stack (authentication is in the app), so "excluded from auth"
+      # means: this route exists in the app WITHOUT a user dependency, and serves
+      # only rows with visibility=public. Same host as the app by default;
+      # set MEDIA_PUBLIC_HOST (and a DNS record) to serve it from a separate host.
+      # Priority 10 = the API's, above the SPA catch-all (1).
+      traefik.http.routers.public-media.rule: "Host(`${MEDIA_PUBLIC_HOST:-${APP_DOMAIN:-app.local}}`) && PathPrefix(`/public/m`)"
+      traefik.http.routers.public-media.priority: "10"
+      traefik.http.routers.public-media.entrypoints: websecure
+      traefik.http.routers.public-media.tls: "true"
+      traefik.http.routers.public-media.middlewares: security-headers@file
+      traefik.http.routers.public-media.service: api
     deploy:
       resources:
         limits: { memory: 1G, cpus: "2.00" }
@@ -1136,6 +1228,10 @@ volumes:
     name: app_kafka_data
   backend_media:
     name: app_backend_media
+  garage_meta:
+    name: app_garage_meta
+  garage_data:
+    name: app_garage_data
   traefik_certs:
     name: app_traefik_certs
   authentik_media:

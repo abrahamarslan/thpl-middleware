@@ -17,7 +17,14 @@ from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
 from app.modules.tenants import service
 from app.modules.tenants.deps import PlatformAdmin
-from app.modules.tenants.schema import TenantCreate, TenantOut, TenantStatusChange, TenantUpdate
+from app.modules.tenants.schema import (
+    InitialAdminOut,
+    TenantCreatedOut,
+    TenantCreate,
+    TenantOut,
+    TenantStatusChange,
+    TenantUpdate,
+)
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -34,11 +41,18 @@ async def list_tenants(_: PlatformAdmin, db: DBSession, status: str | None = Que
     return ResponseModel.ok(data=[TenantOut.model_validate(t) for t in await service.list_tenants(db, status=status)])
 
 
-@router.post("", response_model=ResponseModel[TenantOut], status_code=201)
+@router.post("", response_model=ResponseModel[TenantCreatedOut], status_code=201)
 async def create_tenant(admin: PlatformAdmin, db: DBSession, body: TenantCreate):
+    """Create a tenant WITH its root organization, that organization's roles and an initial administrator.
+
+    The administrator is an ``owner`` of the organization and holds the tenant-wide owner grant: they may do
+    anything in the tenant, including creating new organizations. If ``admin_password`` was omitted a strong
+    temporary password is generated and returned ONCE here.
+    """
     tenant = await service.create_tenant(db, body, actor_id=admin.id)
-    return ResponseModel.ok(data=TenantOut.model_validate(tenant), module=_M, msg_key="created",
-                            code=tenant.tenant_code)
+    out = TenantCreatedOut.model_validate(tenant)
+    out.initial_admin = InitialAdminOut(**tenant.initial_admin) if getattr(tenant, "initial_admin", None) else None
+    return ResponseModel.ok(data=out, module=_M, msg_key="created", code=tenant.tenant_code)
 
 
 @router.get("/{ref}", response_model=ResponseModel[TenantOut])

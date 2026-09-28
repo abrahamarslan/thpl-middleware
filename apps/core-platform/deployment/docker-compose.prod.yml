@@ -12,12 +12,13 @@
 #   - restart: always on the long-running services.
 #   - Kafka UI is bound to VM loopback only (SSH-tunnel to reach it).
 #   - Authentik first-run admin is bootstrapped from .env.prod.
+#   - Garage Web UI (garage.<domain>, behind the dashboard basic-auth).
 #
 # Domain: everything is driven by APP_DOMAIN in .env.prod
-#   (dlp.tarrinahealth.com, auth.dlp.…, ws.dlp.…, traefik.dlp.…).
+#   (dlp.tarrinahealth.com, auth.dlp.…, ws.dlp.…, traefik.dlp.…, garage.dlp.…).
 #
 # Prerequisites:
-#   1. DNS A records for all four hosts -> this VM's public IP.
+#   1. DNS A records for all five hosts -> this VM's public IP.
 #   2. Inbound 80 + 443 open to the internet (80 is required for the ACME
 #      HTTP-01 challenge even though browsers are redirected to 443).
 #   3. cp .env.example .env.prod  and fill it in  (see that file's header).
@@ -57,6 +58,9 @@ services:
       traefik.http.routers.apidocs.tls.certresolver: letsencrypt
       traefik.http.routers.apidocs.service: api
       traefik.http.routers.apidocs.middlewares: dashboard-auth@file,security-headers@file,gzip@file
+      # Public media (unauthenticated GET /public/m/{id}/{variant}) — TLS only;
+      # the router itself is defined in docker-compose.yml.
+      traefik.http.routers.public-media.tls.certresolver: letsencrypt
 
   celery-worker:
     restart: always
@@ -81,6 +85,52 @@ services:
     restart: always
     labels:
       traefik.http.routers.soketi.tls.certresolver: letsencrypt
+
+  # --- Object storage (media) --------------------------------------------------
+  # NOTE: no public Traefik router for the S3 API. Public media goes through the
+  # backend's /public/m (router `public-media`), which keeps the URL independent
+  # of the storage backend. Add an S3 router here only if direct-to-bucket URLs
+  # are ever adopted (that also needs Garage website mode + a public bucket policy).
+  garage:
+    restart: always
+    # The base file's dev defaults are all-zero placeholders. Production must never
+    # run on them, so an unset value fails `docker compose config` instead.
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET:?set GARAGE_RPC_SECRET in .env.prod (openssl rand -hex 32)}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN:?set GARAGE_ADMIN_TOKEN in .env.prod (openssl rand -hex 32)}
+      GARAGE_METRICS_TOKEN: ${GARAGE_METRICS_TOKEN:?set GARAGE_METRICS_TOKEN in .env.prod (openssl rand -hex 32)}
+      GARAGE_DEFAULT_ACCESS_KEY: ${GARAGE_DEFAULT_ACCESS_KEY:?set GARAGE_DEFAULT_ACCESS_KEY in .env.prod (GK + openssl rand -hex 12)}
+      GARAGE_DEFAULT_SECRET_KEY: ${GARAGE_DEFAULT_SECRET_KEY:?set GARAGE_DEFAULT_SECRET_KEY in .env.prod (openssl rand -hex 32)}
+
+  # Web UI for buckets/keys — same basic-auth as the Traefik dashboard and Flower.
+  # Pinned (not :latest): the UI holds the Garage admin token.
+  # 1.1.0 reads the admin token from API_ADMIN_KEY (verified against Garage 2.3.0).
+  garage-webui:
+    image: khairul169/garage-webui:1.1.0
+    container_name: garage-webui
+    restart: always
+    environment:
+      API_BASE_URL: "http://garage:3903"
+      API_ADMIN_KEY: ${GARAGE_ADMIN_TOKEN:?set GARAGE_ADMIN_TOKEN in .env.prod}
+      S3_ENDPOINT_URL: "http://garage:3900"
+      S3_REGION: "garage"
+    networks:
+      - app-backend        # reach garage
+      - app-frontend       # reach Traefik
+    depends_on:
+      garage:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: "0.25" }
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.garage-ui.rule: "Host(`garage.${APP_DOMAIN}`)"
+      traefik.http.routers.garage-ui.entrypoints: websecure
+      traefik.http.routers.garage-ui.tls: "true"
+      traefik.http.routers.garage-ui.tls.certresolver: letsencrypt
+      traefik.http.routers.garage-ui.middlewares: dashboard-auth@file,security-headers@file
+      traefik.http.services.garage-ui.loadbalancer.server.port: "3909"
 
   # --- IAM: bootstrap the first admin (akadmin) from the environment --------
   authentik-server:

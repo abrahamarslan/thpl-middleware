@@ -1,4 +1,12 @@
-"""Operator API data access (SQL only; no business rules)."""
+"""Operator API data access (SQL only; no business rules).
+
+Every read here runs with ``all_tenants=True``: there is ONE Zoho connection per deployment
+(docs/rbac-module.md §12, tenancy open item #2 — per-tenant connections are future work), so
+``zoho_sync_runs`` / ``zoho_sync_events`` are LEDGER tables an operator must see in full regardless
+of which tenant THEY happen to be bound to when they call the endpoint — the automatic tenant filter
+(app/database/tenancy.py) would otherwise silently hide every run/event not stamped with the caller's
+own tenant, which is meaningless here (``zoho.integration:*`` is the only real gate).
+"""
 
 from __future__ import annotations
 
@@ -34,12 +42,12 @@ async def list_runs(
         stmt = stmt.where(ZohoSyncRun.lane == lane)
     if status:
         stmt = stmt.where(ZohoSyncRun.status == status)
-    stmt = stmt.order_by(ZohoSyncRun.started_at.desc()).limit(limit)
+    stmt = stmt.order_by(ZohoSyncRun.started_at.desc()).limit(limit).execution_options(all_tenants=True)
     return list((await db.scalars(stmt)).all())
 
 
 async def get_run(db: AsyncSession, run_id: uuid.UUID) -> ZohoSyncRun | None:
-    return await db.get(ZohoSyncRun, run_id)
+    return await db.get(ZohoSyncRun, run_id, execution_options={"all_tenants": True})
 
 
 async def record_events(
@@ -58,7 +66,8 @@ async def record_events(
         stmt = stmt.where(ZohoSyncEvent.zoho_id == zoho_id)
     if event_type:
         stmt = stmt.where(ZohoSyncEvent.event_type == event_type)
-    stmt = stmt.order_by(ZohoSyncEvent.occurred_at.desc(), ZohoSyncEvent.id.desc()).limit(limit)
+    stmt = (stmt.order_by(ZohoSyncEvent.occurred_at.desc(), ZohoSyncEvent.id.desc()).limit(limit)
+           .execution_options(all_tenants=True))
     return list((await db.scalars(stmt)).all())
 
 

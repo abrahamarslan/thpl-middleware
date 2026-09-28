@@ -24,7 +24,7 @@ No source id column: identity is the crosswalk's (``sync.sync_records``).
 
 from __future__ import annotations
 
-from sqlalchemy import Text
+from sqlalchemy import Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
@@ -48,6 +48,8 @@ class TaxExemption(
 
     __tablename__ = "tax_exemptions"
     __table_args__ = (
+        # Target of tax_assignments' composite (tenant_id, tax_exemption_id) FK.
+        UniqueConstraint("tenant_id", "id", name="uq_tax_exemptions_tenant_id"),
         {"schema": TAX_SCHEMA, "comment": "Tax exemption reasons (P2: codes/names may hold personal names)."},
     )
 

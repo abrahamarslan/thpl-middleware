@@ -13,6 +13,30 @@ consumes `app/modules/entities/`, `app/modules/zoho/sync/`, `app/modules/sync/`,
 `sql/categories_module.sql` companion), reconciled against
 `docs/architecture-prompts/master-prompt.md`.
 
+> **Rev 3 (2026-09-25) — as built.** Phases 0–3 are implemented and were
+> reviewed against the live Zoho Books API; the full findings, evidence and open
+> items are in [`categories-zoho-sync-review.md`](categories-zoho-sync-review.md).
+> Where this document and that one disagree, **that one wins**. What it changes
+> here:
+>
+> | This plan says | As built |
+> |---|---|
+> | **L3 / §5.1 / §6:** `Category` composes `ZohoIdentityMixin` + `ZohoMirrorMixin` (+ `ZohoPushableMixin` if push). | **Superseded by the crosswalk shape** ([`sync-crosswalk-delta-v3.md`](sync-crosswalk-delta-v3.md)). `crosswalk=True` entities carry business columns + a `zoho_id` echo only; the gate state, raw document and custom fields live in `sync.sync_records`. No mirror or push columns. |
+> | **§14 Q1:** endpoint, id field, pagination, `last_modified_time`, payload shape unknown; direction open. | **Answered** by `docs/zoho-docs-md/categories.md` + live probes: Books `/categories`, `category_id`, paginated, `last_modified_time` filter (engine's `+0000` format; the doc's `Z` is rejected), detail adds SEO/`custom_fields`/`category_tax_preferences`, **`include_root_category=false` is required** (Zoho invents a `ROOT` row). Direction **INBOUND**. |
+> | **§14 Q2:** taxonomy home for Zoho categories. | Zoho's hierarchy maps 1:1 onto `parent_id` inside **one** per-organization `zoho` taxonomy, provisioned by `core.fill_category_default_taxonomy()`. |
+> | **§14 Q3 / §6.3:** parent and tree position "remain ours". | The **parent is Zoho-owned** on a linked row (the sync re-links it on every re-apply). Owned set = the translator's readable fields + `parent_id`. |
+> | **§14 Q5:** delete with live children. | 409 (implemented). |
+> | **§6.3:** parent linked in `post_upsert`. | Kept — it cannot be a `ReferenceRule` (§4.2 of the review) — plus a `sync.pending_references` queue for an unresolvable parent. |
+> | **§5.1 `meta_keywords`** typed like the other JSONB buckets. | A JSON **array** of strings (Zoho's `seo_keyword` is one comma-separated string). |
+> | **§11 `is_root` set by the service.** | Derived from `parent_id` by `trg_categories_is_root`; the tree recompute never flags a node with a parent as a root. |
+> | **§15 DoD: "Zoho identity/mirror columns + `uq_categories_zoho_id_live`".** | `zoho_id` echo + `uq_categories_zoho_id_live` only. |
+>
+> Still open from this plan: §14 Q4 (`ltree`), Q6 (`category_stats`). The one new
+> product question the live data surfaced — **`category_tax_preferences`** — is
+> **built**: a category's taxes are `tax.tax_assignments` rows (owner class
+> `category`), settable through `tax_preferences` on create/update and fed by Zoho
+> ([`tax-assignments.md`](tax-assignments.md)).
+
 ---
 
 ## 1. Understanding + locked decisions

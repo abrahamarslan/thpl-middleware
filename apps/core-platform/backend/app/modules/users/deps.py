@@ -114,9 +114,27 @@ async def _bind_tenancy(
         org_code = org_code or org_uuid
         org_uuid = None
     if org_code or org_uuid:
-        chosen = await scope.resolve(
-            db, org_code=org_code, org_uuid=org_uuid, for_tenant=user.tenant_id,
-        )
+        try:
+            chosen = await scope.resolve(
+                db, org_code=org_code, org_uuid=org_uuid, for_tenant=user.tenant_id,
+            )
+        except ForbiddenError as exc:
+            # Both headers are OPTIONAL and, when sent, may only name an
+            # organization of the caller's OWN tenant. A bare "not found" hides
+            # which rule applies — and the code is tenant-scoped, so a code that
+            # exists elsewhere (or a tenant code) reads as "missing". Say so, and
+            # point at the endpoint that reports the codes the caller can use.
+            exc.data = {
+                **exc.data,
+                "org_code": org_code.strip() if org_code else exc.data.get("org_code"),
+                "hint": (
+                    "Both organization headers are optional: omit them to use your own "
+                    "organization. A code or uuid must name an organization of YOUR tenant "
+                    "(an organization code, not the tenant code) — GET /api/auth/me/organization "
+                    "returns the organization you belong to."
+                ),
+            }
+            raise
         organization_id = chosen.organization_id if chosen else None
     bind_user(user, organization_id=organization_id)
 

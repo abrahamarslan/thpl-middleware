@@ -31,12 +31,16 @@ from app.modules.zoho.control import models as _zoho_control_models  # noqa: F40
 from app.modules.tenants import model as _tenants_model  # noqa: F401
 from app.modules.organizations import model as _organizations_model  # noqa: F401
 from app.modules.roles import model as _roles_model  # noqa: F401
+from app.modules.rbac import model as _rbac_model  # noqa: F401
+from app.modules.teams import model as _teams_model  # noqa: F401
 from app.modules.currencies import model as _currencies_model  # noqa: F401
 from app.modules.taxes import model as _taxes_model  # noqa: F401
 from app.modules.locations import model as _zoho_locations_model  # noqa: F401
 from app.modules.entities import model as _entities_model  # noqa: F401
+from app.modules.custom_fields import model as _custom_fields_model  # noqa: F401
 from app.modules.brands import model as _brands_model  # noqa: F401
 from app.modules.manufacturers import model as _manufacturers_model  # noqa: F401
+from app.modules.categories import model as _categories_model  # noqa: F401
 from app.modules.zoho_users import model as _zoho_users_model  # noqa: F401
 from app.modules.zoho.sync import models as _zoho_sync_models  # noqa: F401
 from app.modules.sync import models as _sync_models  # noqa: F401
@@ -88,7 +92,7 @@ def _include_object(obj, name, type_, reflected, compare_to):
 #: Schemas our migrations own. `include_schemas=True` is needed for the tenancy
 #: tables in org_management; everything else (topology, tiger, …) belongs to
 #: PostGIS extensions and is never compared.
-_OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core"}
+_OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core", "extfields", "media", "teams", "rbac"}
 
 
 def _include_name(name, type_, parent_names):

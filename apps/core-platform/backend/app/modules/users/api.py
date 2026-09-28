@@ -12,7 +12,7 @@ ClientInfoDep; see docs/modules/auth-module-documentation.md.
 
 from dataclasses import asdict
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, File, Query, Response, UploadFile
 
 from app.common.client_info import ClientInfoDep
 from app.common.exception.errors import ForbiddenError
@@ -20,7 +20,10 @@ from app.common.response.schema import PageModel, ResponseModel
 from app.common.security.jwt import create_access_token
 from app.core.conf import settings
 from app.database.db import DBSession
+from app.modules.media import service as media_service
+from app.modules.media.schema import AvatarOut
 from app.modules.organizations.schema import OrganizationOut
+from app.modules.rbac.deps import GrantsDep, Perm, org_of
 from app.modules.users import login_otp, moderation, service
 from app.modules.users.deps import CurrentUser, OrganizationCode
 from app.modules.users.password_policy import get_password_policy
@@ -43,12 +46,15 @@ from app.modules.users.schema import (
     ResetPasswordRequest,
     ThrottleRequest,
     TokenPair,
-    UserCreate,
+    UserAdminCreate,
+    UserAdminUpdate,
     UserListFilters,
     UserMeOut,
     UserOut,
+    UserPublicOut,
     UserSelfUpdate,
-    UserUpdate,
+    UserSettings,
+    UserSettingsUpdate,
 )
 
 auth_router = APIRouter()
@@ -120,8 +126,8 @@ async def logout(db: DBSession, user: CurrentUser, client: ClientInfoDep):
 
 
 @auth_router.get("/me", response_model=ResponseModel[UserOut])
-async def me(user: CurrentUser):
-    return ResponseModel(data=UserOut.model_validate(user))
+async def me(db: DBSession, user: CurrentUser):
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 @auth_router.post("/change-password", response_model=ResponseModel[dict])
@@ -182,12 +188,23 @@ async def dev_token(db: DBSession):
 
 # ════════════════════════════════ USERS ═══════════════════════════════════════
 
-@users_router.get("", response_model=ResponseModel[PageModel[UserOut]])
-async def list_users(db: DBSession, _: CurrentUser, filters: UserListFilters = Query()):
+# Authorization (docs/rbac-module.md): every route below declares ONE guard — ``Perm(code, target=…)``.
+# ``org_of(User)`` judges an action on a user AT THAT USER'S organization, so an administrator of one
+# branch cannot touch another branch's people. Reading is two-tier: the directory (id, name, avatar) is
+# open to anyone with ``users.directory:read``; the full record (medical history, PAN, bank details …)
+# needs ``users.user:read`` — or is your own.
+_USER = org_of("app.modules.users.model:User", param="user_id")
+
+
+@users_router.get("", response_model=ResponseModel[PageModel[UserOut | UserPublicOut]])
+async def list_users(
+    db: DBSession, _: Perm("users.directory:read"), grants: GrantsDep, filters: UserListFilters = Query(),
+):
     users, total = await service.list_users(db, filters)
+    full = grants.can_anywhere("users.user:read")          # SHAPE only; the gate above already ran
     return ResponseModel(
         data=PageModel(
-            items=[UserOut.model_validate(u) for u in users],
+            items=await (service.user_outs(db, users) if full else service.user_public_outs(db, users)),
             page=filters.page,
             page_size=filters.page_size,
             total=total,
@@ -197,33 +214,37 @@ async def list_users(db: DBSession, _: CurrentUser, filters: UserListFilters = Q
 
 
 @users_router.post("", response_model=ResponseModel[UserOut], status_code=201)
-async def create_user(db: DBSession, current: CurrentUser, body: UserCreate):
+async def create_user(db: DBSession, current: Perm("users.user:create"), body: UserAdminCreate):
+    """Create a user. They start as a ``member``; give them a role with PUT /users/{id}/base-role."""
     user = await service.create_user(db, body, created_by=current.id, actor_label=current.email)
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
-@users_router.get("/{user_id}", response_model=ResponseModel[UserOut])
+@users_router.get("/{user_id}", response_model=ResponseModel[UserOut | UserPublicOut])
 async def get_user(
-    db: DBSession, _: CurrentUser, user_id: int,
+    db: DBSession, viewer: Perm("users.directory:read", target=_USER), grants: GrantsDep, user_id: int,
     include_deleted: bool = Query(False, description="Also match soft-deleted users"),
 ):
     user = await service.get_user(db, user_id, include_deleted=include_deleted)
-    return ResponseModel(data=UserOut.model_validate(user))
+    if user.id == viewer.id or grants.can_anywhere("users.user:read"):
+        return ResponseModel(data=await service.user_out(db, user))
+    return ResponseModel(data=(await service.user_public_outs(db, [user]))[0])
 
 
 @users_router.put("/{user_id}", response_model=ResponseModel[UserOut])
 async def update_user(
-    db: DBSession, current: CurrentUser, user_id: int, body: UserUpdate, client: ClientInfoDep
+    db: DBSession, current: Perm("users.user:update", target=_USER), user_id: int, body: UserAdminUpdate,
+    client: ClientInfoDep,
 ):
     user = await service.update_user(
         db, user_id, body, updated_by=current.id, actor_label=current.email, client=client
     )
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 @users_router.delete("/{user_id}", response_model=ResponseModel[dict])
 async def delete_user(
-    db: DBSession, current: CurrentUser, user_id: int,
+    db: DBSession, current: Perm("users.user:delete", target=_USER), user_id: int,
     hard: bool = Query(False, description="Permanently delete instead of soft delete"),
 ):
     await service.delete_user(
@@ -233,50 +254,54 @@ async def delete_user(
 
 
 @users_router.post("/{user_id}/restore", response_model=ResponseModel[UserOut])
-async def restore_user(db: DBSession, _: CurrentUser, user_id: int):
+async def restore_user(db: DBSession, _: Perm("users.user:restore", target=_USER), user_id: int):
     user = await service.restore_user(db, user_id)
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 # ── Moderation: ban / unban / throttle ───────────────────────────────────────
 
 @users_router.get("/{user_id}/moderation", response_model=ResponseModel[ModerationOut])
-async def get_moderation(db: DBSession, _: CurrentUser, user_id: int):
+async def get_moderation(db: DBSession, _: Perm("users.moderation:manage", target=_USER), user_id: int):
     """Current ban/throttle/lock state of a user."""
     user = await service.get_user(db, user_id, include_deleted=True)
     return ResponseModel(data=ModerationOut(**moderation.moderation_state(user)))
 
 
 @users_router.post("/{user_id}/ban", response_model=ResponseModel[UserOut])
-async def ban_user(db: DBSession, current: CurrentUser, user_id: int, body: BanRequest):
+async def ban_user(
+    db: DBSession, current: Perm("users.moderation:manage", target=_USER), user_id: int, body: BanRequest,
+):
     """Ban a user (permanent unless `until` is given); mirrors to Authentik."""
     user = await service.get_user(db, user_id, include_deleted=True)
     user = await moderation.ban_user(db, user, reason=body.reason, until=body.until, actor_id=current.id)
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 @users_router.post("/{user_id}/unban", response_model=ResponseModel[UserOut])
-async def unban_user(db: DBSession, current: CurrentUser, user_id: int):
+async def unban_user(db: DBSession, current: Perm("users.moderation:manage", target=_USER), user_id: int):
     user = await service.get_user(db, user_id, include_deleted=True)
     user = await moderation.unban_user(db, user, actor_id=current.id)
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 @users_router.post("/{user_id}/throttle", response_model=ResponseModel[UserOut])
-async def throttle_user(db: DBSession, current: CurrentUser, user_id: int, body: ThrottleRequest):
+async def throttle_user(
+    db: DBSession, current: Perm("users.moderation:manage", target=_USER), user_id: int, body: ThrottleRequest,
+):
     """Throttle a user: existing session stays, new auth attempts are 429'd."""
     user = await service.get_user(db, user_id, include_deleted=True)
     user = await moderation.throttle_user(
         db, user, reason=body.reason, until=body.until, actor_id=current.id
     )
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 @users_router.post("/{user_id}/unthrottle", response_model=ResponseModel[UserOut])
-async def unthrottle_user(db: DBSession, current: CurrentUser, user_id: int):
+async def unthrottle_user(db: DBSession, current: Perm("users.moderation:manage", target=_USER), user_id: int):
     user = await service.get_user(db, user_id, include_deleted=True)
     user = await moderation.unthrottle_user(db, user, actor_id=current.id)
-    return ResponseModel(data=UserOut.model_validate(user))
+    return ResponseModel(data=await service.user_out(db, user))
 
 
 # ════════════════════════════════ ME / PROFILE ═══════════════════════════════
@@ -308,6 +333,62 @@ async def update_my_profile(
     """
     data = await service.update_my_profile(db, user, body, client=client)
     return ResponseModel.ok(data=data, module="users", msg_key="profile_updated")
+
+
+# ══════════════════════════════ ME / APP SETTINGS ═════════════════════════════
+# App-specific preferences (profile visibility, theme, notification channels)
+# persisted in `users.application_settings` JSONB. GET returns the full effective
+# settings; PATCH deep-merges any subset, so an app can send one changed toggle.
+
+@me_router.get("/settings", response_model=ResponseModel[UserSettings])
+@auth_router.get("/me/settings", response_model=ResponseModel[UserSettings])
+async def get_my_settings(db: DBSession, user: CurrentUser):
+    """The authenticated user's effective app settings (defaults where unset)."""
+    return ResponseModel.ok(
+        data=await service.get_my_settings(db, user), module="users", msg_key="settings_fetched",
+    )
+
+
+@me_router.patch("/settings", response_model=ResponseModel[UserSettings])
+@auth_router.patch("/me/settings", response_model=ResponseModel[UserSettings])
+async def update_my_settings(
+    db: DBSession, user: CurrentUser, body: UserSettingsUpdate, client: ClientInfoDep,
+):
+    """Update the authenticated user's app settings.
+
+    Any subset of the settings may be sent — sections and fields merge over the
+    stored values, so a client only sends what changed.
+    """
+    data = await service.update_my_settings(db, user, body, client=client)
+    return ResponseModel.ok(data=data, module="users", msg_key="settings_updated")
+
+
+# ════════════════════════════════ ME / AVATAR ════════════════════════════════
+# Public media: the returned URLs are served by the unauthenticated
+# /public/m router (modules/media/public_api.py), so other applications can embed
+# them with a plain GET. Variants are generated asynchronously — 202, then poll
+# GET /api/me/profile until `avatar_urls` has no nulls.
+
+@me_router.post("/avatar", response_model=ResponseModel[AvatarOut], status_code=202)
+async def upload_my_avatar(db: DBSession, user: CurrentUser, file: UploadFile = File(...)):
+    """Set (or replace) the authenticated user's avatar (PNG / JPEG / WebP, max 10 MB, max 40 MP).
+
+    The image is validated and re-encoded with all EXIF/GPS metadata removed.
+    Replacing an avatar issues a NEW media id (and so new URLs); the previous
+    image is soft-deleted and its bytes purged after a 24 h grace window.
+    """
+    media = await media_service.replace_avatar(db, user_id=user.id, upload=file)
+    return ResponseModel(
+        data=AvatarOut(media_id=media.uuid, status=media.status, avatar_urls=media_service.media_urls(media)),
+        msg="Avatar uploaded; conversions queued",
+    )
+
+
+@me_router.delete("/avatar", status_code=204)
+async def delete_my_avatar(db: DBSession, user: CurrentUser):
+    """Remove the authenticated user's avatar (idempotent)."""
+    await media_service.delete_avatar(db, user_id=user.id)
+    return Response(status_code=204)
 
 
 # ════════════════════════════════ ME / ORGANIZATION ══════════════════════════
@@ -363,7 +444,7 @@ async def get_my_location(db: DBSession, user: CurrentUser):
 
 
 @users_router.get("/{user_id}/location", response_model=ResponseModel[LiveLocationOut | None])
-async def get_user_location(db: DBSession, _: CurrentUser, user_id: int):
+async def get_user_location(db: DBSession, _: Perm("users.location:read", target=_USER), user_id: int):
     """A user's last known position — what dispatch and beat planning read."""
     await service.get_user(db, user_id)          # 404 for an unknown/other-tenant user
     live = await service.get_live_location(db, user_id)
