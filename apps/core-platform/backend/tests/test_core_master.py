@@ -32,7 +32,9 @@ def test_the_nine_core_tables_live_in_the_core_schema():
     tables = {t.name for t in Base.metadata.tables.values() if t.schema == "core"}
     assert tables == {"entity_types", "brands", "manufacturers",
                       "brand_manufacturers", "manufacturer_identifiers", "entity_aliases",
-                      "taxonomies", "taxonomy_entity_types", "categories", "categorizables"}
+                      "taxonomies", "taxonomy_entity_types", "categories", "categorizables",
+                      # platform idempotency ledger (app/modules/idempotency), not master data
+                      "idempotency_keys"}
 
 
 def test_normalized_columns_are_stored_generated_columns():
