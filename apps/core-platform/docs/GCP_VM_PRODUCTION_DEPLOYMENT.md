@@ -854,11 +854,22 @@ Run `./manage.sh prod-ssl` first — it checks every cause below at once.
 - **Resolution:** Verify the 8 GB swapfile is active with `free -h`. Adjust concurrency in `.env`: reduce `CELERY_CONCURRENCY=2` and `WORKERS=2` if necessary.
 
 ### Issue 5: `dependency failed to start: container kafka is unhealthy` (but the broker logs say "Kafka Server started")
-- **Cause:** the healthcheck runs `kafka-broker-api-versions.sh`, a full JVM that inherits the broker's `KAFKA_HEAP_OPTS=-Xmx1G` — so each probe tries to start a second 1 GB-heap JVM inside the same cgroup and is OOM-killed. The broker itself is fine.
-- **Resolution:** already fixed in `docker-compose.yml` — the healthcheck command now prefixes `KAFKA_HEAP_OPTS='-Xmx128m -Xms64m'` and uses `timeout: 20s / retries: 12 / start_period: 90s`. If you see this on an old checkout, `git pull`. Confirm health with:
+- **Cause (two parts):**
+  1. The healthcheck runs `kafka-broker-api-versions.sh`, a full JVM that inherits the broker's `KAFKA_HEAP_OPTS=-Xmx1G` — so each probe tries to start a second 1 GB-heap JVM inside the same cgroup and is OOM-killed. The broker itself is fine.
+  2. On this VM a single-node KRaft broker can spend minutes replaying its metadata log (especially after an unclean stop or while `./manage.sh prod --build` thrashes the disk). The old `start_period: 90s / retries: 12` marked it unhealthy mid-recovery, and services with `depends_on: service_healthy` aborted the whole `up`.
+- **Resolution:** fixed in `docker-compose.yml`:
+  - `stop_grace_period: 90s` on `kafka` lets KRaft flush and shut down cleanly, which prevents most long recoveries to begin with.
+  - Healthcheck now uses `KAFKA_HEAP_OPTS='-Xmx128m -Xms64m'` with `timeout: 30s / retries: 40 / start_period: 300s` (tolerates slow recovery).
+  - `kafka-exporter`, `search-indexer`, `kafbat-ui` and `debezium` now use `condition: service_started` (they retry connecting), so a slow broker can no longer fail the deploy.
+  If you see this on an old checkout, `git pull`. Confirm health with:
   ```bash
   docker inspect --format '{{.State.Health.Status}}' kafka
   docker exec kafka bash -c "KAFKA_HEAP_OPTS='-Xmx128m' /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092" | head -1
+  ```
+- **If Kafka is stuck anyway** (corrupt/unclean metadata log; safe because Postgres is the source of truth and Debezium re-snapshots):
+  ```bash
+  ./manage.sh kafka-reset       # stops kafka, wipes app_kafka_data, starts fresh
+  ./manage.sh register-debezium
   ```
 
 ### Issue 6: Frontend loads but every API call is CORS-blocked

@@ -82,6 +82,11 @@ DEBEZIUM (CDC)
   register-debezium  Register/update the zoho-mirror Postgres connector
   debezium-status    Show connector list + status
 
+KAFKA (KRaft)
+  kafka-reset        Recover a Kafka that never became healthy: stop it,
+                     wipe app_kafka_data, and start it fresh. Debezium then
+                     re-snapshots (Postgres remains the source of truth).
+
 ENV
   env-check          Lint deployment/.env for shell-unsafe values (manage.sh sources it)
   sync-env [args]    Sync shared env vars between the two .env files.
@@ -420,6 +425,33 @@ case "$COMMAND" in
         fi
         docker exec debezium curl -s http://localhost:8083/connectors | python3 -m json.tool || true
         docker exec debezium curl -s "http://localhost:8083/connectors/${ARG1:-zoho-mirror}/status" | python3 -m json.tool || true
+        ;;
+
+    # -- Kafka (KRaft) ------------------------------------------------------------
+    kafka-reset)
+        # A single-node KRaft broker can fail to become healthy when its metadata
+        # log is unclean (hard reboot / SIGKILL) — recovery can take far longer
+        # than any sane healthcheck window. Postgres holds the real data and
+        # Debezium re-snapshots, so a fresh volume is the clean recovery path.
+        echo -e "${YELLOW}This wipes the Kafka volume (topics, offsets, CDC progress).${NC}"
+        echo -e "${YELLOW}Postgres is unaffected; Debezium will re-snapshot.${NC}"
+        read -rp "Type 'yes' to confirm: " confirm
+        if [ "$confirm" != "yes" ]; then
+            echo -e "${YELLOW}Aborted.${NC}"
+            exit 0
+        fi
+        echo -e "${CYAN}Stopping Kafka and Debezium...${NC}"
+        prod_compose stop kafka debezium 2>/dev/null || true
+        prod_compose rm -sf kafka debezium 2>/dev/null || true
+        echo -e "${CYAN}Removing volume app_kafka_data...${NC}"
+        docker volume rm app_kafka_data 2>/dev/null || true
+        echo -e "${CYAN}Starting a fresh Kafka...${NC}"
+        prod_compose up -d kafka
+        echo ""
+        echo -e "${GREEN}Kafka started. Wait for it to become healthy, then re-register${NC}"
+        echo -e "${GREEN}the connector:${NC}"
+        echo -e "  docker inspect --format '{{.State.Health.Status}}' kafka"
+        echo -e "  ./manage.sh register-debezium"
         ;;
 
     # -- Authentik (IAM user sync) ----------------------------------------------

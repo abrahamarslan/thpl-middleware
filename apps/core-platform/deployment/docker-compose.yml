@@ -672,8 +672,10 @@ services:
     restart: unless-stopped
     command: ["--kafka.server=kafka:9092"]
     depends_on:
+      # service_started, not service_healthy: see the kafka healthcheck comment.
+      # The exporter retries until the broker accepts connections.
       kafka:
-        condition: service_healthy
+        condition: service_started
     networks:
       - app-backend
       - app-monitoring
@@ -704,8 +706,10 @@ services:
       MEILISEARCH_MASTER_KEY: ${MEILISEARCH_KEY}
       SEARCH_CDC_TOPICS: ${SEARCH_CDC_TOPICS:-zoho-mirror.org_management.organizations}
     depends_on:
+      # Kafka only needs to be started (the consumer reconnects); gating on its
+      # health would abort `up` during a legitimate KRaft log recovery.
       kafka:
-        condition: service_healthy
+        condition: service_started
       meilisearch:
         condition: service_healthy
     networks:
@@ -887,6 +891,10 @@ services:
     image: apache/kafka:3.9.1
     container_name: kafka
     restart: unless-stopped
+    # KRaft persists its metadata log on SIGTERM; the default 10s grace is too
+    # short and leaves an unclean log that costs ~20 min of recovery on the next
+    # boot on this VM. Wait long enough for a clean shutdown.
+    stop_grace_period: 90s
     environment:
       # Fixed cluster id so first-boot storage formatting is deterministic.
       CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
@@ -916,11 +924,18 @@ services:
       # spawns a second 1G-heap JVM next to the broker, exceeds the cgroup memory
       # limit, and the probe JVM is OOM-killed → the container never goes healthy
       # even though the broker is fine. Clamp the probe heap; give the JVM time.
-      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS='-Xmx128m -Xms64m' /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      #
+      # The generous start_period/retries matter too: single-node KRaft on this
+      # VM can legitimately spend many minutes replaying an unclean metadata log
+      # (also I/O-thrashed while images build during `./manage.sh prod`). Being
+      # marked unhealthy mid-recovery makes `depends_on: service_healthy` fail
+      # the whole up with "dependency failed to start: container kafka is
+      # unhealthy" even though the broker recovers on its own.
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS='-Xmx128m -Xms64m' timeout 25 /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 15s
-      timeout: 20s
-      retries: 12
-      start_period: 90s
+      timeout: 30s
+      retries: 40
+      start_period: 300s
     networks:
       - app-backend
     deploy:
@@ -932,8 +947,10 @@ services:
     container_name: kafbat-ui
     restart: unless-stopped
     depends_on:
+      # Started-only: the UI polls the broker and shows it as offline until the
+      # broker is ready, instead of failing `./manage.sh prod` mid-recovery.
       kafka:
-        condition: service_healthy
+        condition: service_started
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -976,8 +993,9 @@ services:
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
       ENABLE_DEBEZIUM_SCRIPTING: "false"
     depends_on:
+      # Kafka connect retries against the broker; don't block startup on health.
       kafka:
-        condition: service_healthy
+        condition: service_started
       postgres:
         condition: service_healthy
     networks:
