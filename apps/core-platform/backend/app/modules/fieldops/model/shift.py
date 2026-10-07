@@ -19,7 +19,13 @@ frozen onto the pause row as ``is_paid`` when it starts.
 Times: every business time is ``occurred_at``-derived (``clock.py``) and carries a
 ``*_received_at`` (when the server learned it) and ``*_time_basis`` (how it was derived).
 Coordinates are NEVER stored here — the start/end/pause/resume fixes are checkpoint rows
-of ``fieldops.location_pings``.
+of ``fieldops.location_pings``; the planned start/end are place/hub references
+(``RouteEndpointsMixin``, docs/fieldops/shift-templates.md).
+
+Where a shift came from is ``source``: ``scheduled`` (a manager created it, status ``scheduled``
+until the user starts it), ``template`` (materialized from the user's shift template at start) or
+``ad_hoc``. ``auto_close_at`` is computed at start and on corrections, and is what both the server's
+auto-close and the app's zombie-shift alarm use.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ from app.database.mixins import (
 )
 from app.database.soft_delete import SoftDeleteFilteredMixin
 from app.modules.comments.mixins import HasCommentsMixin
+from app.modules.fieldops.endpoints import RouteEndpointsMixin, endpoint_table_args
 from app.modules.fieldops.enums import (
     FIELDOPS_SCHEMA,
     CheckResult,
@@ -67,7 +74,9 @@ from app.modules.fieldops.enums import (
     PauseType,
     ReviewStatus,
     ShiftEndReason,
+    ShiftSource,
     ShiftStatus,
+    ShiftWorkType,
     TimeBasis,
     TravelMode,
     values,
@@ -76,7 +85,8 @@ from app.modules.fieldops.enums import (
 _LIVE = text("deleted_at IS NULL")
 
 
-class Shift(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, HasCommentsMixin, Base):
+class Shift(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, RouteEndpointsMixin, SoftDeleteFilteredMixin, HasCommentsMixin,
+            Base):
     __tablename__ = "shifts"
     __table_args__ = (
         UniqueConstraint("tenant_id", "id", name="uq_shifts_tenant_id"),
@@ -99,6 +109,17 @@ class Shift(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Ha
         CheckConstraint(f"travel_mode IS NULL OR travel_mode IN ({values(TravelMode)})",
                         name="chk_shifts_travel_mode"),
         CheckConstraint(f"start_check IN ({values(CheckResult)})", name="chk_shifts_start_check"),
+        CheckConstraint(f"end_check IN ({values(CheckResult)})", name="chk_shifts_end_check"),
+        CheckConstraint(f"work_type IS NULL OR work_type IN ({values(ShiftWorkType)})", name="chk_shifts_work_type"),
+        CheckConstraint(f"source IN ({values(ShiftSource)})", name="chk_shifts_source"),
+        CheckConstraint("status <> 'scheduled' OR (planned_start_at IS NOT NULL AND planned_end_at IS NOT NULL "
+                        "AND planned_end_at > planned_start_at)", name="chk_shifts_scheduled_window"),
+        ForeignKeyConstraint(["tenant_id", "template_id"], [f"{FIELDOPS_SCHEMA}.shift_templates.tenant_id",
+                                                            f"{FIELDOPS_SCHEMA}.shift_templates.id"],
+                             name="fk_shifts_template", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["tenant_id", "hub_id"], ["hubs.tenant_id", "hubs.id"],
+                             name="fk_shifts_hub", ondelete="RESTRICT"),
+        *endpoint_table_args("shifts"),
         CheckConstraint("ended_at IS NULL OR started_at IS NULL OR ended_at >= started_at",
                         name="chk_shifts_end_after_start"),
         CheckConstraint("status NOT IN ('active','paused') OR (started_at IS NOT NULL AND ended_at IS NULL)",
@@ -118,12 +139,20 @@ class Shift(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Ha
               postgresql_where=text("review_status = 'pending' AND deleted_at IS NULL")),
         Index("ix_shifts_open", "last_activity_at",
               postgresql_where=text("status IN ('active','paused') AND deleted_at IS NULL")),
+        Index("ix_shifts_auto_close", "auto_close_at",
+              postgresql_where=text("status IN ('active','paused') AND deleted_at IS NULL")),
+        Index("ix_shifts_scheduled", "tenant_id", "user_id", "planned_start_at",
+              postgresql_where=text("status = 'scheduled' AND deleted_at IS NULL")),
+        Index("uq_shifts_code_live", "tenant_id", "shift_code", unique=True,
+              postgresql_where=text("shift_code IS NOT NULL AND deleted_at IS NULL")),
+        Index("ix_shifts_hub_date", "tenant_id", "hub_id", "shift_date",
+              postgresql_where=text("hub_id IS NOT NULL AND deleted_at IS NULL")),
         {"schema": FIELDOPS_SCHEMA, "comment": "Work sessions; at most one open (active|paused) per user."},
     )
 
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     device_id: Mapped[int | None] = mapped_column(BigInteger, comment="The device the shift is bound to")
-    policy_id: Mapped[int | None] = mapped_column(BigInteger, comment="work_policies.id resolved at start (no FK)")
+    policy_id: Mapped[int | None] = mapped_column(BigInteger, comment="Most specific policy_layers.id at start (no FK)")
     policy_snapshot: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
         comment="The effective policy values frozen at start — old shifts are judged by the rules then in force",
@@ -133,6 +162,19 @@ class Shift(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Ha
     )
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=ShiftStatus.ACTIVE.value,
                                         server_default=text("'active'"), index=True)
+    shift_code: Mapped[str | None] = mapped_column(String(32), comment="Human reference SH-YYYYMMDD-NNNN (per tenant)")
+    title: Mapped[str | None] = mapped_column(String(200))
+    work_type: Mapped[str | None] = mapped_column(String(20), comment="delivery | collection | return | exchange | other")
+    source: Mapped[str] = mapped_column(String(12), nullable=False, default=ShiftSource.AD_HOC.value,
+                                        server_default=text("'ad_hoc'"), comment="scheduled | template | ad_hoc")
+    template_id: Mapped[int | None] = mapped_column(BigInteger, comment="fieldops.shift_templates.id it came from")
+    template_snapshot: Mapped[dict | None] = mapped_column(JSONB, comment="The template's values when used")
+    hub_id: Mapped[int | None] = mapped_column(Integer, comment="The user's hub for shift_date, frozen")
+    assigned_by: Mapped[int | None] = mapped_column(BigInteger, comment="users.id who scheduled it")
+    auto_close_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        comment="min(planned end + overtime, start + max hours) + grace — when auto-close will end it",
+    )
     review_status: Mapped[str] = mapped_column(String(20), nullable=False, default=ReviewStatus.NOT_REQUIRED.value,
                                                server_default=text("'not_required'"))
 
@@ -148,8 +190,14 @@ class Shift(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Ha
     )
     start_check: Mapped[str] = mapped_column(
         String(20), nullable=False, default=CheckResult.NOT_CONFIGURED.value,
-        server_default=text("'not_configured'"), comment="Start-place check (policy.require_start_at_place_id)",
+        server_default=text("'not_configured'"), comment="Start-place check (the resolved start endpoint)",
     )
+    start_distance_m: Mapped[Decimal | None] = mapped_column(Numeric(10, 1), comment="Headline of the start check")
+    end_check: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=CheckResult.NOT_CONFIGURED.value,
+        server_default=text("'not_configured'"), comment="End-place check (never blocks)",
+    )
+    end_distance_m: Mapped[Decimal | None] = mapped_column(Numeric(10, 1))
     start_manual_location_reason: Mapped[str | None] = mapped_column(Text)
     start_selfie_media_uuid: Mapped[uuid_lib.UUID | None] = mapped_column(PgUUID(as_uuid=True))
 

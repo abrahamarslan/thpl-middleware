@@ -23,13 +23,13 @@ import datetime as dt
 import uuid as uuid_lib
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Header, Query, Request
+from fastapi.responses import JSONResponse, Response
 
 from app.common.client_info import ClientInfoDep
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
-from app.modules.fieldops import crud, jobs
+from app.modules.fieldops import cards, crud, jobs
 from app.modules.fieldops.clock import business_date
 from app.modules.fieldops.deps import DeviceClock, IdempotencyKeyDep, request_id
 from app.modules.fieldops.enums import Channel
@@ -43,11 +43,13 @@ from app.modules.fieldops.schema import (
     DeviceRegisterIn,
     DeviceSessionOut,
     EffectivePolicyOut,
+    MyShiftDetailOut,
     ParticipantOut,
     PauseOut,
     PingBatchIn,
     PingBatchResultOut,
     ShiftEndIn,
+    ShiftHandoverIn,
     ShiftOut,
     ShiftPauseIn,
     ShiftResumeIn,
@@ -62,8 +64,18 @@ from app.modules.fieldops.schema import (
     VisitOut,
     VisitSlim,
     VisitStartIn,
+    VisitStartPlannedIn,
 )
-from app.modules.fieldops.service import devices, ingest, policy, shifts, tasks, visits
+from app.modules.fieldops.service import (  # noqa: F401 — session_rules / consent_hooks register on import
+    consent_hooks,
+    devices,
+    ingest,
+    policy,
+    session_rules,
+    shifts,
+    tasks,
+    visits,
+)
 from app.modules.fieldops.service.common import org_timezone
 from app.modules.fieldops.service.context import Act
 from app.modules.idempotency import service as idempotency
@@ -111,22 +123,48 @@ async def device_events(user: FieldWorker, db: DBSession, send: DeviceClock, bod
 
 @router.get("/fieldops/policy", response_model=ResponseModel[EffectivePolicyOut])
 async def my_policy(user: FieldWorker, db: DBSession, grants: GrantsDep):
-    """The work policy that applies to me, plus what my role may do (e.g. telephonic visits)."""
+    """The policy that applies to me (every flat value), plus what my role may do (e.g. telephonic visits)."""
     effective = await policy.resolve_policy(db, user)
     return ResponseModel(data=EffectivePolicyOut(
         policy_id=effective.policy_id, policy_uuid=effective.policy_uuid, values=effective.snapshot(),
-        can_telephonic=await grants.allows(db, TELEPHONIC),
+        can_telephonic=await grants.allows(db, TELEPHONIC), layers=effective.layer_uuids, epoch=effective.epoch,
     ))
+
+
+@router.get("/fieldops/config", response_model=ResponseModel[dict],
+            responses={304: {"description": "Not modified (If-None-Match matched the ETag)"}})
+async def my_config(user: FieldWorker, db: DBSession,
+                    if_none_match: Annotated[str | None, Header(alias="If-None-Match")] = None):
+    """The field app's configuration (Android ``LocationConfig`` schema v5), resolved from the policy
+    layers for me — and, during a shift, its hub/beat, with the shift's frozen obligations.
+
+    ``config_version`` never decreases: apply a config when ``config_version >= applied`` and the ETag
+    differs. Send ``If-None-Match`` on refresh: an unchanged config is a bodyless ``304``."""
+    from app.modules.fieldops.policy.render import etag
+
+    body, meta = await policy.client_config(db, user)
+    tag = etag(body)
+    headers = {"ETag": tag, "Cache-Control": "private, max-age=0, must-revalidate"}
+    if if_none_match and if_none_match.strip() == tag:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=ResponseModel(data=body, meta=meta).model_dump(mode="json"), headers=headers)
 
 
 @router.get("/fieldops/current", response_model=ResponseModel[CurrentOut])
 async def my_current(user: FieldWorker, db: DBSession):
     """My open shift, its open pause and my in-progress visit — the app's resume call after a restart."""
+    from app.modules.compliance.consents import live
+
     shift, pause, visit = await crud.current_of(db, user.id)
+    location = await live(db, user.id, "location_tracking")
+    effective = await policy.resolve_policy(db, user, shift=shift)
     return ResponseModel(data=CurrentOut(
-        shift=ShiftOut.model_validate(shift) if shift else None,
+        shift=await cards.shift_detail(db, shift) if shift else None,
         open_pause=PauseOut.model_validate(pause) if pause else None,
         visit=VisitOut.model_validate(visit) if visit else None,
+        consent={"location_tracking": {"given": bool(location),
+                                       "version": location[0].consent_text_version if location else None,
+                                       "required": bool(effective.require_location_consent)}},
     ))
 
 
@@ -140,7 +178,7 @@ async def start_shift(user: FieldWorker, db: DBSession, send: DeviceClock, key: 
     async def handler():
         device_id = await _device_id(db, user, send)
         shift, created = await shifts.start_shift(db, _act(user, send, request, key), body, device_id=device_id)
-        return ResponseModel(data=ShiftOut.model_validate(shift),
+        return ResponseModel(data=await cards.shift_detail(db, shift),
                              msg="Shift started" if created else "Shift already started"), 201 if created else 200
 
     return await idempotency.run(db, user=user, key=key, route="POST /me/shifts",
@@ -150,9 +188,42 @@ async def start_shift(user: FieldWorker, db: DBSession, send: DeviceClock, key: 
 
 @router.get("/shifts", response_model=ResponseModel[list[ShiftSlim]])
 async def my_shifts(user: FieldWorker, db: DBSession, date_from: dt.date | None = None, date_to: dt.date | None = None,
-                    limit: int = Query(31, ge=1, le=366)):
-    rows = await crud.my_shifts(db, user.id, date_from=date_from, date_to=date_to, limit=limit)
-    return ResponseModel(data=[ShiftSlim.model_validate(r) for r in rows])
+                    status: str | None = None, upcoming: bool = False, limit: int = Query(31, ge=1, le=366)):
+    """My shifts — open first, then scheduled (by planned start), then history (newest first).
+
+    Each item carries the plan: ``title``, ``work_type``, planned window, ``start_location`` /
+    ``end_location`` (mode, name, address, coordinates, fence radius, enforcement), the ``hub``,
+    the ``template`` and the stop counts. With no date filter (or ``upcoming=true``), today's (and,
+    within 12 h, tomorrow's) occurrence of my SHIFT TEMPLATE is included as a VIRTUAL entry with
+    ``uuid: null`` and ``source: template`` — start it with a new uuid."""
+    rows = await crud.my_shifts(db, user.id, date_from=date_from, date_to=date_to, limit=limit, status=status,
+                                upcoming=upcoming)
+    items = await cards.shift_cards(db, rows)
+    if upcoming or (date_from is None and date_to is None and status is None):
+        items = await shifts.virtual_entries(db, user) + items
+    return ResponseModel(data=items)
+
+
+@router.get("/shifts/{shift_uuid}", response_model=ResponseModel[MyShiftDetailOut])
+async def my_shift(shift_uuid: uuid_lib.UUID, user: FieldWorker, db: DBSession):
+    """One of my shifts with its captured start/end, its stops (planned visits, in order) and the FENCE PACK:
+    circles to register with Android's GeofencingClient (``requestId = fence_id``; ≤ 100)."""
+    from app.modules.fieldops.service.common import own_shift
+
+    shift = await own_shift(db, user, shift_uuid)
+    detail = await cards.shift_detail(db, shift)
+    stops, fences = await cards.stops_and_fences(db, shift, detail)
+    return ResponseModel(data=MyShiftDetailOut(shift=detail, stops=stops, fences=fences))
+
+
+@router.post("/shifts/{shift_uuid}/handover", response_model=ResponseModel[ShiftOut])
+async def handover_shift(shift_uuid: uuid_lib.UUID, user: FieldWorker, db: DBSession, send: DeviceClock,
+                         request: Request, body: ShiftHandoverIn | None = None):
+    """Move my OPEN shift to this device (I signed in on a new phone): fixes from here stop being
+    ``foreign_device``. Needs ``X-Device-Session`` of a registered device."""
+    device_id = await _device_id(db, user, send)
+    shift = await shifts.handover(db, _act(user, send, request, None), shift_uuid, device_id=device_id)
+    return ResponseModel(data=await cards.shift_detail(db, shift), msg="Shift moved to this device")
 
 
 @router.post("/shifts/{shift_uuid}/pause", response_model=ResponseModel[PauseOut], status_code=201)
@@ -188,7 +259,7 @@ async def end_shift(shift_uuid: uuid_lib.UUID, user: FieldWorker, db: DBSession,
     async def handler():
         shift = await shifts.end_shift(db, _act(user, send, request, key), shift_uuid, body)
         jobs.enqueue(jobs.COMPUTE_METRICS, shift.id)
-        return ResponseModel(data=ShiftOut.model_validate(shift), msg="Shift ended")
+        return ResponseModel(data=await cards.shift_detail(db, shift), msg="Shift ended")
 
     return await idempotency.run(db, user=user, key=key, route="POST /me/shifts/{uuid}/end",
                                  payload={"shift": str(shift_uuid), **body.model_dump(mode="json")},
@@ -212,6 +283,25 @@ async def start_visit(user: FieldWorker, db: DBSession, grants: GrantsDep, send:
                              msg="Visit started" if created else "Visit already started"), 201 if created else 200
 
     return await idempotency.run(db, user=user, key=key, route="POST /me/visits",
+                                 payload=body.model_dump(mode="json"), status_code=201, handler=handler,
+                                 entity_type="visit")
+
+
+@router.post("/visits/{visit_uuid}/start", response_model=ResponseModel[VisitOut], status_code=201)
+async def start_planned_visit(visit_uuid: uuid_lib.UUID, user: FieldWorker, db: DBSession, send: DeviceClock,
+                              key: IdempotencyKeyDep, request: Request, body: VisitStartPlannedIn) -> JSONResponse:
+    """Start a PLANNED visit — a stop of my shift ("Start Delivery"). The ``fix`` is the proof-of-presence
+    capture (send the high-accuracy one-shot); verification and enforcement are those of any visit start.
+    201 started · 200 replay · 409 ``visit_not_planned`` / ``shift_not_active`` / ``visit_in_progress`` ·
+    422 ``justification_required`` / ``outside_geofence`` / ``mock_location_rejected``."""
+    async def handler():
+        device_id = await _device_id(db, user, send)
+        visit, created = await visits.start_planned(db, _act(user, send, request, key), visit_uuid, body,
+                                                    device_id=device_id)
+        return ResponseModel(data=VisitOut.model_validate(visit),
+                             msg="Visit started" if created else "Visit already started"), 201 if created else 200
+
+    return await idempotency.run(db, user=user, key=key, route="POST /me/visits/{uuid}/start",
                                  payload=body.model_dump(mode="json"), status_code=201, handler=handler,
                                  entity_type="visit")
 
@@ -286,11 +376,12 @@ async def void_task(task_uuid: uuid_lib.UUID, user: FieldWorker, db: DBSession, 
 # ── the stream ──────────────────────────────────────────────────────────────────
 
 @router.post("/location-pings", response_model=ResponseModel[PingBatchResultOut])
-async def upload_pings(user: FieldWorker, db: DBSession, send: DeviceClock, body: PingBatchIn):
+async def upload_pings(user: FieldWorker, db: DBSession, send: DeviceClock, body: PingBatchIn, request: Request):
     """Flush the offline queue: up to 500 fixes. ALWAYS 200 with per-item results: drop ``accepted``
     and ``duplicate`` items locally, drop ``rejected`` ones too (they cannot be fixed by retrying)."""
     session = await devices.resolve_session(db, user, send.session_uuid)
-    result = await ingest.ingest_batch(db, user, send, body, session=session)
+    result = await ingest.ingest_batch(db, user, send, body, session=session,
+                                       not_after=getattr(request.state, "session_drain_not_after", None))
     return ResponseModel(data=result)
 
 

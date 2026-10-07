@@ -7,6 +7,7 @@
 Shift lifecycle::
 
     scheduled ─start─▶ active ⇄ paused ─end─▶ completed
+       │ └─(planned end + grace passed)─▶ missed
        │                 │   └─────────auto_close / supersede─▶ auto_closed
        └─cancel─┐        └─cancel (no visits)─┐
                 ▼                             ▼
@@ -42,12 +43,13 @@ _R = ReviewStatus
 
 SHIFT_LIFECYCLE: dict[str | None, frozenset[str]] = {
     None: frozenset({_S.SCHEDULED.value, _S.ACTIVE.value}),
-    _S.SCHEDULED.value: frozenset({_S.ACTIVE.value, _S.CANCELLED.value}),
+    _S.SCHEDULED.value: frozenset({_S.ACTIVE.value, _S.CANCELLED.value, _S.MISSED.value}),
     _S.ACTIVE.value: frozenset({_S.PAUSED.value, _S.COMPLETED.value, _S.AUTO_CLOSED.value, _S.CANCELLED.value}),
     _S.PAUSED.value: frozenset({_S.ACTIVE.value, _S.COMPLETED.value, _S.AUTO_CLOSED.value, _S.CANCELLED.value}),
     _S.COMPLETED.value: frozenset(),
     _S.AUTO_CLOSED.value: frozenset(),
     _S.CANCELLED.value: frozenset(),
+    _S.MISSED.value: frozenset(),
 }
 
 VISIT_LIFECYCLE: dict[str | None, frozenset[str]] = {

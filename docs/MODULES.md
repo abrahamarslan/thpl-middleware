@@ -434,17 +434,42 @@ and rationale: [spec](fieldops/implementation-of-shift-visits-system.md),
   shift, one in-progress visit per user. Closing a shift closes its pause and cancels its
   stuck visits in the same transaction; auto-close never invents a long shift (a ghost closes
   at 0 minutes and is flagged).
-- **Obligations vs permissions:** `fieldops.work_policies` (per organization × base role) says
-  what a worker MUST do; RBAC says what they MAY — `fieldops.field_work:use` (member),
-  `fieldops.telephonic_visit:create` (granted per organization role), review/read codes for
-  managers. Manager reads are narrowed to their teams and reports (`scope.py`).
+- **Obligations vs permissions:** **policy layers** (`fieldops.policy_layers`, migration
+  `b7e4c1a9d3f2`; [policy-layers.md](fieldops/policy-layers.md)) say what a worker MUST do and how
+  the field app behaves — sparse settings targeted at an organization (its subtree's fallback),
+  role, team, hub, user (beat reserved), merged per setting, with locks; the same engine carries the
+  Android config (`GET /api/me/fieldops/config`) and the single-session rule. RBAC says what they
+  MAY — `fieldops.field_work:use` (member), `fieldops.telephonic_visit:create`, review/read and
+  planning codes for managers. Manager reads are narrowed to their teams and reports (`scope.py`).
+- **Planned work** (migration `c3d9a7e2f415`; [shift-templates.md](fieldops/shift-templates.md)):
+  shift templates (assigned by the setting `shift.template`, materialized when the user starts),
+  manager-scheduled shifts with stops (planned visits), route endpoints (start/end: anywhere / hub /
+  assigned hub / place, with optional geofence enforcement), the user's hub of the day
+  (`user_hub_assignments`), `auto_close_at`, status `missed`. Android wire contract:
+  [android-contract.md](fieldops/android-contract.md).
 - **Geofencing** is accuracy-aware and advisory by default; soft/hard blocking never refuses a
   start that already happened offline. Everything estimated or suspicious opens an idempotent
   **anomaly** and puts the shift/visit in the review queue.
 - **Offline safety:** client UUIDv7s make creates replay-safe; `X-Idempotency-Key` replays
   transitions from `core.idempotency_keys` (`app/modules/idempotency/`, platform-wide).
-- Background work in `app/tasks/fieldops.py` (auto-close, orphan linking, metrics, checkpoint
-  geocoding, missed visits, partitions/retention).
+- Background work in `app/tasks/fieldops.py` (auto-close + missed shifts, silent-tracking
+  detector, orphan linking, metrics, checkpoint geocoding, missed visits, partitions/retention).
+
+## Sign-in sessions — `app/modules/users/sessions.py` (schema `auth`, migration `20261006_1700_d81f4b6e2c90`)
+
+Every first-party sign-in is an `auth.user_sessions` row; tokens carry its uuid as `sid` and every
+request checks it, so logout, refresh-token reuse, password changes and the field app's
+single-session rule (policy setting `session.field`) revoke tokens at the next request
+(`401 session_revoked`). Reference: [auth/sessions.md](auth/sessions.md).
+
+## Consent and privacy
+
+- `/api/me/consents` (`app/modules/compliance/consents.py`) — DPDP consent give / withdraw;
+  withdrawing `location_tracking` ends the open shift. [compliance/consents.md](compliance/consents.md)
+- Privacy settings (`users.application_settings.privacy`) — `profile_visibility` everyone · team ·
+  managers · private, `contact_visibility` everyone · team · hidden — enforced in the user directory
+  (`app/modules/users/visibility.py`); `GET /api/me/settings/options`.
+  [users/privacy-settings.md](users/privacy-settings.md)
 
 ## Circuit breaker — upgraded
 

@@ -18,7 +18,8 @@ MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 UNGUARDED = [
     (r"^/api/auth/(register|login|login-otp/request|login-otp/verify|refresh|forgot-password|reset-password|dev-token)$",
      "authentication entry points (nobody is signed in yet)"),
-    (r"^/api/auth/(logout|change-password)$", "acts on the caller's own session and credentials"),
+    (r"^/api/auth/(logout|logout-all|change-password)$", "acts on the caller's own session and credentials"),
+    (r"^/api/auth/sessions(/.*)?$", "the caller's own sign-in sessions (service filters by user)"),
     (r"^/api/(auth/)?me(/.*)?$", "self-service: acts on the caller's own record"),
     (r"^/api/favorites(/.*)?$", "a user's own favourites"),
     (r"^/api/emails/webhooks/resend$", "provider webhook, verified by signature"),
@@ -32,7 +33,8 @@ RESOURCE_PREFIXES = (
     "/api/roles/{", "/api/organizations/{", "/api/users/{user_id}", "/api/hr/employment/{",
     "/api/locations/{", "/api/addresses/{", "/api/geofences/{", "/api/brands/{", "/api/manufacturers/{",
     "/api/hubs/{", "/api/vehicles/{", "/api/fleet-partners/{", "/api/currencies/{", "/api/documents/{",
-    "/api/fieldops/shifts/{", "/api/fieldops/visits/{", "/api/fieldops/anomalies/{", "/api/fieldops/policies/{",
+    "/api/fieldops/shifts/{", "/api/fieldops/visits/{", "/api/fieldops/anomalies/{", "/api/fieldops/policy-layers/{",
+    "/api/fieldops/shift-templates/{",
 )
 #: Handled by the service's own guardrails (escalation, level, last owner), not by a row target.
 NO_TARGET_NEEDED = re.compile(r"^/api/users/\{user_id\}/(roles|base-role)")
@@ -43,7 +45,9 @@ GATED_READS = ("/api/users", "/api/activity", "/api/emails", "/api/hr/employment
                # Field data: people's shifts, visits, tracks and live positions.
                "/api/fieldops/shifts", "/api/fieldops/shifts/{ref}", "/api/fieldops/shifts/{ref}/track",
                "/api/fieldops/visits", "/api/fieldops/visits/{ref}", "/api/fieldops/live",
-               "/api/fieldops/anomalies", "/api/fieldops/review-queue", "/api/fieldops/policies")
+               "/api/fieldops/anomalies", "/api/fieldops/review-queue", "/api/fieldops/policy-layers",
+               "/api/fieldops/policy-settings", "/api/fieldops/policies/resolve", "/api/fieldops/shift-templates",
+               "/api/hubs/assignments")
 
 
 def _walk(routes, prefix=""):

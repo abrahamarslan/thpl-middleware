@@ -69,14 +69,16 @@ async def register(db: AsyncSession, user: Any, body: DeviceRegisterIn) -> tuple
     device.app_id = body.app_id or device.app_id
     device.push_token = body.push_token or device.push_token
     device.last_seen_at = now
+    # Demote the user's other primary device BEFORE this one becomes primary: uq_devices_one_primary allows
+    # one per user, so flushing first made a user's SECOND phone (a new handset, a sign-in on device B) a 409.
+    demote = (update(Device.__table__)
+              .where(Device.__table__.c.tenant_id == user.tenant_id, Device.__table__.c.user_id == user.id,
+                     Device.__table__.c.is_primary.is_(True)))
+    if device.id is not None:
+        demote = demote.where(Device.__table__.c.id != device.id)
+    await db.execute(demote.values(is_primary=False))
     device.is_primary = True
     await db.flush()
-    await db.execute(
-        update(Device.__table__)
-        .where(Device.__table__.c.tenant_id == device.tenant_id, Device.__table__.c.user_id == user.id,
-               Device.__table__.c.id != device.id, Device.__table__.c.is_primary.is_(True))
-        .values(is_primary=False)
-    )
 
     fields = body.session.model_dump(exclude={"uuid"})
     fields["location_permission"] = (body.session.location_permission.value

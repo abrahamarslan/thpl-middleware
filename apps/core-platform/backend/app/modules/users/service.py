@@ -42,6 +42,9 @@ from app.modules.users.schema import (
     UserSettings,
     UserSettingsUpdate,
     UserUpdate,
+    ChannelOption,
+    SettingOption,
+    SettingsOptionsOut,
 )
 from app.modules.users.security import hash_password, verify_password
 from app.modules.users.tokens import issue_token_pair
@@ -235,7 +238,12 @@ async def login(
         raise AuthError("Invalid credentials")
 
     try:
-        tokens = issue_token_pair(user)
+        from app.modules.users import sessions
+
+        device_label = " · ".join(p for p in (body.device_type, body.device_id) if p) or None
+        tokens = await sessions.start(
+            db, user, client=client, client_type=sessions.client_type_of(body.client_type, body.device_type),
+            installation_id=body.installation_id, device_label=device_label)
     except Exception as exc:  # noqa: BLE001
         await audit(
             db, Event.LOGIN_FAILURE, user=user, status="failure",
@@ -290,7 +298,11 @@ async def refresh_tokens(
             description="user no longer active", client=client, commit=True,
         )
         raise AuthError("User no longer active")
-    tokens = issue_token_pair(user)
+    from app.modules.users import sessions
+
+    # A session-bound refresh token is ROTATED (reuse of the previous one revokes the session);
+    # a legacy token (no sid) gets a session-less pair as before.
+    tokens = await sessions.refresh(db, payload, user) or issue_token_pair(user)
     await audit(db, Event.TOKEN_REFRESH, user=user, client=client)
     await audit(
         db, Event.TOKEN_ISSUED, user=user, client=client,
@@ -318,6 +330,11 @@ async def change_password(
     user.last_password_change_at = datetime.now(UTC)
     await db.flush()
     await audit(db, Event.PASSWORD_CHANGED, user=user, client=client, context={"method": "self"})
+    # A changed password ends every OTHER session (this one, which proved the old password, stays).
+    from app.modules.users import sessions
+
+    await sessions.revoke_all(db, user.id, reason="password_changed",
+                              except_sid=(sessions.current_claims() or {}).get("sid"))
 
     # Mirror the new password into Authentik (best-effort; plaintext in scope).
     await authentik_sync.sync_set_password(db, user, new_password)
@@ -469,15 +486,28 @@ async def user_out(db: AsyncSession, user: User) -> UserOut:
     return (await user_outs(db, [user]))[0]
 
 
-async def user_public_outs(db: AsyncSession, users: list[User]) -> list[UserPublicOut]:
-    """The directory view (id, name, avatar) — what a colleague may see. Avatars resolved in one query."""
+async def user_public_outs(db: AsyncSession, users: list[User], *, viewer: User | None = None,
+                           admin: bool = False) -> list[UserPublicOut]:
+    """The directory view — what a colleague may see, by each person's PRIVACY settings
+    (``users/visibility.py``): profile details (avatar, username, designation, department) when the profile is
+    visible to ``viewer``, email/phone when contact info is. Avatars in one query, audiences in ≤ 2."""
     from app.modules.media import service as media_service
+    from app.modules.users import visibility
 
     urls = await media_service.avatar_urls_for_users(db, [u.id for u in users])
+    audience = await visibility.audiences(db, viewer, [u.id for u in users], admin=admin) if viewer else {}
     outs: list[UserPublicOut] = []
     for user in users:
-        out = UserPublicOut.model_validate(user)
-        out.avatar_urls = urls.get(user.id)
+        aud = audience.get(user.id, {"tenant"})
+        profile, contact = visibility.privacy_of(user)
+        out = UserPublicOut(id=user.id, name=user.name, first_name=user.first_name, last_name=user.last_name)
+        if visibility.can_view_profile(profile, aud):
+            out.username, out.designation, out.department = user.username, user.designation, user.department
+            out.avatar_urls = urls.get(user.id)
+        else:
+            out.restricted = True
+        if visibility.can_view_contact(contact, aud):
+            out.email, out.phone = user.email, user.phone
         outs.append(out)
     return outs
 
@@ -632,15 +662,21 @@ async def restore_user(db: AsyncSession, user_id: int) -> User:
     return user
 
 
-async def logout(db: AsyncSession, user: User, *, client: ClientInfo | None = None) -> None:
-    """Close the session (client drops its tokens) and audit the event.
+async def logout(db: AsyncSession, user: User, *, client: ClientInfo | None = None,
+                 claims: dict | None = None, everywhere: bool = False) -> int:
+    """Revoke this token's session (``everywhere``: every session of the user) and audit it. The token
+    stops working at its next request (``401 session_revoked``). Returns the sessions revoked."""
+    from app.modules.users import sessions
 
-    Tokens are stateless JWTs; this marks the in-app presence flag and records
-    ``auth.logout``. See the audit plan doc for server-side token revocation.
-    """
+    if everywhere:
+        revoked = await sessions.revoke_all(db, user.id, reason="logout_all")
+    else:
+        revoked = int(await sessions.revoke_current(db, claims, reason="logout"))
     user.has_active_session = False
     await db.flush()
-    await audit(db, Event.LOGOUT, user=user, client=client)
+    await audit(db, Event.LOGOUT, user=user, client=client, context={"sessions_revoked": revoked,
+                                                                       "everywhere": everywhere})
+    return revoked
 
 
 # ── Location telemetry ────────────────────────────────────────────────────────
@@ -959,11 +995,15 @@ _SETTINGS_SECTIONS = {"privacy", "appearance", "notifications"}
 
 
 def _settings_snapshot(user: User) -> UserSettings:
-    """Parse stored settings, falling back to defaults for out-of-band/invalid JSON."""
+    """Parse stored settings (legacy privacy values normalized), falling back to defaults for invalid JSON.
+    ``security`` is derived from the user, never stored."""
     try:
-        return UserSettings.model_validate(user.application_settings or {})
+        snapshot = UserSettings.model_validate({k: v for k, v in (user.application_settings or {}).items()
+                                                if k != "security"})
     except ValidationError:
-        return UserSettings()
+        snapshot = UserSettings()
+    snapshot.security.two_factor_enabled = user.two_factor_confirmed_at is not None
+    return snapshot
 
 
 def _deep_merge(base: dict, patch: dict) -> None:
@@ -989,15 +1029,46 @@ async def update_my_settings(
     features may have stored are preserved.
     """
     stored = dict(user.application_settings or {})
-    merged = _settings_snapshot(user).model_dump()
-    merged.update({k: v for k, v in stored.items() if k not in _SETTINGS_SECTIONS})
+    merged = _settings_snapshot(user).stored()
+    merged.update({k: v for k, v in stored.items() if k not in _SETTINGS_SECTIONS and k != "security"})
     _deep_merge(merged, body.model_dump(exclude_unset=True, exclude_none=True))
+    merged["privacy"] = UserSettings.model_validate({"privacy": merged["privacy"]}).stored()["privacy"]
 
     await update_user(
         db, user.id, UserUpdate(application_settings=merged),
         updated_by=user.id, actor_label=user.email, client=client,
     )
-    return UserSettings.model_validate(merged)
+    result = UserSettings.model_validate({k: v for k, v in merged.items() if k in _SETTINGS_SECTIONS})
+    result.security.two_factor_enabled = user.two_factor_confirmed_at is not None
+    return result
+
+
+def settings_options() -> SettingsOptionsOut:
+    """Every value the settings accept, with English labels (clients map by ``value``). Channel availability
+    is the deployment's: e-mail goes through Resend; push, SMS and Slack delivery are not built yet — the
+    preference is stored and honoured once they are."""
+    from app.core.conf import settings as conf
+
+    def opts(pairs):
+        return [SettingOption(value=v, label=label) for v, label in pairs]
+
+    return SettingsOptionsOut(
+        profile_visibility=opts([("everyone", "Everyone"), ("team", "My Team"), ("managers", "Managers"),
+                                 ("private", "Private")]),
+        profile_visibility_default="everyone",
+        contact_visibility=opts([("everyone", "Everyone"), ("team", "Team"), ("hidden", "Hidden")]),
+        contact_visibility_default="hidden",
+        notification_channels=[
+            ChannelOption(key="email", label="Email", available=bool(conf.RESEND_API_KEY) or conf.DEBUG,
+                          reason=None if (conf.RESEND_API_KEY or conf.DEBUG) else "not_configured"),
+            ChannelOption(key="push", label="Push", available=False, reason="not_configured_for_organization"),
+            ChannelOption(key="sms", label="SMS", available=False, reason="not_configured_for_organization"),
+            ChannelOption(key="slack", label="Slack", available=False, reason="not_configured_for_organization"),
+            ChannelOption(key="in_app", label="In-app", available=True, locked=True),
+        ],
+        themes=opts([("light", "Light"), ("dark", "Dark"), ("system", "System")]),
+        two_factor_supported=False,
+    )
 
 
 # ── Reference Data Caching (L1 In-Memory + L2 Redis DB 0) ────────────────────

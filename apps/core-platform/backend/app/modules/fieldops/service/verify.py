@@ -74,9 +74,16 @@ class Verdict:
 
 
 async def resolve_target(db: AsyncSession, *, place_id: int | None, at: dt.datetime,
-                         policy: EffectivePolicy) -> Target:
+                         policy: EffectivePolicy, radius_m: float | None = None, trusted: bool = False) -> Target:
+    """``radius_m`` (a planned endpoint's explicit radius) → a circle around the place, fence or not.
+    ``trusted`` (a place a manager pinned as a shift endpoint) → the policy radius even when the place's
+    coordinates are not field-verified: the manager vouched for them."""
     if place_id is None:
         return Target(TargetKind.NONE)
+    if radius_m is not None:
+        has_point = await db.scalar(text("SELECT coordinates IS NOT NULL FROM geo.places WHERE id = :p"),
+                                    {"p": place_id})
+        return Target(TargetKind.PLACE_DEFAULT, place_id=place_id, radius_m=float(radius_m)) if has_point             else Target(TargetKind.NONE, place_id=place_id)
     fence = (await db.execute(text("""
         SELECT id, (boundary IS NOT NULL) AS is_polygon, radius_m, visit_enforcement, dwell_threshold_s
           FROM geo.geofences
@@ -97,7 +104,8 @@ async def resolve_target(db: AsyncSession, *, place_id: int | None, at: dt.datet
     ), {"place": place_id})).first()
     if place is None or not place.has_point:
         return Target(TargetKind.NONE, place_id=place_id)
-    radius = target_radius(place.verification_status, base_m=policy.number("default_visit_radius_m"),
+    radius = target_radius("field_verified" if trusted else place.verification_status,
+                           base_m=policy.number("default_visit_radius_m"),
                            geocoded_factor=policy.number("geocoded_radius_factor"))
     if radius is None:
         return Target(TargetKind.NONE, place_id=place_id, place_verification=place.verification_status)
@@ -159,10 +167,13 @@ async def evaluate(
     offline: bool = False,
     justified: bool = False,
     enforce: bool = True,
+    enforcement: str | None = None,
+    radius_m: float | None = None,
+    trusted: bool = False,
 ) -> Verdict:
     """Verify ``subject`` at ``at`` and append a ``location_checks`` row. ``enforce=False`` records the
     verdict without applying the enforcement mode (visit END, shift start-place checks)."""
-    target = await resolve_target(db, place_id=place_id, at=at, policy=policy)
+    target = await resolve_target(db, place_id=place_id, at=at, policy=policy, radius_m=radius_m, trusted=trusted)
     fix = None
     if channel == "field" and target.configured:
         fix = await _best_fix(db, tenant_id=subject.tenant_id, user_id=user_id, at=at, target=target)
@@ -176,7 +187,7 @@ async def evaluate(
     else:
         result = classify(distance, target.radius_m if target.configured else None, accuracy, channel=channel,
                           max_accuracy_m=max_accuracy)
-    mode = Enforcement(target.enforcement_override or policy.geofence_enforcement)
+    mode = Enforcement(enforcement or target.enforcement_override or policy.geofence_enforcement)
     decision = decide(result, mode, offline=offline, justified=justified) if enforce \
         else Decision(CheckAction.RECORDED)
     check = LocationCheck(

@@ -205,8 +205,9 @@ async def test_visits_need_a_shift_and_only_one_runs_at_a_time(worlds, db):
 
 async def test_soft_block_needs_a_justification_and_records_why(worlds, db):
     client, acme, _ = worlds
-    created = await client.post("/api/fieldops/policies", headers=acme.auth(acme.admin),
-                                json={"name": "ACME default", "geofence_enforcement": "soft_block"})
+    created = await client.post("/api/fieldops/policy-layers", headers=acme.auth(acme.admin),
+                                json={"name": "ACME default",
+                                      "settings": {"geofence.rules": {"geofence_enforcement": "soft_block"}}})
     assert created.status_code == 201, created.text
     await consent(db, acme, acme.member)
     shop = await place(db, acme)
@@ -231,8 +232,9 @@ async def test_soft_block_needs_a_justification_and_records_why(worlds, db):
 
 async def test_an_offline_start_is_never_blocked_even_under_hard_block(worlds, db):
     client, acme, _ = worlds
-    await client.post("/api/fieldops/policies", headers=acme.auth(acme.admin),
-                      json={"name": "strict", "geofence_enforcement": "hard_block"})
+    strict = await client.post("/api/fieldops/policy-layers", headers=acme.auth(acme.admin),
+                               json={"name": "strict", "settings": {"geofence.rules": {"geofence_enforcement": "hard_block"}}})
+    assert strict.status_code == 201, strict.text
     await consent(db, acme, acme.member)
     shop = await place(db, acme)
     await start_shift(client, acme, acme.member, at=now() - dt.timedelta(hours=5))
@@ -253,8 +255,9 @@ async def test_an_offline_start_is_never_blocked_even_under_hard_block(worlds, d
 
 async def test_no_place_coordinates_never_blocks(worlds, db):
     client, acme, _ = worlds
-    await client.post("/api/fieldops/policies", headers=acme.auth(acme.admin),
-                      json={"name": "strict", "geofence_enforcement": "hard_block"})
+    strict = await client.post("/api/fieldops/policy-layers", headers=acme.auth(acme.admin),
+                               json={"name": "strict", "settings": {"geofence.rules": {"geofence_enforcement": "hard_block"}}})
+    assert strict.status_code == 201, strict.text
     await consent(db, acme, acme.member)
     unmapped = await place(db, acme, verification="unverified")
     await start_shift(client, acme, acme.member)

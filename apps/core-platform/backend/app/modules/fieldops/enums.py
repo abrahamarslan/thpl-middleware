@@ -31,10 +31,42 @@ class ShiftStatus(str, enum.Enum):
     COMPLETED = "completed"
     AUTO_CLOSED = "auto_closed"
     CANCELLED = "cancelled"
+    #: a scheduled shift whose planned end (+ grace) passed without a start
+    MISSED = "missed"
 
 
 OPEN_SHIFT_STATUSES = (ShiftStatus.ACTIVE.value, ShiftStatus.PAUSED.value)
-CLOSED_SHIFT_STATUSES = (ShiftStatus.COMPLETED.value, ShiftStatus.AUTO_CLOSED.value, ShiftStatus.CANCELLED.value)
+CLOSED_SHIFT_STATUSES = (ShiftStatus.COMPLETED.value, ShiftStatus.AUTO_CLOSED.value, ShiftStatus.CANCELLED.value,
+                         ShiftStatus.MISSED.value)
+
+
+class ShiftWorkType(str, enum.Enum):
+    """What a shift's work is (the app's "Delivery Type"). A mixed shift is ``delivery``; each stop carries
+    its own job type (``visits.purpose`` / task types)."""
+
+    DELIVERY = "delivery"
+    COLLECTION = "collection"
+    RETURN = "return"
+    EXCHANGE = "exchange"
+    OTHER = "other"
+
+
+class ShiftSource(str, enum.Enum):
+    """Where a shift's plan came from."""
+
+    SCHEDULED = "scheduled"      # a manager created it (POST /fieldops/shifts)
+    TEMPLATE = "template"        # materialized from the user's shift template when they started
+    AD_HOC = "ad_hoc"            # no schedule, no template (policy allow_unscheduled_shifts)
+
+
+class EndpointMode(str, enum.Enum):
+    """Where work starts / ends (docs/fieldops/shift-templates.md). One vocabulary for shifts, templates,
+    and later beats and journey plans."""
+
+    ANYWHERE = "anywhere"            # no expectation (default)
+    HUB = "hub"                      # a specific hub (its place / geofence is the target)
+    ASSIGNED_HUB = "assigned_hub"    # the user's hub for that day (hubs.user_hub_assignments)
+    PLACE = "place"                  # a particular location (geo.places)
 
 
 class VisitStatus(str, enum.Enum):
@@ -67,6 +99,8 @@ class ShiftEndReason(str, enum.Enum):
     SUPERSEDED = "superseded"
     CANCELLED = "cancelled"
     MANAGER_CORRECTION = "manager_correction"
+    POLICY_VIOLATION = "policy_violation"        # mock_location_action = end_shift
+    CONSENT_WITHDRAWN = "consent_withdrawn"      # DPDP: location consent withdrawn mid-shift
 
 
 class DurationBasis(str, enum.Enum):
@@ -240,12 +274,41 @@ class CheckpointLabel(str, enum.Enum):
     VISIT_END = "visit_end"
     TASK_SUBMITTED = "task_submitted"
     SOS = "sos"
+    GEOFENCE_ENTER = "geofence_enter"
+    GEOFENCE_EXIT = "geofence_exit"
 
 
 SHIFT_LABELS = (CheckpointLabel.SHIFT_START.value, CheckpointLabel.SHIFT_END.value,
                 CheckpointLabel.SHIFT_PAUSE.value, CheckpointLabel.SHIFT_RESUME.value)
 VISIT_LABELS = (CheckpointLabel.VISIT_START.value, CheckpointLabel.VISIT_END.value,
                 CheckpointLabel.TASK_SUBMITTED.value)
+GEOFENCE_LABELS = (CheckpointLabel.GEOFENCE_ENTER.value, CheckpointLabel.GEOFENCE_EXIT.value)
+
+
+class AppState(str, enum.Enum):
+    FOREGROUND = "foreground"
+    BACKGROUND = "background"
+
+
+class BatteryState(str, enum.Enum):
+    CHARGING = "charging"
+    DISCHARGING = "discharging"
+    FULL = "full"
+    NOT_CHARGING = "not_charging"
+    UNKNOWN = "unknown"
+
+
+CHARGING_STATES = (BatteryState.CHARGING.value, BatteryState.FULL.value)
+
+
+class NetworkType(str, enum.Enum):
+    WIFI = "wifi"
+    G5 = "5g"
+    G4 = "4g"
+    G3 = "3g"
+    G2 = "2g"
+    OFFLINE = "offline"
+    UNKNOWN = "unknown"
 
 
 class LocationProvider(str, enum.Enum):
@@ -366,6 +429,15 @@ class AnomalyType(str, enum.Enum):
     LATE_END = "late_end"
     DISPUTED_PLACE = "disputed_place"
     PLACE_GEOTAG_PROPOSAL = "place_geotag_proposal"
+    LATE_START = "late_start"
+    MISSED_SHIFT = "missed_shift"
+    NO_HUB_ASSIGNED = "no_hub_assigned"
+    TEMPLATE_EXCEEDS_MAX_HOURS = "template_exceeds_max_hours"
+    TRACKING_SILENT = "tracking_silent"
+    DEVICE_HANDOVER = "device_handover"
+    FOREIGN_USER_PING = "foreign_user_ping"
+    OUTSIDE_START_PLACE = "outside_start_place"
+    OUTSIDE_END_PLACE = "outside_end_place"
 
 
 class Severity(str, enum.Enum):

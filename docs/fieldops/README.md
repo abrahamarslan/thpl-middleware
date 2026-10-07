@@ -1,5 +1,10 @@
 # Field operations — shifts, pauses, visits, tasks and the location stream
 
+> **2026-10-06 additions** (migrations `b7e4c1a9d3f2`, `c3d9a7e2f415`): `work_policies` was replaced by
+> [policy layers](policy-layers.md); shift templates, scheduled shifts, stops, route endpoints and the hub of
+> the day: [shift-templates.md](shift-templates.md); the Android wire contract:
+> [android-contract.md](android-contract.md); summary: [field-app-integration-as-built.md](field-app-integration-as-built.md).
+
 **Status:** ✅ built (2026-09-29) · **Schema:** `fieldops` (+ `core.idempotency_keys`) ·
 **Migration:** `5d8c2e1f7a90` (reversible; takes over `user_location_pings`) ·
 **Code:** `app/modules/fieldops/`, `app/modules/idempotency/`, `app/tasks/fieldops.py` ·
@@ -15,7 +20,7 @@ lists where the build deliberately differs from the spec.
 ## 1. The model
 
 ```
-fieldops.work_policies ─ resolved per user (base role × organization tree) ─ frozen on each shift
+fieldops.policy_layers ─ merged per setting (organization tree × role/team/hub/user) ─ frozen on each shift
                                      │
 fieldops.devices ─ device_sessions ─ device_events            (device binding, capability, tracking health)
                                      │
@@ -92,8 +97,11 @@ are optional; weaker evidence only means a weaker `time_basis`.
 | `POST /me/devices` | register installation + session on every launch; `warnings` = what will break tracking |
 | `POST /me/device-events` | tracking-health events (GPS off, permission changed, app killed …) |
 | `GET /me/fieldops/policy` · `GET /me/fieldops/current` | effective policy + `can_telephonic`; open shift / pause / visit |
-| `POST /me/shifts` | start (201; 200 = replay) — consent, location, selfie/odometer per policy |
-| `GET /me/shifts` | own history |
+| `POST /me/shifts` | start (201; 200 = replay) — a scheduled shift by its uuid, else the template, else ad hoc; consent, location, selfie/odometer, start-place enforcement |
+| `GET /me/shifts` · `GET /me/shifts/{uuid}` | cards (plan, endpoints, hub, stop counts; virtual template entries) · detail with stops + fence pack |
+| `POST /me/shifts/{uuid}/handover` | move the open shift to this device |
+| `POST /me/visits/{uuid}/start` | start a planned stop |
+| `GET /me/fieldops/config` | the Android config (policy layers; ETag / 304) |
 | `POST /me/shifts/{uuid}/pause` · `/resume` · `/end` | |
 | `POST /me/visits` · `GET /me/visits?date=` | start (verification + enforcement) · a business day's visits |
 | `POST /me/visits/{uuid}/end` · `/cancel` · `/join` | `join` = joint working (participant) |
@@ -112,7 +120,9 @@ organization grants it to the roles that phone customers.
 `reason`) · `POST /shifts/{ref}/review` · `DELETE /shifts/{ref}?reason=` · `GET /visits` ·
 `GET /visits/{ref}` (tasks, participants, checks) · `PATCH /visits/{ref}` ·
 `POST /visits/{ref}/review` · `POST /visits/{ref}/cancel` · `GET /live` · `GET /anomalies` ·
-`POST /anomalies/{ref}/resolve` · `GET /review-queue` · `GET|POST|PATCH|DELETE /policies`.
+`POST /anomalies/{ref}/resolve` · `GET /review-queue` · `POST /shifts` · `/shifts/bulk` ·
+`PATCH /shifts/{ref}/plan` · `POST /shifts/{ref}/cancel` · `POST /shifts/{ref}/stops` ·
+`/shift-templates` · `/policy-settings` · `/policy-layers` · `GET /policies/resolve` · `POST /policies/preview`.
 
 Reads pass two gates: `Perm(...)` (at the row's organization) and `scope.visible` — a team-scoped
 manager sees their teams' members and direct reports, not the tenant. Outside the set is a 404.
@@ -162,9 +172,8 @@ manager sees their teams' members and direct reports, not the tenant. Outside th
 
 ## 6. Policies
 
-`fieldops.work_policies`, per organization and optionally per role (NULL = the organization's
-default), resolved by the user's **base role** walking up the organization tree; with no row the
-column defaults apply. Frozen on each shift (`policy_snapshot`). Key knobs: `requires_shift`,
+Policy layers — see [policy-layers.md](policy-layers.md). (Until 2026-10-06 this was
+`fieldops.work_policies`, one whole row per organization × role.) Frozen on each shift (`policy_snapshot`). Key knobs: `requires_shift`,
 `allow_visits_without_shift`, `require_location_consent` (DPDP), `require_start_selfie`,
 `require_odometer`, `max_shift_hours`, `auto_close_grace_minutes`, `stale_shift_after_minutes`,
 pause rules, tracking cadence, `geofence_enforcement`, radii and accuracy, anomaly thresholds.
@@ -210,4 +219,4 @@ vs telephonic metrics, manager scope and cross-tenant 404s, corrections, the leg
 | `user_location_pings` | Dropped after the copy (the spec suggested a compatibility view; no reader outside this change existed) |
 | Celery tasks | In `app/tasks/fieldops.py` (house convention), not in the module |
 | Visit ↔ account | App-level existence proof through `core.entity_types` (no deferred trigger yet — `customer` is not registered until the contacts module lands) |
-| **Not built** | Soketi live push (the live map polls `GET /fieldops/live`); raw batch archive to object storage (`ping_batches` keeps the sha256 and per-item results); manager override tokens for hard blocks; outlet geotag proposals; fence pack for offline evaluation; Debezium/ClickHouse CDC of the field-ops tables (needs `publish_via_partition_root` for the stream — verify with Debezium 2.7 first); beat/journey plans (`plan_ref` is reserved) |
+| **Not built** | Soketi live push (the live map polls `GET /fieldops/live`); raw batch archive to object storage (`ping_batches` keeps the sha256 and per-item results); manager override tokens for hard blocks; outlet geotag proposals; (the fence pack for Android geofences IS built — `GET /me/shifts/{uuid}`); Debezium/ClickHouse CDC of the field-ops tables (needs `publish_via_partition_root` for the stream — verify with Debezium 2.7 first); beat/journey plans (`plan_ref` is reserved) |

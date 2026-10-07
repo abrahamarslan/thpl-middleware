@@ -95,7 +95,7 @@ def _include_object(obj, name, type_, reflected, compare_to):
 #: tables in org_management; everything else (topology, tiger, …) belongs to
 #: PostGIS extensions and is never compared.
 _OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core", "extfields", "media", "teams",
-                  "rbac", "fieldops"}
+                  "rbac", "fieldops", "auth"}
 
 
 def _include_name(name, type_, parent_names):

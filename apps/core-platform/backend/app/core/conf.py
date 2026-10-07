@@ -170,6 +170,20 @@ class Settings(BaseSettings):
     JWT_EXPIRATION_HOURS: int = 24
     JWT_REFRESH_EXPIRATION_DAYS: int = 30
 
+    # --- Sign-in sessions (auth.user_sessions; docs/auth/sessions.md) ---
+    # Tokens carry a ``sid``; every request checks the session (Redis-cached), so a revoked session
+    # (logout, signed in elsewhere, refresh reuse) fails at its next request — not when the JWT expires.
+    #: Absolute cap of a session, whatever the refreshes.
+    SESSION_MAX_DAYS: int = 30
+    #: Field-app sessions per user when no policy layer sets ``session.field`` (0 = unlimited).
+    FIELD_MAX_SESSIONS: int = 0
+    #: Web / service sessions per user (0 = unlimited).
+    MAX_WEB_SESSIONS: int = 0
+    #: Refuse first-party tokens WITHOUT a sid (issued before sessions existed). Turn on once they have expired.
+    AUTH_REQUIRE_SESSION: bool = False
+    #: Seconds a session's state is cached in Redis (0 = always read the database).
+    SESSION_CACHE_TTL_SECONDS: int = 60
+
     # --- Authentik OIDC (SSO; users are JIT-provisioned into the users table) ---
     AUTHENTIK_ENABLED: bool = False
     AUTHENTIK_ISSUER: str = ""        # e.g. https://auth.app.local/application/o/core-platform/

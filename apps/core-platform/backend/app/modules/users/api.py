@@ -12,7 +12,7 @@ ClientInfoDep; see docs/modules/auth-module-documentation.md.
 
 from dataclasses import asdict
 
-from fastapi import APIRouter, File, Query, Response, UploadFile
+from fastapi import APIRouter, File, Query, Request, Response, UploadFile
 
 from app.common.client_info import ClientInfoDep
 from app.common.exception.errors import ForbiddenError
@@ -44,6 +44,8 @@ from app.modules.users.schema import (
     RegisterRequest,
     ResetPasswordRequest,
     ThrottleRequest,
+    SessionOut,
+    SettingsOptionsOut,
     TokenPair,
     UserAdminCreate,
     UserAdminUpdate,
@@ -109,6 +111,8 @@ async def login_otp_verify(db: DBSession, body: LoginOtpVerifyRequest, client: C
         device_id=body.device_id,
         device_type=body.device_type,
         client=client,
+        client_type=body.client_type,
+        installation_id=body.installation_id,
     )
     return ResponseModel(data=tokens)
 
@@ -119,9 +123,38 @@ async def refresh(db: DBSession, body: RefreshRequest, client: ClientInfoDep):
 
 
 @auth_router.post("/logout", response_model=ResponseModel[dict])
-async def logout(db: DBSession, user: CurrentUser, client: ClientInfoDep):
-    await service.logout(db, user, client=client)
-    return ResponseModel(data={"logged_out": True})
+async def logout(db: DBSession, user: CurrentUser, client: ClientInfoDep, request: Request):
+    """End THIS sign-in session: the token is refused from its next request (401 ``session_revoked``)."""
+    revoked = await service.logout(db, user, client=client, claims=getattr(request.state, "token_claims", None))
+    return ResponseModel(data={"logged_out": True, "sessions_revoked": revoked})
+
+
+@auth_router.post("/logout-all", response_model=ResponseModel[dict])
+async def logout_all(db: DBSession, user: CurrentUser, client: ClientInfoDep):
+    """End EVERY sign-in session of mine (all devices, this one included)."""
+    revoked = await service.logout(db, user, client=client, everywhere=True)
+    return ResponseModel(data={"logged_out": True, "sessions_revoked": revoked})
+
+
+@auth_router.get("/sessions", response_model=ResponseModel[list[SessionOut]])
+async def my_sessions(db: DBSession, user: CurrentUser, request: Request, include_revoked: bool = False):
+    """My sign-in sessions (devices). ``current`` marks the one this request uses."""
+    from app.modules.users import sessions
+
+    sid = (getattr(request.state, "token_claims", None) or {}).get("sid")
+    rows = await sessions.list_sessions(db, user.id, include_revoked=include_revoked)
+    return ResponseModel(data=[SessionOut.model_validate(r).model_copy(update={"current": str(r.uuid) == sid})
+                               for r in rows])
+
+
+@auth_router.delete("/sessions/{session_uuid}", response_model=ResponseModel[dict])
+async def end_my_session(db: DBSession, user: CurrentUser, session_uuid: str):
+    """Sign one of my devices out."""
+    from app.modules.users import sessions
+
+    row = await sessions.get_session(db, session_uuid, user_id=user.id)
+    await sessions.revoke(db, row, reason="logout")
+    return ResponseModel(data={"revoked": True})
 
 
 @auth_router.get("/me", response_model=ResponseModel[UserOut])
@@ -197,13 +230,14 @@ _USER = org_of("app.modules.users.model:User", param="user_id")
 
 @users_router.get("", response_model=ResponseModel[PageModel[UserOut | UserPublicOut]])
 async def list_users(
-    db: DBSession, _: Perm("users.directory:read"), grants: GrantsDep, filters: UserListFilters = Query(),
+    db: DBSession, viewer: Perm("users.directory:read"), grants: GrantsDep, filters: UserListFilters = Query(),
 ):
     users, total = await service.list_users(db, filters)
     full = grants.can_anywhere("users.user:read")          # SHAPE only; the gate above already ran
     return ResponseModel(
         data=PageModel(
-            items=await (service.user_outs(db, users) if full else service.user_public_outs(db, users)),
+            items=await (service.user_outs(db, users) if full
+                         else service.user_public_outs(db, users, viewer=viewer)),
             page=filters.page,
             page_size=filters.page_size,
             total=total,
@@ -227,7 +261,7 @@ async def get_user(
     user = await service.get_user(db, user_id, include_deleted=include_deleted)
     if user.id == viewer.id or grants.can_anywhere("users.user:read"):
         return ResponseModel(data=await service.user_out(db, user))
-    return ResponseModel(data=(await service.user_public_outs(db, [user]))[0])
+    return ResponseModel(data=(await service.user_public_outs(db, [user], viewer=viewer))[0])
 
 
 @users_router.put("/{user_id}", response_model=ResponseModel[UserOut])
@@ -259,6 +293,37 @@ async def restore_user(db: DBSession, _: Perm("users.user:restore", target=_USER
 
 
 # ── Moderation: ban / unban / throttle ───────────────────────────────────────
+
+@users_router.get("/{user_id}/sessions", response_model=ResponseModel[list[SessionOut]])
+async def user_sessions(db: DBSession, _: Perm("users.session:read", target=_USER), user_id: int,
+                        include_revoked: bool = False):
+    """A user's sign-in sessions (devices)."""
+    from app.modules.users import sessions
+
+    await service.get_user(db, user_id)
+    return ResponseModel(data=[SessionOut.model_validate(r) for r in
+                               await sessions.list_sessions(db, user_id, include_revoked=include_revoked)])
+
+
+@users_router.delete("/{user_id}/sessions/{session_uuid}", response_model=ResponseModel[dict])
+async def end_user_session(db: DBSession, _: Perm("users.session:delete", target=_USER), user_id: int,
+                           session_uuid: str):
+    """Sign a user's device out (reason ``admin``)."""
+    from app.modules.users import sessions
+
+    row = await sessions.get_session(db, session_uuid, user_id=user_id)
+    await sessions.revoke(db, row, reason="admin")
+    return ResponseModel(data={"revoked": True})
+
+
+@users_router.delete("/{user_id}/sessions", response_model=ResponseModel[dict])
+async def end_user_sessions(db: DBSession, _: Perm("users.session:delete", target=_USER), user_id: int):
+    """Sign a user out of every device."""
+    from app.modules.users import sessions
+
+    await service.get_user(db, user_id)
+    return ResponseModel(data={"revoked": await sessions.revoke_all(db, user_id, reason="admin")})
+
 
 @users_router.get("/{user_id}/moderation", response_model=ResponseModel[ModerationOut])
 async def get_moderation(db: DBSession, _: Perm("users.moderation:manage", target=_USER), user_id: int):
@@ -338,6 +403,15 @@ async def update_my_profile(
 # App-specific preferences (profile visibility, theme, notification channels)
 # persisted in `users.application_settings` JSONB. GET returns the full effective
 # settings; PATCH deep-merges any subset, so an app can send one changed toggle.
+
+@me_router.get("/settings/options", response_model=ResponseModel[SettingsOptionsOut])
+@auth_router.get("/me/settings/options", response_model=ResponseModel[SettingsOptionsOut])
+async def settings_options(_: CurrentUser):
+    """Every allowed settings value with its label — map by ``value``. ``profile_visibility``: everyone
+    (every user of your organization's tenant) · team · managers · private; ``contact_visibility``:
+    everyone · team · hidden. Administrators always see profiles (``admin_override``)."""
+    return ResponseModel(data=service.settings_options())
+
 
 @me_router.get("/settings", response_model=ResponseModel[UserSettings])
 @auth_router.get("/me/settings", response_model=ResponseModel[UserSettings])

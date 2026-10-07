@@ -267,6 +267,10 @@ async def reset_password(
         db, Event.PASSWORD_RESET_COMPLETED, user=user, client=client,
         context={"method": reset_type},
     )
+    # Whoever held the old password is signed out everywhere.
+    from app.modules.users import sessions
+
+    await sessions.revoke_all(db, user.id, reason="password_changed")
 
     # Mirror into Authentik (best-effort; plaintext only in scope here).
     await sync_set_password(db, user, new_password)

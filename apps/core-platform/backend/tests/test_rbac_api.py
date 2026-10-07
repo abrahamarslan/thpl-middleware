@@ -87,8 +87,11 @@ async def test_a_member_sees_the_directory_not_the_record(tree_world):
     assert listed.status_code == 200
     items = listed.json()["data"]["items"]
     assert items and all({"id", "name"} <= item.keys() for item in items)
-    for sensitive in ("medical_history", "pan", "bank_details", "payment_details", "email", "phone"):
+    for sensitive in ("medical_history", "pan", "bank_details", "payment_details"):
         assert all(sensitive not in item for item in items), sensitive
+    # Email / phone follow each person's privacy settings; the default contact_visibility is "hidden".
+    others = [item for item in items if item["id"] != w.member_a.id]
+    assert others and all(item.get("email") is None and item.get("phone") is None for item in others)
 
     peer = await client.get(f"/api/users/{w.admin_a.id}", headers=w.auth(w.member_a, w.branch_a))
     assert "medical_history" not in peer.json()["data"]
@@ -387,5 +390,38 @@ async def test_users_created_by_an_administrator_start_as_members(tree_world, db
     with_role = await client.post("/api/users", headers=w.auth(w.admin_a, w.branch_a), json={
         "name": "Sneaky", "email": "sneaky@tree.example", "password": "Str0ng!Passw0rd#x", "role_id": role.id})
     assert with_role.status_code == 422
+
+
+# ── re-syncing an organization's system roles from the code templates ───────
+
+async def test_resync_repairs_a_system_role_seeded_before_a_template_permission_existed(tree_world, db):
+    """A release adds a permission to ``member``; organizations seeded before it lack the row. Resync."""
+    from app.modules.rbac.model import Permission, RolePermission
+
+    client, w = tree_world
+    member_role = await role_of(db, w.branch_a, "member")
+    permission_id = await db.scalar(
+        select(Permission.id).where(Permission.permission_code == "fieldops.field_work:use")
+    )
+    row = await db.scalar(select(RolePermission).where(
+        RolePermission.role_id == member_role.id, RolePermission.permission_id == permission_id
+    ))
+    assert row is not None
+    await db.delete(row)                      # simulate the stale organization
+    await db.commit()
+
+    mine = (await client.get("/api/me/permissions", headers=w.auth(w.member_a, w.branch_a))).json()["data"]
+    assert "fieldops.field_work:use" not in mine["permissions"]
+
+    # Only a role manager may re-sync.
+    assert (await client.post("/api/roles/resync", headers=w.auth(w.member_a, w.branch_a))).status_code == 403
+
+    ok = await client.post("/api/roles/resync", headers=w.auth(w.admin_a, w.branch_a))
+    assert ok.status_code == 200, ok.text
+    member_out = next(r for r in ok.json()["data"] if r["code"] == "member")
+    assert "fieldops.field_work:use" in member_out["permissions"]
+
+    mine = (await client.get("/api/me/permissions", headers=w.auth(w.member_a, w.branch_a))).json()["data"]
+    assert "fieldops.field_work:use" in mine["permissions"]
 
 

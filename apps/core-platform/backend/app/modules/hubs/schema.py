@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import uuid as uuid_lib
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -85,3 +86,52 @@ class HubSlim(BaseModel):
     name: str
     hub_type: str
     status: str
+
+
+# ── user hub assignments (the hub of a day) ─────────────────────────────────────
+
+class HubAssignmentIn(BaseModel):
+    """One assignment: a single ``date``, or a ``valid_from`` … ``valid_to`` range (``valid_to`` omitted =
+    open-ended). ``hub_id`` null = explicitly no hub on those days."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: int = Field(..., gt=0)
+    hub_id: int | None = Field(None, gt=0)
+    date: dt.date | None = None
+    valid_from: dt.date | None = None
+    valid_to: dt.date | None = None
+    note: str | None = Field(None, max_length=500)
+
+    def window(self) -> tuple[dt.date, dt.date | None]:
+        if self.date is not None:
+            return self.date, self.date
+        if self.valid_from is None:
+            raise ValueError("give a date, or valid_from (and optionally valid_to)")
+        return self.valid_from, self.valid_to
+
+
+class HubAssignmentsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assignments: list[HubAssignmentIn] = Field(..., min_length=1, max_length=500)
+
+
+class HubAssignmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    uuid: uuid_lib.UUID
+    user_id: int
+    hub_id: int | None
+    valid_from: dt.date
+    valid_to: dt.date | None
+    source: str
+    note: str | None
+    created_at: dt.datetime
+
+
+class HubOfDayOut(BaseModel):
+    date: dt.date
+    hub_id: int | None
+    source: str | None = Field(None, description="assignment | employment | null (no hub)")
+    hub: HubSlim | None = None

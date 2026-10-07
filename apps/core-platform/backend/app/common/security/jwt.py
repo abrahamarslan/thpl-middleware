@@ -8,6 +8,9 @@ Two token sources exist in production:
 
 The user-resolving dependency that accepts BOTH lives in
 app/modules/users/deps.py (it needs DB access for JIT provisioning).
+
+Session-bound tokens carry ``sid`` (the ``auth.user_sessions`` uuid) and ``jti``; the session — not the
+token's expiry — decides whether a token still works (app/modules/users/sessions.py).
 """
 
 from datetime import UTC, datetime, timedelta
@@ -41,9 +44,9 @@ def create_access_token(subject: str, *, claims: dict[str, Any] | None = None) -
                          lifetime=timedelta(hours=settings.JWT_EXPIRATION_HOURS), claims=claims)
 
 
-def create_refresh_token(subject: str) -> str:
+def create_refresh_token(subject: str, *, claims: dict[str, Any] | None = None) -> str:
     return _create_token(subject, token_type="refresh",
-                         lifetime=timedelta(days=settings.JWT_REFRESH_EXPIRATION_DAYS))
+                         lifetime=timedelta(days=settings.JWT_REFRESH_EXPIRATION_DAYS), claims=claims)
 
 
 def decode_token(token: str, *, expected_type: str = "access") -> dict[str, Any]:

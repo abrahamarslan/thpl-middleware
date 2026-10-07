@@ -121,6 +121,11 @@ celery_app.conf.update(
             "schedule": timedelta(minutes=5),
             "options": {"expires": 4 * 60},
         },
+        "fieldops-detect-silent": {
+            "task": "app.tasks.fieldops.detect_silent_shifts",
+            "schedule": timedelta(minutes=5),
+            "options": {"expires": 4 * 60},
+        },
         "fieldops-link-orphan-pings": {
             "task": "app.tasks.fieldops.link_orphan_pings",
             "schedule": timedelta(minutes=10),

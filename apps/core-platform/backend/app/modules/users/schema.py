@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, computed_field, field_validator, model_validator
 
 from app.modules.geo.enums import LinkType
 from app.modules.geo.schema import PostalFields
@@ -220,6 +220,12 @@ class UserPublicOut(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     avatar_urls: dict[str, str | None] | None = None
+    designation: str | None = Field(None, description="Shown when the profile is visible to the viewer")
+    department: str | None = Field(None, description="Shown when the profile is visible to the viewer")
+    email: str | None = Field(None, description="Shown when contact info is visible to the viewer")
+    phone: str | None = Field(None, description="Shown when contact info is visible to the viewer")
+    restricted: bool = Field(False, description="True = this person's profile is not visible to you "
+                                                "(only id and name are shown)")
 
 
 class UserAdminCreate(UserCreate):
@@ -291,6 +297,10 @@ class LoginRequest(BaseModel):
     password: str
     device_id: str | None = None
     device_type: str | None = None
+    client_type: Literal["field_app", "web", "service"] | None = Field(
+        None, description="Which client signs in. field_app sessions follow the single-session rule "
+                          "(policy setting session.field). Omitted: android/ios device_type → field_app, else web.")
+    installation_id: str | None = Field(None, max_length=64, description="The field app's installation id")
 
 
 class TokenPair(BaseModel):
@@ -298,6 +308,27 @@ class TokenPair(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int
+    session_uuid: UUID | None = Field(None, description="The sign-in session these tokens belong to (sid)")
+    displaced_sessions: int = Field(0, description="Sessions on other devices this sign-in ended "
+                                                  "(single-session rule) — they get 401 session_revoked")
+
+
+class SessionOut(BaseModel):
+    """One of a user's sign-in sessions."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    uuid: UUID
+    client_type: str
+    device_label: str | None
+    installation_id: str | None
+    ip_address: str | None
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    revoked_reason: str | None
+    current: bool = False
 
 
 class RefreshRequest(BaseModel):
@@ -342,6 +373,8 @@ class LoginOtpVerifyRequest(BaseModel):
     code: str = Field(min_length=4, max_length=10)
     device_id: str | None = None
     device_type: str | None = None
+    client_type: Literal["field_app", "web", "service"] | None = None
+    installation_id: str | None = Field(None, max_length=64)
 
 
 class PasswordPolicyOut(BaseModel):
@@ -610,16 +643,57 @@ class UserMeOut(UserOut):
 # silently stored blob. Stored JSON may carry keys written by other features, so
 # `UserSettings` itself ignores unknown keys instead of refusing them.
 
-ProfileVisibility = Literal["public", "organization", "contacts", "private"]
+#: Who can see the profile (details beyond name: avatar, username, designation, department).
+#: ``everyone`` = every signed-in user of the TENANT (never anonymous, never another tenant).
+ProfileVisibility = Literal["everyone", "team", "managers", "private"]
+#: Who can see email / phone.
+ContactVisibility = Literal["everyone", "team", "hidden"]
 Theme = Literal["light", "dark", "system"]
+
+#: Pre-2026-10 values (stored or sent by older apps) → the current vocabulary.
+LEGACY_PROFILE_VISIBILITY = {"public": "everyone", "organization": "everyone", "contacts": "team"}
+PROFILE_VISIBILITY_VALUES = ("everyone", "team", "managers", "private")
+CONTACT_VISIBILITY_VALUES = ("everyone", "team", "hidden")
+
+
+def _normalize_privacy(data: Any) -> Any:
+    """Legacy privacy → current: ``public``/``organization`` → ``everyone``, ``contacts`` → ``team``;
+    ``show_email``/``show_phone`` → ``contact_visibility`` (both true → ``everyone``, else ``hidden``)."""
+    if not isinstance(data, dict):
+        return data
+    data = dict(data)
+    pv = data.get("profile_visibility")
+    if pv in LEGACY_PROFILE_VISIBILITY:
+        data["profile_visibility"] = LEGACY_PROFILE_VISIBILITY[pv]
+    show_email, show_phone = data.pop("show_email", None), data.pop("show_phone", None)
+    if data.get("contact_visibility") is None and (show_email is not None or show_phone is not None):
+        data["contact_visibility"] = "everyone" if (show_email and show_phone) else "hidden"
+    return data
 
 
 class PrivacySettings(BaseModel):
-    """Who can see the user's profile and which contact fields are exposed."""
+    """Who can see the user's profile and contact details. The user themself and administrators with
+    ``users.user:read`` always can (an employer's administrators are not hidden from)."""
 
-    profile_visibility: ProfileVisibility = "organization"
-    show_email: bool = False
-    show_phone: bool = False
+    profile_visibility: ProfileVisibility = "everyone"
+    contact_visibility: ContactVisibility = "hidden"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy(cls, data: Any) -> Any:
+        return _normalize_privacy(data)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def show_email(self) -> bool:
+        """DEPRECATED (read-only): ``contact_visibility != hidden``. Use ``contact_visibility``."""
+        return self.contact_visibility != "hidden"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def show_phone(self) -> bool:
+        """DEPRECATED (read-only): ``contact_visibility != hidden``. Use ``contact_visibility``."""
+        return self.contact_visibility != "hidden"
 
 
 class AppearanceSettings(BaseModel):
@@ -630,23 +704,49 @@ class NotificationSettings(BaseModel):
     email: bool = True
     push: bool = True
     sms: bool = False
+    slack: bool = False
     in_app: bool = True
 
 
+class SecuritySettings(BaseModel):
+    """READ-ONLY here: 2FA is turned on through its own enrolment flow (not built yet), never a PATCH."""
+
+    two_factor_enabled: bool = False
+
+
 class UserSettings(BaseModel):
-    """The full effective shape persisted under ``users.application_settings``."""
+    """The full effective shape persisted under ``users.application_settings`` (``security`` is derived)."""
 
     privacy: PrivacySettings = Field(default_factory=PrivacySettings)
     appearance: AppearanceSettings = Field(default_factory=AppearanceSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
+
+    def stored(self) -> dict[str, Any]:
+        """What is persisted: no derived fields (``show_*``, ``security``)."""
+        data = self.model_dump(exclude={"security"})
+        data["privacy"] = {k: v for k, v in data["privacy"].items() if k not in ("show_email", "show_phone")}
+        return data
 
 
 class PrivacySettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    profile_visibility: ProfileVisibility | None = None
-    show_email: bool | None = None
-    show_phone: bool | None = None
+    profile_visibility: Literal["everyone", "team", "managers", "private", "public", "organization",
+                                "contacts"] | None = Field(None, description="Legacy public/organization/contacts "
+                                                                            "are accepted and normalized")
+    contact_visibility: ContactVisibility | None = None
+    show_email: bool | None = Field(None, description="DEPRECATED — use contact_visibility")
+    show_phone: bool | None = Field(None, description="DEPRECATED — use contact_visibility")
+
+    @model_validator(mode="after")
+    def _legacy(self) -> "PrivacySettingsUpdate":
+        if self.profile_visibility in LEGACY_PROFILE_VISIBILITY:
+            self.profile_visibility = LEGACY_PROFILE_VISIBILITY[self.profile_visibility]
+        if self.contact_visibility is None and (self.show_email is not None or self.show_phone is not None):
+            self.contact_visibility = "everyone" if (self.show_email and self.show_phone) else "hidden"
+        self.show_email = self.show_phone = None
+        return self
 
 
 class AppearanceSettingsUpdate(BaseModel):
@@ -661,17 +761,44 @@ class NotificationSettingsUpdate(BaseModel):
     email: bool | None = None
     push: bool | None = None
     sms: bool | None = None
+    slack: bool | None = None
     in_app: bool | None = None
 
 
 class UserSettingsUpdate(BaseModel):
-    """A partial settings change; every section/field is optional and merged."""
+    """A partial settings change; every section/field is optional and merged. ``security`` is not settable."""
 
     model_config = ConfigDict(extra="forbid")
 
     privacy: PrivacySettingsUpdate | None = None
     appearance: AppearanceSettingsUpdate | None = None
     notifications: NotificationSettingsUpdate | None = None
+
+
+class SettingOption(BaseModel):
+    value: str
+    label: str
+
+
+class ChannelOption(BaseModel):
+    key: str
+    label: str
+    available: bool
+    locked: bool = False
+    reason: str | None = None
+
+
+class SettingsOptionsOut(BaseModel):
+    """Every allowed value of the settings, with labels — clients map by ``value``, never by label."""
+
+    profile_visibility: list[SettingOption]
+    profile_visibility_default: str
+    contact_visibility: list[SettingOption]
+    contact_visibility_default: str
+    admin_override: bool = Field(True, description="Administrators (users.user:read) always see profiles")
+    notification_channels: list[ChannelOption]
+    themes: list[SettingOption]
+    two_factor_supported: bool = False
 
 
 

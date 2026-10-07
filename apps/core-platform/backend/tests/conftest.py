@@ -27,6 +27,8 @@ os.environ.setdefault("ZOHO_ORGANIZATION_ID", "10234695")
 # Tests change roles/assignments straight in the database; a cached grant would go stale under them.
 # The cache itself is tested explicitly (tests/test_rbac_engine.py) by turning it on.
 os.environ.setdefault("RBAC_CACHE_TTL_SECONDS", "0")
+# Session state is read from the database in tests (a cached "live" would hide a revocation made in SQL).
+os.environ.setdefault("SESSION_CACHE_TTL_SECONDS", "0")
 
 import pytest  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -121,7 +123,11 @@ _TEST_TABLES = (
     "fieldops.device_events",
     "fieldops.device_sessions",
     "fieldops.devices",
-    "fieldops.work_policies",
+    "fieldops.shift_templates",
+    "fieldops.policy_layers",
+    "fieldops.policy_epochs",
+    "user_hub_assignments",
+    "auth.user_sessions",
     "core.idempotency_keys",
     # Users & telemetry
     "user_live_locations",

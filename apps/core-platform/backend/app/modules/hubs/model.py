@@ -29,11 +29,12 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, ExcludeConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.db import Base
 from app.database.mixins import (
+    BigIntPKWithUUIDv7Mixin,
     DeactivationMixin,
     IntPKMixin,
     OrgEntityMixin,
@@ -41,7 +42,7 @@ from app.database.mixins import (
 )
 from app.database.soft_delete import SoftDeleteFilteredMixin
 from app.modules.documents.mixins import HasDocumentsMixin
-from app.modules.hubs.enums import HubStatus, HubType, values
+from app.modules.hubs.enums import AssignmentSource, HubStatus, HubType, values
 
 _STATUS_SQL = values(HubStatus)
 
@@ -146,3 +147,51 @@ class Hub(
 
     def __repr__(self) -> str:
         return f"<Hub id={self.id} code={self.code!r} type={self.hub_type!r} status={self.status!r}>"
+
+
+class UserHubAssignment(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Base):
+    """Which hub a user operates from, by DATE — it can change daily, and can be explicitly none.
+
+    Effective-dated: ``[valid_from, valid_to]`` (inclusive dates in the organization's business day;
+    ``valid_to`` NULL = open-ended). ``assignments_no_overlap`` keeps one assignment per user per day,
+    so "the user's hub on D" is a single row or nothing. ``hub_id`` NULL is an explicit "no hub that
+    day" (it overrides the employment record's default hub).
+
+    Resolution (``hubs/assignments.py::hub_for``): an assignment covering the day → else the current
+    employment record's ``hub_id`` → else NULL. Field operations freeze it onto each shift
+    (``shifts.hub_id``) and use it as the ``hub`` policy dimension and the ``assigned_hub`` endpoint.
+    """
+
+    __tablename__ = "user_hub_assignments"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id", "user_id"], ["users.tenant_id", "users.id"],
+                             name="fk_user_hub_assignments_user", ondelete="CASCADE"),
+        ForeignKeyConstraint(["tenant_id", "hub_id"], ["hubs.tenant_id", "hubs.id"],
+                             name="fk_user_hub_assignments_hub", ondelete="CASCADE"),
+        CheckConstraint("valid_to IS NULL OR valid_to >= valid_from", name="chk_user_hub_assignments_window"),
+        CheckConstraint(f"source IN ({values(AssignmentSource)})", name="chk_user_hub_assignments_source"),
+        ExcludeConstraint(
+            ("tenant_id", "="), ("user_id", "="),
+            (text("daterange(valid_from, valid_to, '[]')"), "&&"),
+            using="gist", where=text("deleted_at IS NULL"), name="user_hub_assignments_no_overlap",
+        ),
+        Index("ix_user_hub_assignments_user", "tenant_id", "user_id", text("valid_from DESC"),
+              postgresql_where=text("deleted_at IS NULL")),
+        Index("ix_user_hub_assignments_hub_day", "tenant_id", "hub_id", "valid_from",
+              postgresql_where=text("deleted_at IS NULL AND hub_id IS NOT NULL")),
+        {"comment": "Date-effective hub of a user (daily changes; NULL hub = explicitly none)."},
+    )
+
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    hub_id: Mapped[int | None] = mapped_column(Integer, comment="NULL = explicitly no hub for these days")
+    valid_from: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    valid_to: Mapped[dt.date | None] = mapped_column(Date, comment="Inclusive; NULL = open-ended")
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default=AssignmentSource.MANAGER.value,
+                                        server_default=text(f"'{AssignmentSource.MANAGER.value}'"))
+    note: Mapped[str | None] = mapped_column(String(500))
+
+    def covers(self, day: dt.date) -> bool:
+        return self.valid_from <= day and (self.valid_to is None or day <= self.valid_to)
+
+    def __repr__(self) -> str:
+        return f"<UserHubAssignment user={self.user_id} hub={self.hub_id} {self.valid_from}..{self.valid_to}>"

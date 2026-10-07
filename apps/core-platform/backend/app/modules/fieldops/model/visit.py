@@ -135,6 +135,8 @@ class Visit(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Ha
     )
 
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="The rep who owns the visit")
+    stop_code: Mapped[str | None] = mapped_column(String(40), comment="Human stop reference (invoice / package no.)")
+    external_ref: Mapped[str | None] = mapped_column(String(100), comment="Order / shipment id in the owning module")
     shift_id: Mapped[int | None] = mapped_column(BigInteger, comment="NULL only when the policy allows it")
     device_id: Mapped[int | None] = mapped_column(BigInteger)
     channel: Mapped[str] = mapped_column(String(12), nullable=False, default=Channel.FIELD.value,

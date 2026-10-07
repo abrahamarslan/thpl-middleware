@@ -22,11 +22,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.modules.fieldops.endpoints import EndpointIn, EndpointOut
+from app.modules.fieldops.policy.settings import Scope
 from app.modules.fieldops.enums import (
     ActivityType,
+    AppState,
+    BatteryState,
     Channel,
     CheckpointLabel,
-    Enforcement,
     JustificationCode,
     LocationPermission,
     LocationProvider,
@@ -34,8 +37,8 @@ from app.modules.fieldops.enums import (
     ParticipantRole,
     PauseType,
     Platform,
+    ShiftWorkType,
     TaskType,
-    TrackingMode,
     TravelMode,
     VisitCancellationReason,
     VisitOutcome,
@@ -94,6 +97,8 @@ class FixIn(_In):
     is_charging: bool | None = None
     power_save: bool | None = None
     network_type: str | None = Field(None, max_length=10)
+    battery_state: BatteryState | None = None
+    app_state: AppState | None = Field(None, description="foreground | background when the fix was taken")
     sequence_no: int | None = Field(None, ge=0)
     client_timestamp: dt.datetime | None = Field(None, description="Fix time (Location.getTime)")
     elapsed_realtime_ms: int | None = Field(None, ge=0, description="Location.getElapsedRealtimeNanos / 1e6")
@@ -109,13 +114,21 @@ class PingIn(FixIn):
     kind: str = Field("continuous", pattern="^(continuous|checkpoint|manual)$")
     checkpoint_label: str | None = None
     shift_uuid: uuid_lib.UUID | None = None
-    visit_uuid: uuid_lib.UUID | None = None
+    visit_uuid: uuid_lib.UUID | None = Field(None, description="The visit / stop (Android stop_id)")
+    geofence_uuid: uuid_lib.UUID | None = Field(None, description="fence_id from the fence pack (enter/exit)")
+    client_significant: bool | None = Field(None, description="Client hint; the server decides")
+    client_distance_m: float | None = Field(None, ge=0, allow_inf_nan=False, description="Client hint")
     manual_reason: str | None = Field(None, max_length=500)
 
     @model_validator(mode="after")
     def _consistent(self) -> PingIn:
         if self.provider is LocationProvider.MANUAL and not self.manual_reason:
             raise ValueError("a manual fix needs manual_reason")
+        geofence = self.checkpoint_label in (CheckpointLabel.GEOFENCE_ENTER.value, CheckpointLabel.GEOFENCE_EXIT.value)
+        if geofence and self.geofence_uuid is None:
+            raise ValueError("a geofence_enter / geofence_exit checkpoint needs geofence_uuid")
+        if self.geofence_uuid is not None and not geofence:
+            raise ValueError("geofence_uuid is only for geofence_enter / geofence_exit checkpoints")
         if self.checkpoint_label is not None:
             if self.kind != "checkpoint":
                 raise ValueError("checkpoint_label requires kind='checkpoint'")
@@ -226,8 +239,19 @@ class DeviceEventsResultOut(BaseModel):
 
 # ── shifts ──────────────────────────────────────────────────────────────────────
 
+class JustificationIn(_In):
+    code: JustificationCode
+    note: str | None = Field(None, max_length=1000)
+
+
+
 class ShiftStartIn(_Located):
-    uuid: uuid_lib.UUID = Field(..., description="Client-generated UUIDv7 — the shift's id")
+    """Start a shift. ``uuid`` = a SCHEDULED shift's uuid (from ``GET /me/shifts``) starts that shift;
+    a new uuid starts from the user's shift template (or ad hoc, when the policy allows)."""
+
+    uuid: uuid_lib.UUID = Field(..., description="Client-generated UUIDv7, or the scheduled shift's uuid")
+    justification: JustificationIn | None = Field(None, description="Why you are outside the start location "
+                                                                    "(soft_block)")
     planned_end_at: dt.datetime | None = None
     vehicle_id: int | None = Field(None, gt=0)
     travel_mode: TravelMode | None = None
@@ -266,19 +290,63 @@ class PauseOut(_Out):
     ended_by: str | None
 
 
+class HubRef(BaseModel):
+    id: int
+    code: str | None = None
+    name: str | None = None
+
+
+class TemplateRef(BaseModel):
+    uuid: uuid_lib.UUID | None = None
+    code: str
+    name: str
+
+
 class ShiftSlim(_Out):
-    uuid: uuid_lib.UUID
+    """A shift as lists show it — the plan (title, work type, window, where it starts and ends, the hub),
+    the outcome (status, times, checks) and the stop counts. ``uuid`` is null only for a VIRTUAL entry
+    (``source = template``, a template occurrence nobody has started yet): start it with a new uuid."""
+
+    uuid: uuid_lib.UUID | None
+    shift_code: str | None = None
+    title: str | None = None
+    work_type: str | None = None
+    source: str = "ad_hoc"
     user_id: int
     shift_date: dt.date
     status: str
     review_status: str
-    started_at: dt.datetime | None
-    ended_at: dt.datetime | None
-    paused_since: dt.datetime | None
-    pause_count: int
-    wall_clock_minutes: Decimal | None
-    paid_minutes: Decimal | None
-    duration_basis: str | None
+    planned_start_at: dt.datetime | None = None
+    planned_end_at: dt.datetime | None = None
+    auto_close_at: dt.datetime | None = None
+    started_at: dt.datetime | None = None
+    ended_at: dt.datetime | None = None
+    paused_since: dt.datetime | None = None
+    pause_count: int = 0
+    wall_clock_minutes: float | None = None
+    paid_minutes: float | None = None
+    duration_basis: str | None = None
+    start_check: str = "not_configured"
+    start_distance_m: float | None = None
+    end_check: str = "not_configured"
+    end_distance_m: float | None = None
+    hub: HubRef | None = None
+    template: TemplateRef | None = None
+    start_location: EndpointOut | None = None
+    end_location: EndpointOut | None = None
+    stops_total: int = 0
+    stops_completed: int = 0
+
+
+class CapturedPoint(BaseModel):
+    """A checkpoint fix the app sent with an action (the shift's actual start / end location)."""
+
+    latitude: float
+    longitude: float
+    accuracy_m: float | None
+    recorded_at: dt.datetime
+    occurred_at: dt.datetime
+    is_mock: bool
 
 
 class ShiftOut(ShiftSlim):
@@ -286,12 +354,9 @@ class ShiftOut(ShiftSlim):
     device_id: int | None
     policy_id: int | None
     policy_snapshot: dict
-    planned_start_at: dt.datetime | None
-    planned_end_at: dt.datetime | None
     start_received_at: dt.datetime | None
     start_time_basis: str | None
     start_client_timestamp: dt.datetime | None
-    start_check: str
     start_manual_location_reason: str | None
     start_selfie_media_uuid: uuid_lib.UUID | None
     end_received_at: dt.datetime | None
@@ -299,20 +364,217 @@ class ShiftOut(ShiftSlim):
     end_client_timestamp: dt.datetime | None
     ended_by: str | None
     end_reason: str | None
-    pause_minutes: Decimal | None
-    unpaid_pause_minutes: Decimal | None
+    pause_minutes: float | None
+    unpaid_pause_minutes: float | None
     last_activity_at: dt.datetime | None
     vehicle_id: int | None
     travel_mode: str | None
-    odometer_start_km: Decimal | None
-    odometer_end_km: Decimal | None
+    odometer_start_km: float | None
+    odometer_end_km: float | None
     cancellation_reason: str | None
     notes: str | None
+    assigned_by: int | None = None
     reviewed_by: int | None
     reviewed_at: dt.datetime | None
     row_version: int
     created_at: dt.datetime
     updated_at: dt.datetime
+    captured_start: CapturedPoint | None = None
+    captured_end: CapturedPoint | None = None
+
+
+class ShiftScheduleIn(_In):
+    """Schedule a shift for a user. Either an explicit window (``planned_start_at`` + ``planned_end_at``) or a
+    ``template`` (code/uuid) and an optional ``date`` (default today, in the template's timezone); explicit
+    fields override the template's. ``start``/``end`` omitted = the template's, else anywhere."""
+
+    uuid: uuid_lib.UUID | None = Field(None, description="Optional client id — a replay returns the same shift")
+    user_id: int = Field(..., gt=0)
+    template: str | None = Field(None, max_length=64, description="Template code or uuid")
+    date: dt.date | None = Field(None, description="Business date of the template occurrence")
+    planned_start_at: dt.datetime | None = None
+    planned_end_at: dt.datetime | None = None
+    title: str | None = Field(None, max_length=200)
+    work_type: ShiftWorkType | None = None
+    start: EndpointIn | None = None
+    end: EndpointIn | None = None
+    notes: str | None = Field(None, max_length=2000)
+
+    utc_times = field_validator("planned_start_at", "planned_end_at", mode="after")(lambda cls, v: _utc(v))
+
+
+class ShiftScheduleBulkIn(_In):
+    shifts: list[ShiftScheduleIn] = Field(..., min_length=1, max_length=200)
+
+
+class ShiftScheduleUpdate(_In):
+    row_version: int = Field(..., ge=1)
+    planned_start_at: dt.datetime | None = None
+    planned_end_at: dt.datetime | None = None
+    title: str | None = Field(None, max_length=200)
+    work_type: ShiftWorkType | None = None
+    start: EndpointIn | None = None
+    end: EndpointIn | None = None
+    notes: str | None = Field(None, max_length=2000)
+
+    utc_times = field_validator("planned_start_at", "planned_end_at", mode="after")(lambda cls, v: _utc(v))
+
+
+class ShiftHandoverIn(_In):
+    occurred: ClockIn = Field(default_factory=ClockIn)
+
+
+# ── shift templates ─────────────────────────────────────────────────────────────
+
+class ShiftTemplateIn(_In):
+    code: str = Field(..., min_length=2, max_length=40, pattern="^[A-Za-z0-9_\\-]+$")
+    name: str = Field(..., min_length=2, max_length=120)
+    description: str | None = Field(None, max_length=2000)
+    title_pattern: str | None = Field(None, max_length=200)
+    work_type: ShiftWorkType = ShiftWorkType.OTHER
+    start_local_time: dt.time
+    end_local_time: dt.time
+    end_day_offset: int = Field(0, ge=0, le=1)
+    timezone: str | None = Field(None, max_length=64, description="IANA zone; omitted = the organization's")
+    days_of_week: list[int] = Field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7], min_length=1, max_length=7)
+    valid_from: dt.date | None = None
+    valid_until: dt.date | None = None
+    status: str = Field("active", pattern="^(active|inactive)$")
+    start: EndpointIn | None = None
+    end: EndpointIn | None = None
+
+    @field_validator("days_of_week")
+    @classmethod
+    def _days(cls, value: list[int]) -> list[int]:
+        if any(d < 1 or d > 7 for d in value):
+            raise ValueError("days_of_week are ISO weekdays 1 (Monday) … 7 (Sunday)")
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _tz(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        from zoneinfo import ZoneInfo
+
+        try:
+            ZoneInfo(value)
+        except Exception:  # noqa: BLE001
+            raise ValueError(f"unknown timezone {value!r}") from None
+        return value
+
+
+class ShiftTemplateUpdate(_In):
+    row_version: int = Field(..., ge=1)
+    name: str | None = Field(None, min_length=2, max_length=120)
+    description: str | None = Field(None, max_length=2000)
+    title_pattern: str | None = Field(None, max_length=200)
+    work_type: ShiftWorkType | None = None
+    start_local_time: dt.time | None = None
+    end_local_time: dt.time | None = None
+    end_day_offset: int | None = Field(None, ge=0, le=1)
+    timezone: str | None = Field(None, max_length=64)
+    days_of_week: list[int] | None = Field(None, min_length=1, max_length=7)
+    valid_from: dt.date | None = None
+    valid_until: dt.date | None = None
+    status: str | None = Field(None, pattern="^(active|inactive)$")
+    start: EndpointIn | None = None
+    end: EndpointIn | None = None
+
+
+class ShiftTemplateOut(_Out):
+    uuid: uuid_lib.UUID
+    id: int
+    organization_id: int
+    code: str
+    name: str
+    description: str | None
+    title_pattern: str | None
+    work_type: str
+    start_local_time: dt.time
+    end_local_time: dt.time
+    end_day_offset: int
+    timezone: str | None
+    days_of_week: list[int]
+    valid_from: dt.date | None
+    valid_until: dt.date | None
+    status: str
+    start_location: EndpointOut | None = None
+    end_location: EndpointOut | None = None
+    row_version: int
+    created_at: dt.datetime
+    updated_at: dt.datetime
+
+
+# ── stops (planned visits) ──────────────────────────────────────────────────────
+
+class StopIn(_In):
+    """One stop of a shift = a PLANNED visit. Where: ``place_uuid``, or ``latitude``/``longitude`` (+ address),
+    or an account whose address book has a place."""
+
+    uuid: uuid_lib.UUID | None = None
+    sequence: int | None = Field(None, ge=0)
+    purpose: str = Field("delivery", max_length=20)
+    account: dict[str, Any] | None = Field(None, description='{"type": "customer", "id": 42}')
+    place_uuid: uuid_lib.UUID | None = None
+    latitude: float | None = Field(None, ge=-90, le=90, allow_inf_nan=False)
+    longitude: float | None = Field(None, ge=-180, le=180, allow_inf_nan=False)
+    address: str | None = Field(None, max_length=500)
+    name: str | None = Field(None, max_length=255)
+    planned_start_at: dt.datetime | None = None
+    planned_end_at: dt.datetime | None = None
+    stop_code: str | None = Field(None, max_length=40)
+    external_ref: str | None = Field(None, max_length=100)
+    notes: str | None = Field(None, max_length=2000)
+
+    utc_times = field_validator("planned_start_at", "planned_end_at", mode="after")(lambda cls, v: _utc(v))
+
+
+class StopsIn(_In):
+    stops: list[StopIn] = Field(..., min_length=1, max_length=200)
+
+
+class FenceOut(BaseModel):
+    """One circle for Android's GeofencingClient (``requestId`` = ``fence_id``). A polygon fence is sent as
+    its minimum enclosing circle; the SERVER still verifies against the polygon."""
+
+    fence_id: uuid_lib.UUID
+    kind: str                      # start | end | stop
+    place_uuid: uuid_lib.UUID | None
+    visit_uuid: uuid_lib.UUID | None = None
+    latitude: float
+    longitude: float
+    radius_m: float
+    enforcement: str | None = None
+
+
+class StopOut(BaseModel):
+    uuid: uuid_lib.UUID
+    sequence: int | None
+    status: str
+    purpose: str
+    stop_code: str | None
+    external_ref: str | None
+    account_type: str | None
+    account_id: int | None
+    planned_start_at: dt.datetime | None
+    started_at: dt.datetime | None
+    ended_at: dt.datetime | None
+    start_check: str
+    location: EndpointOut | None = None
+
+
+class MyShiftDetailOut(BaseModel):
+    shift: ShiftOut
+    stops: list[StopOut]
+    fences: list[FenceOut]
+
+
+class VisitStartPlannedIn(_Located):
+    """Start a PLANNED visit (a stop): the fix is the proof-of-presence capture."""
+
+    justification: JustificationIn | None = None
+    notes: str | None = Field(None, max_length=2000)
 
 
 # ── visits ──────────────────────────────────────────────────────────────────────
@@ -320,11 +582,6 @@ class ShiftOut(ShiftSlim):
 class AccountRef(_In):
     type: str = Field(..., max_length=64, description="core.entity_types.code, e.g. 'customer'")
     id: int = Field(..., gt=0)
-
-
-class JustificationIn(_In):
-    code: JustificationCode
-    note: str | None = Field(None, max_length=1000)
 
 
 class VisitStartIn(_Located):
@@ -535,6 +792,9 @@ class CurrentOut(BaseModel):
     shift: ShiftOut | None = None
     open_pause: PauseOut | None = None
     visit: VisitOut | None = None
+    consent: dict[str, Any] = Field(default_factory=dict,
+                                    description='{"location_tracking": {"given", "version", "required"}} — prompt '
+                                                'before starting a shift when required and not given')
 
 
 class EffectivePolicyOut(BaseModel):
@@ -542,88 +802,71 @@ class EffectivePolicyOut(BaseModel):
     policy_uuid: uuid_lib.UUID | None
     values: dict[str, Any]
     can_telephonic: bool
+    layers: list[str] = Field(default_factory=list, description="Contributing layer uuids, general → specific")
+    epoch: int = 0
 
 
-class PolicyIn(_In):
+class PolicyLayerIn(_In):
+    """A policy layer for the request's organization (``X-Organization-Code``): an organization
+    fallback (``scope_type = organization``) or a role / team / hub / user target within it."""
+
     name: str = Field(..., min_length=2, max_length=120)
     description: str | None = Field(None, max_length=2000)
-    role_id: int | None = Field(None, gt=0, description="NULL = the organization default")
-    requires_shift: bool = True
-    allow_visits_without_shift: bool = False
-    require_location_consent: bool = True
-    require_start_selfie: bool = False
-    require_odometer: bool = False
-    require_start_at_place_id: int | None = Field(None, gt=0)
-    earliest_start_local: dt.time | None = None
-    latest_end_local: dt.time | None = None
-    max_shift_hours: Decimal = Field(Decimal("12.0"), gt=0, le=24)
-    auto_close_grace_minutes: int = Field(60, ge=0, le=24 * 60)
-    stale_shift_after_minutes: int = Field(240, gt=0)
-    max_pause_minutes: int = Field(90, gt=0)
-    max_pauses_per_shift: int = Field(6, gt=0)
-    paid_pause_types: list[PauseType] = Field(default_factory=lambda: [PauseType.REST, PauseType.MEETING,
-                                                                       PauseType.TRAINING])
-    track_during_pause: bool = False
-    tracking_mode: TrackingMode = TrackingMode.CONTINUOUS
-    ping_interval_s: int = Field(60, gt=0)
-    stationary_interval_s: int = Field(300, gt=0)
-    ping_min_distance_m: int = Field(50, ge=0)
-    geofence_enforcement: Enforcement = Enforcement.ADVISORY
-    default_visit_radius_m: int = Field(100, gt=0)
-    geocoded_radius_factor: Decimal = Field(Decimal("2.50"), ge=1)
-    max_fix_accuracy_m: int = Field(100, gt=0)
-    allow_manual_location: bool = True
-    min_visit_minutes: Decimal = Field(Decimal("2.0"), ge=0)
-    late_task_window_hours: int = Field(12, ge=0)
-    gap_flag_minutes: int = Field(30, gt=0)
-    clock_skew_flag_seconds: int = Field(300, gt=0)
-    min_tracking_coverage_pct: Decimal = Field(Decimal("70.00"), ge=0, le=100)
+    scope_type: Scope = Scope.ORGANIZATION
+    scope_id: int | None = Field(None, gt=0, description="roles/teams/hubs/users id; omitted for organization")
+    settings: dict[str, Any] = Field(default_factory=dict,
+                                     description="Sparse {setting key: value}; GET /policy-settings lists the keys")
+    locked_keys: list[str] = Field(default_factory=list, description="Keys (or key.field) narrower layers may not override")
+    priority: int = Field(0, ge=-100, le=100)
+    effective_from: dt.datetime | None = None
+    effective_until: dt.datetime | None = None
+    status: str = Field("active", pattern="^(active|inactive)$")
+
+    utc_times = field_validator("effective_from", "effective_until", mode="after")(lambda cls, v: _utc(v))
 
 
-class PolicyUpdate(PolicyIn):
-    name: str | None = Field(None, min_length=2, max_length=120)  # type: ignore[assignment]
+class PolicyLayerUpdate(_In):
     row_version: int = Field(..., ge=1)
+    name: str | None = Field(None, min_length=2, max_length=120)
+    description: str | None = Field(None, max_length=2000)
+    settings: dict[str, Any] | None = Field(None, description="Keys to set/replace (others are kept)")
+    unset: list[str] | None = Field(None, description="Keys (or key.field) to remove — back to inheritance")
+    locked_keys: list[str] | None = None
+    priority: int | None = Field(None, ge=-100, le=100)
+    effective_from: dt.datetime | None = None
+    effective_until: dt.datetime | None = None
     status: str | None = Field(None, pattern="^(active|inactive)$")
 
+    utc_times = field_validator("effective_from", "effective_until", mode="after")(lambda cls, v: _utc(v))
 
-class PolicyOut(_Out):
+
+class PolicyPreviewIn(PolicyLayerIn):
+    replaces: str | None = Field(None, description="uuid of the layer this draft would replace")
+
+
+class PolicyLayerOut(_Out):
     uuid: uuid_lib.UUID
     id: int
     organization_id: int
-    role_id: int | None
     name: str
     description: str | None
+    scope_type: str
+    scope_id: int | None
+    settings: dict[str, Any]
+    locked_keys: list[str]
+    priority: int
+    effective_from: dt.datetime | None
+    effective_until: dt.datetime | None
     status: str
-    requires_shift: bool
-    allow_visits_without_shift: bool
-    require_location_consent: bool
-    require_start_selfie: bool
-    require_odometer: bool
-    require_start_at_place_id: int | None
-    earliest_start_local: dt.time | None
-    latest_end_local: dt.time | None
-    max_shift_hours: Decimal
-    auto_close_grace_minutes: int
-    stale_shift_after_minutes: int
-    max_pause_minutes: int
-    max_pauses_per_shift: int
-    paid_pause_types: list[str]
-    track_during_pause: bool
-    tracking_mode: str
-    ping_interval_s: int
-    stationary_interval_s: int
-    ping_min_distance_m: int
-    geofence_enforcement: str
-    default_visit_radius_m: int
-    geocoded_radius_factor: Decimal
-    max_fix_accuracy_m: int
-    allow_manual_location: bool
-    min_visit_minutes: Decimal
-    late_task_window_hours: int
-    gap_flag_minutes: int
-    clock_skew_flag_seconds: int
-    min_tracking_coverage_pct: Decimal
     row_version: int
+    created_at: dt.datetime
+    updated_at: dt.datetime
+
+
+class PolicyLayerWriteOut(BaseModel):
+    layer: PolicyLayerOut
+    warnings: list[dict[str, Any]] = Field(default_factory=list,
+                                           description="Contributions that would be skipped (invalid combination)")
 
 
 # ── manager side ────────────────────────────────────────────────────────────────

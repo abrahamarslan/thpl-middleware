@@ -3,6 +3,7 @@
 | Route | Permission |
 |---|---|
 | ``GET ""`` · ``GET /{ref}`` | any signed-in user |
+| ``POST /resync`` | ``rbac.role:manage`` — re-apply the code-owned templates to this organization's system roles |
 | ``POST ""`` | ``rbac.role:create`` |
 | ``PATCH /{ref}`` | ``rbac.role:update`` (at the role's organization) |
 | ``PUT /{ref}/permissions`` | ``rbac.role:manage`` — a CUSTOM role's whole permission set |
@@ -53,6 +54,20 @@ async def list_roles(_: CurrentUser, db: DBSession):
 @router.get("/{ref}", response_model=ResponseModel[RoleOut])
 async def get_role(_: CurrentUser, db: DBSession, ref: str):
     return ResponseModel.ok(data=(await _outs(db, [await service.get_role(db, ref)]))[0])
+
+
+@router.post("/resync", response_model=ResponseModel[list[RoleOut]])
+async def resync_system_roles(
+    actor: Perm("rbac.role:manage"), db: DBSession, prune: bool = Query(False),
+):
+    """Re-apply the code-owned templates to THIS organization's system roles.
+
+    Adds every template permission the roles are missing — e.g. a permission added to ``member`` in
+    a later release, for organizations seeded before it existed. Add-missing-only unless
+    ``prune=true`` (which makes each explicit system role's set exactly match its template).
+    """
+    roles = await service.resync_system_roles(db, prune=prune, actor=actor)
+    return ResponseModel.ok(data=await _outs(db, roles), module="rbac", msg_key="roles_resynced")
 
 
 @router.post("", response_model=ResponseModel[RoleOut], status_code=201)

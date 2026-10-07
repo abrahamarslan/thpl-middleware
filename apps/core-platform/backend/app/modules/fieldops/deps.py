@@ -104,9 +104,10 @@ def request_id(request: Request) -> str | None:
 shift_target = org_of("app.modules.fieldops.model.shift:Shift")
 visit_target = org_of("app.modules.fieldops.model.visit:Visit")
 anomaly_target = org_of("app.modules.fieldops.model.ledger:Anomaly")
-policy_target = org_of("app.modules.fieldops.model.policy:WorkPolicy")
+policy_target = org_of("app.modules.fieldops.model.policy:PolicyLayer")
+template_target = org_of("app.modules.fieldops.model.template:ShiftTemplate", "code")
 
 __all__ = [
     "DeviceClock", "IdempotencyKeyDep", "anomaly_target", "device_clock", "idempotency_key",
-    "policy_target", "request_id", "shift_target", "visit_target",
+    "policy_target", "request_id", "shift_target", "template_target", "visit_target",
 ]

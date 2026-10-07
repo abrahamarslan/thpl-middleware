@@ -66,6 +66,8 @@ from app.database.mixins import AppMetaMixin, BigIntPKWithUUIDv7Mixin, MultiTena
 from app.modules.fieldops.enums import (
     FIELDOPS_SCHEMA,
     ActivityType,
+    AppState,
+    BatteryState,
     CheckAction,
     CheckPhase,
     CheckpointLabel,
@@ -97,6 +99,11 @@ class LocationPing(MultiTenantMixin, AppMetaMixin, Base):
                         "OR visit_uuid IS NOT NULL", name="chk_location_pings_visit_label"),
         CheckConstraint("checkpoint_label NOT IN ('shift_start','shift_end','shift_pause','shift_resume') "
                         "OR shift_uuid IS NOT NULL", name="chk_location_pings_shift_label"),
+        CheckConstraint("checkpoint_label NOT IN ('geofence_enter','geofence_exit') OR geofence_uuid IS NOT NULL",
+                        name="chk_location_pings_geofence_label"),
+        CheckConstraint(f"app_state IS NULL OR app_state IN ({values(AppState)})", name="chk_location_pings_app_state"),
+        CheckConstraint(f"battery_state IS NULL OR battery_state IN ({values(BatteryState)})",
+                        name="chk_location_pings_battery_state"),
         CheckConstraint(f"provider IN ({values(LocationProvider)})", name="chk_location_pings_provider"),
         CheckConstraint(f"time_basis IN ({values(TimeBasis)})", name="chk_location_pings_time_basis"),
         CheckConstraint(f"activity_type IS NULL OR activity_type IN ({values(ActivityType)})",
@@ -188,6 +195,13 @@ class LocationPing(MultiTenantMixin, AppMetaMixin, Base):
     place_id: Mapped[int | None] = mapped_column(BigInteger, comment="Checkpoints: the resolved place")
     geocode_call_id: Mapped[int | None] = mapped_column(BigInteger, comment="Checkpoints: geo.geocode_api_calls.id")
     address_label: Mapped[str | None] = mapped_column(Text, comment="Checkpoints: display snapshot")
+    geofence_id: Mapped[int | None] = mapped_column(BigInteger, comment="geo.geofences.id the event names (no FK)")
+    geofence_uuid: Mapped[uuid_lib.UUID | None] = mapped_column(PgUUID(as_uuid=True),
+                                                                comment="Fence the client reported (enter/exit)")
+    app_state: Mapped[str | None] = mapped_column(String(12), comment="foreground | background")
+    battery_state: Mapped[str | None] = mapped_column(String(14))
+    client_significant: Mapped[bool | None] = mapped_column(Boolean, comment="Client hint; diagnostics only")
+    client_distance_m: Mapped[float | None] = mapped_column(REAL, comment="Client-computed hop; diagnostics only")
     extras: Mapped[dict | None] = mapped_column(JSONB, comment="Sparse vendor fields; NULL normally")
 
     def __repr__(self) -> str:

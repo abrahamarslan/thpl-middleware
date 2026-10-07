@@ -122,5 +122,6 @@ source_modules =
     app.modules.vehicles
     app.modules.entities
     app.modules.idempotency
+    app.modules.hubs
 forbidden_modules =
     app.modules.fieldops

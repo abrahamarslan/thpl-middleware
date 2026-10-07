@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exception.errors import AppError, ConflictError, NotFoundError
-from app.database.tenancy import current_organization_id
+from app.database.tenancy import current_organization_id, current_tenant_id
 from app.modules.activity.recorder import record_activity
 from app.modules.rbac import engine
 from app.modules.rbac import service as rbac
@@ -158,3 +158,36 @@ async def seed_system_roles(db: AsyncSession, organization_id: int, *, prune: bo
         if role is not None and role.is_system:
             await rbac.apply_template(db, role, template, prune=prune)
     return created
+
+
+async def _org_roles(db: AsyncSession, organization_id: int) -> list[Role]:
+    return list((await db.scalars(
+        select(Role).where(Role.organization_id == organization_id)
+        .order_by(Role.hierarchy_level.desc(), Role.code)
+    )).all())
+
+
+async def resync_system_roles(db: AsyncSession, *, prune: bool = False, actor: Any) -> list[Role]:
+    """Re-apply the code-owned templates to THIS organization's system roles.
+
+    A release can add a permission to a template (e.g. ``fieldops.field_work:use`` on ``member``);
+    an organization seeded before it must be re-synced. Add-missing-only by default, so a permission
+    an operator deliberately removed is NOT put back; ``prune=True`` makes each explicit system
+    role's set exactly match its template. Grants are cached per tenant, so the epoch is bumped.
+    """
+    organization_id = _require_org()
+    before = await rbac.role_codes(db, await _org_roles(db, organization_id))
+    await seed_system_roles(db, organization_id, prune=prune)
+    await db.flush()
+    roles = await _org_roles(db, organization_id)
+    after = await rbac.role_codes(db, roles)
+    added = {r.code: sorted(set(after[r.id]) - set(before.get(r.id, ()))) for r in roles}
+    removed = {r.code: sorted(set(before.get(r.id, ())) - set(after[r.id])) for r in roles}
+    await record_activity(
+        db, action="roles_resynced", actor_id=actor.id, subject_type="Organization", subject_id=organization_id,
+        changes={"added": {c: v for c, v in added.items() if v},
+                 "removed": {c: v for c, v in removed.items() if v}},
+        context={"prune": prune},
+    )
+    await engine.bump_epoch(current_tenant_id())
+    return roles

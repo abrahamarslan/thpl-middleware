@@ -78,6 +78,12 @@ _FIELD_REVIEW: frozenset[str] = frozenset({
     "fieldops.anomaly:read", "fieldops.anomaly:approve", "users.location:read",
 })
 
+#: Planning field work: scheduling shifts (on templates), planning stops, and moving people between hubs by day.
+_FIELD_PLANNING: frozenset[str] = frozenset({
+    "fieldops.shift:create", "fieldops.shift:update", "fieldops.visit:create", "fieldops.visit:update",
+    "fieldops.shift_template:read", "hubs.assignment:read", "hubs.assignment:manage",
+})
+
 
 def _templates() -> tuple[RoleTemplate, ...]:
     reads = codes_matching(actions={"read"})
@@ -98,7 +104,7 @@ def _templates() -> tuple[RoleTemplate, ...]:
                 "teams.job_title:read", "teams.team_type:read", "teams.team_role:read",
                 "teams.team:read", "teams.membership:read", "teams.membership:assign",
                 "teams.membership:approve", "hr.employment:read",
-            }) | _FIELD_REVIEW | {"fieldops.policy:read"},
+            }) | _FIELD_REVIEW | _FIELD_PLANNING | {"fieldops.policy:read"},
         ),
         RoleTemplate(
             "team_manager", "Team Manager", "Manages a team and its members", 50, GrantMode.EXPLICIT,
@@ -107,7 +113,7 @@ def _templates() -> tuple[RoleTemplate, ...]:
                 "teams.team_type:read", "teams.team_role:read", "teams.team:read",
                 "teams.team:update", "teams.membership:read", "teams.membership:assign",
                 "teams.membership:approve",
-            }) | _FIELD_REVIEW,
+            }) | _FIELD_REVIEW | _FIELD_PLANNING,
         ),
         RoleTemplate(
             "auditor", "Auditor", "Read-only access to everything, plus the audit log",

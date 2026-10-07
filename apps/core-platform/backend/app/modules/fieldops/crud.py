@@ -33,7 +33,12 @@ from app.modules.fieldops.scope import Visible
 
 _SHIFT_SLIM = (Shift.id, Shift.uuid, Shift.user_id, Shift.organization_id, Shift.shift_date, Shift.status,
                Shift.review_status, Shift.started_at, Shift.ended_at, Shift.paused_since, Shift.pause_count,
-               Shift.wall_clock_minutes, Shift.paid_minutes, Shift.duration_basis)
+               Shift.wall_clock_minutes, Shift.paid_minutes, Shift.duration_basis, Shift.shift_code, Shift.title,
+               Shift.work_type, Shift.source, Shift.planned_start_at, Shift.planned_end_at, Shift.auto_close_at,
+               Shift.start_check, Shift.start_distance_m, Shift.end_check, Shift.end_distance_m, Shift.hub_id,
+               Shift.template_id, Shift.policy_snapshot, Shift.start_mode, Shift.start_hub_id, Shift.start_place_id,
+               Shift.start_enforcement, Shift.start_radius_m, Shift.end_mode, Shift.end_hub_id, Shift.end_place_id,
+               Shift.end_enforcement, Shift.end_radius_m)
 _VISIT_SLIM = (Visit.id, Visit.uuid, Visit.user_id, Visit.organization_id, Visit.shift_id, Visit.channel,
                Visit.status, Visit.review_status, Visit.purpose, Visit.account_type, Visit.account_id,
                Visit.place_id, Visit.started_at, Visit.ended_at, Visit.start_check, Visit.outcome)
@@ -49,9 +54,14 @@ def _scoped(stmt, visible: Visible | None, user_col, org_col):
 async def list_shifts(
     db: AsyncSession, *, visible: Visible | None, user_id: int | None = None, date_from: dt.date | None = None,
     date_to: dt.date | None = None, status: str | None = None, review_status: str | None = None,
-    limit: int = 50, offset: int = 0,
+    limit: int = 50, offset: int = 0, statuses: tuple[str, ...] | None = None,
+    planned_from: dt.datetime | None = None,
 ) -> list[Shift]:
     stmt = select(Shift).options(load_only(*_SHIFT_SLIM))
+    if statuses:
+        stmt = stmt.where(Shift.status.in_(statuses))
+    if planned_from is not None:
+        stmt = stmt.where(Shift.planned_end_at >= planned_from)
     stmt = _scoped(stmt, visible, Shift.user_id, Shift.organization_id)
     if user_id is not None:
         stmt = stmt.where(Shift.user_id == user_id)
@@ -63,7 +73,8 @@ async def list_shifts(
         stmt = stmt.where(Shift.status == status)
     if review_status is not None:
         stmt = stmt.where(Shift.review_status == review_status)
-    stmt = stmt.order_by(Shift.shift_date.desc(), Shift.started_at.desc().nulls_last()).limit(limit).offset(offset)
+    stmt = stmt.order_by(Shift.shift_date.desc(), Shift.started_at.desc().nulls_first(),
+                         Shift.planned_start_at.asc().nulls_last()).limit(limit).offset(offset)
     return list((await db.scalars(stmt)).all())
 
 
@@ -204,8 +215,22 @@ async def current_of(db: AsyncSession, user_id: int) -> tuple[Shift | None, Shif
 
 
 async def my_shifts(db: AsyncSession, user_id: int, *, date_from: dt.date | None, date_to: dt.date | None,
-                    limit: int = 31) -> list[Shift]:
-    return await list_shifts(db, visible=None, user_id=user_id, date_from=date_from, date_to=date_to, limit=limit)
+                    limit: int = 31, status: str | None = None, upcoming: bool = False) -> list[Shift]:
+    """My shifts: open first, then scheduled by planned start, then history (newest first). ``upcoming``:
+    only scheduled/open shifts whose planned window has not ended."""
+    if upcoming:
+        rows = await list_shifts(db, visible=None, user_id=user_id, statuses=("scheduled", "active", "paused"),
+                                 planned_from=dt.datetime.now(dt.UTC), limit=limit)
+        rows += [r for r in await list_shifts(db, visible=None, user_id=user_id, statuses=("active", "paused"),
+                                              limit=2) if r not in rows]
+    else:
+        rows = await list_shifts(db, visible=None, user_id=user_id, date_from=date_from, date_to=date_to,
+                                 status=status, limit=limit)
+    rank = {"active": 0, "paused": 0, "scheduled": 1}
+    far = dt.datetime.max.replace(tzinfo=dt.UTC)
+    return sorted(rows, key=lambda r: (rank.get(r.status, 2),
+                                       (r.planned_start_at or far) if r.status == "scheduled" else far,
+                                       -(r.shift_date.toordinal())))
 
 
 async def my_visits(db: AsyncSession, user_id: int, *, day_start: dt.datetime | None, day_end: dt.datetime | None,

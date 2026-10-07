@@ -6,7 +6,8 @@ session, and is IDEMPOTENT — a retried or duplicated message changes nothing t
 
 Periodic (beat, ``celery_app.py``)::
 
-    fieldops-auto-close          5 min   close shifts past their cap (ghost / auto-closed anomalies)
+    fieldops-auto-close          5 min   close shifts past auto_close_at; scheduled shifts never started → missed
+    fieldops-detect-silent       5 min   open shifts whose tracking went silent → tracking_silent
     fieldops-link-orphan-pings  10 min   back-fill shift_id / visit_id of fixes that beat their entity
     fieldops-recompute-metrics  15 min   closed shifts without (fresh) metrics — catches lost enqueues
     fieldops-geocode-checkpoints 10 min  address labels for new checkpoints (only when geocoding is on)
@@ -51,12 +52,24 @@ def auto_close_shifts() -> dict:
         closed = await shifts.auto_close_due(db)
         for shift_id in closed:
             await metrics.compute_shift_metrics(db, shift_id)
-        return {"closed": len(closed)}
+        missed = await shifts.mark_missed(db)
+        return {"closed": len(closed), "missed": len(missed)}
 
     result = _run("autoclose", body)
-    if result["closed"]:
+    if result["closed"] or result["missed"]:
         logger.info("fieldops.auto_close", **result)
     return result
+
+
+@shared_task(name="app.tasks.fieldops.detect_silent_shifts")
+def detect_silent_shifts() -> dict:
+    """Open shifts whose tracking went silent (the live zombie backstop; plan §3.7)."""
+    from app.modules.fieldops.service import shifts
+
+    async def body(db):
+        return {"raised": await shifts.detect_silent(db)}
+
+    return _run("silence", body)
 
 
 @shared_task(name="app.tasks.fieldops.link_orphan_pings")

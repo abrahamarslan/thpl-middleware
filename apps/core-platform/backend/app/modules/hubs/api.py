@@ -1,12 +1,25 @@
 """Hub API — mounted at /api/hubs (the caller's tenant + organization)."""
 
+import datetime as dt
+
 from fastapi import APIRouter, Query
+
+from app.common.exception.errors import NotFoundError
 
 from app.common.response.schema import ResponseModel
 from app.database.db import DBSession
-from app.modules.hubs import service
-from app.modules.hubs.schema import HubCreate, HubOut, HubSlim, HubUpdate
-from app.modules.rbac.deps import Perm, org_of
+from app.modules.hubs import assignments, service
+from app.modules.hubs.schema import (
+    HubAssignmentOut,
+    HubAssignmentsIn,
+    HubCreate,
+    HubOfDayOut,
+    HubOut,
+    HubSlim,
+    HubUpdate,
+)
+from app.modules.rbac.deps import GrantsDep, Perm, org_of
+from app.modules.rbac.engine import Target
 from app.modules.users.deps import CurrentUser
 
 router = APIRouter()
@@ -25,6 +38,59 @@ async def list_hubs(
 ):
     rows = await service.list_hubs(db, hub_type=hub_type, status=status, q=q, page=page, page_size=page_size)
     return ResponseModel.ok(data=[HubSlim.model_validate(r) for r in rows], module=_M, msg_key="listed")
+
+
+# ── user hub assignments (registered before /{ref}) ─────────────────────────────
+
+@router.get("/assignments", response_model=ResponseModel[list[HubAssignmentOut]])
+async def list_assignments(_: Perm("hubs.assignment:read"), db: DBSession, grants: GrantsDep,
+                           user_id: int | None = None, hub_id: int | None = None, date: dt.date | None = None):
+    """Assignments of the users whose organization the caller's ``hubs.assignment:read`` covers."""
+    rows = await assignments.list_assignments(db, user_id=user_id, hub_id=hub_id, day=date)
+    allowed: dict[int, bool] = {}
+    for org_id in {r.organization_id for r in rows}:
+        allowed[org_id] = await grants.allows(db, "hubs.assignment:read", Target(organization_id=org_id))
+    return ResponseModel(data=[HubAssignmentOut.model_validate(r) for r in rows if allowed[r.organization_id]])
+
+
+@router.post("/assignments", response_model=ResponseModel[list[HubAssignmentOut]], status_code=201)
+async def set_assignments(_: Perm("hubs.assignment:manage"), db: DBSession, grants: GrantsDep,
+                          body: HubAssignmentsIn):
+    """Set users' hubs by day or range (all-or-nothing). Overlapped assignments are split, not refused.
+
+    Authorized PER USER at that user's organization (a branch manager cannot move another branch's
+    people); one refused item refuses the whole request."""
+    from sqlalchemy import select
+
+    from app.modules.users.model import User
+
+    users = []
+    for item in body.assignments:
+        try:
+            item.window()
+        except ValueError as exc:
+            raise assignments.HubAssignmentError(str(exc), data={"user_id": item.user_id}) from None
+        user = await db.scalar(select(User).where(User.id == item.user_id))
+        if user is None:
+            raise NotFoundError(f"User {item.user_id} not found")
+        users.append(user)
+    await grants.require_all(db, "hubs.assignment:manage", [Target(organization_id=u.organization_id) for u in users])
+    out = []
+    for item, user in zip(body.assignments, users, strict=True):
+        start, end = item.window()
+        out.append(await assignments.assign(db, user=user, hub_id=item.hub_id, valid_from=start, valid_to=end,
+                                            note=item.note))
+    return ResponseModel(data=[HubAssignmentOut.model_validate(r) for r in out], msg="Hub assignments saved")
+
+
+@router.get("/me", response_model=ResponseModel[HubOfDayOut])
+async def my_hub(user: CurrentUser, db: DBSession, date: dt.date | None = None):
+    """My hub for a day (default: today in my organization's timezone)."""
+    day = date or await assignments.organization_today(db, user.organization_id)
+    found = await assignments.hub_of_day(db, tenant_id=user.tenant_id, user_id=user.id, day=day)
+    hub = await service.get_hub(db, found.hub_id) if found.hub_id else None
+    return ResponseModel(data=HubOfDayOut(date=day, hub_id=found.hub_id, source=found.source,
+                                          hub=HubSlim.model_validate(hub) if hub else None))
 
 
 @router.get("/{ref}", response_model=ResponseModel[HubOut])

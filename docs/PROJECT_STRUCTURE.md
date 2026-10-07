@@ -344,20 +344,25 @@ platform (`location_pings`, which replaced `user_location_pings`). Reference:
 
 | Path | Purpose / usage |
 |---|---|
-| `model/` | `policy.py` WorkPolicy · `device.py` Device, DeviceSession, DeviceEvent · `shift.py` Shift, ShiftPause, ShiftMetrics · `visit.py` Visit, VisitParticipant, VisitTask · `stream.py` LocationPing (partitioned), PingBatch, LocationCheck · `ledger.py` StateTransition, Anomaly. Every table: bigint PK + `uuid`. |
+| `model/` | `policy.py` PolicyLayer, PolicyEpoch · `template.py` ShiftTemplate · `device.py` Device, DeviceSession, DeviceEvent · `shift.py` Shift, ShiftPause, ShiftMetrics · `visit.py` Visit, VisitParticipant, VisitTask · `stream.py` LocationPing (partitioned), PingBatch, LocationCheck · `ledger.py` StateTransition, Anomaly. Every table: bigint PK + `uuid`. |
 | `enums.py` | Every closed vocabulary; CHECKs are generated from it. `QualityFlag` is the ping bitmask. |
+| `policy/` | Policy layers: `settings.py` (the settings registry), `dimensions.py` (scope targets), `resolver.py` (PURE `fold` + one-query loader + epoch), `render.py` (the Android config JSON). |
+| `endpoints.py` | Route endpoints (start/end: anywhere / hub / assigned_hub / place): `RouteEndpointsMixin`, `EndpointIn/Out`, place find-or-create. |
+| `wire.py` | PURE inbound ping mapper: the Android `PingDto` shape → `PingIn`, owner check, rejections. |
+| `cards.py` | Shift cards for lists/details (hub, template, endpoints, stop counts, fence pack) in a constant number of queries. |
+| `seed.py` | Company defaults: the `WORK_SHIFT` template and default/member policy layers (`scripts/seed.py --only fieldops.defaults`). |
 | `clock.py` | PURE: business time from the device's monotonic / wall clocks + send-time headers; the partition-key clamp; the organization's business day. |
 | `verification.py` | PURE: accuracy-aware `classify` / `classify_polygon`, radius from place provenance, the enforcement matrix (`decide`). |
 | `trackmath.py` | PURE: impossible hops, movement, jitter-free distance, coverage/gaps, dwell, interval algebra. |
 | `state.py` | PURE: the lifecycle and review state machines. |
 | `task_types.py` | The visit-task registry: payload model, channels, reference types per `task_type`. |
 | `schema.py` · `deps.py` · `errors.py` | Transport schemas; device-clock / idempotency-key headers and row targets; domain errors with stable codes. |
-| `service/` | `ingest` (batch write path, checkpoints, live projection) · `shifts` (start/pause/resume/end/supersede/auto-close/correct/review) · `visits` · `tasks` · `verify` (the one PostGIS evaluator + dwell) · `metrics` · `anomalies` · `policy` · `devices` · `transitions` (the only status writer) · `geocode` (checkpoint labels). |
+| `service/` | `ingest` (batch write path, checkpoints, live projection, mock policy) · `shifts` (start — scheduled / template / ad hoc — pause/resume/end/supersede/auto-close/missed/silence/schedule/handover/correct/review) · `templates` (occurrences, materialization) · `session_rules` / `consent_hooks` (registered with users / compliance) · `visits` · `tasks` · `verify` (the one PostGIS evaluator + dwell) · `metrics` · `anomalies` · `policy` · `devices` · `transitions` (the only status writer) · `geocode` (checkpoint labels). |
 | `crud.py` | Read queries: Slim lists (`load_only`), details, track, live map, review queue. |
 | `scope.py` | Interim data scope for managers' reads (teams, reports) until RBAC data scope exists. |
 | `partitions.py` | Monthly partitions ahead + retention (no pg_partman). |
 | `api_me.py` · `api.py` | `/api/me/…` (the field app, incl. the legacy `/me/location`) · `/api/fieldops/…` (managers). |
-| `app/tasks/fieldops.py` | Celery: auto-close, orphan linking, metrics, checkpoint geocoding, missed visits, maintenance. |
+| `app/tasks/fieldops.py` | Celery: auto-close (+ missed shifts), silent-tracking detector, orphan linking, metrics, checkpoint geocoding, missed visits, maintenance. |
 | `app/modules/idempotency/` | `core.idempotency_keys` + `run()` — replay-safe mutations for offline clients (platform-wide). |
 
 #### `app/modules/tags|documents|media|emails|search/` — cross-cutting modules (see [docs/MODULES.md](MODULES.md))

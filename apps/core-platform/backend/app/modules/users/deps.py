@@ -23,7 +23,7 @@ optional header never blocks a request.
 import uuid
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.common.exception.errors import AuthError, ForbiddenError
@@ -31,17 +31,18 @@ from app.common.security.authentik import decode_authentik_token, looks_like_aut
 from app.common.security.jwt import bearer_scheme, decode_token
 from app.core.conf import settings
 from app.database.db import DBSession
-from app.modules.users import crud, moderation, service
+from app.modules.users import crud, moderation, service, sessions
 from app.modules.users.model import User
 
 
 async def get_current_user(
+    request: Request,
     db: DBSession,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     x_organization_id: Annotated[str | None, Header(alias="X-Organization-Id")] = None,
     x_organization_code: Annotated[str | None, Header(alias="X-Organization-Code")] = None,
 ) -> User:
-    user = await _authenticate(db, credentials)
+    user = await _authenticate(db, credentials, request)
     await _bind_tenancy(db, user, org_uuid=x_organization_id, org_code=x_organization_code)
     return user
 
@@ -56,7 +57,7 @@ OrganizationCode = Annotated[
 ]
 
 
-async def _authenticate(db, credentials: HTTPAuthorizationCredentials | None) -> User:
+async def _authenticate(db, credentials: HTTPAuthorizationCredentials | None, request: Request | None = None) -> User:
     if credentials is None:
         raise AuthError("Missing bearer token")
     token = credentials.credentials
@@ -66,6 +67,13 @@ async def _authenticate(db, credentials: HTTPAuthorizationCredentials | None) ->
         return await service.provision_from_authentik(db, claims)
 
     payload = decode_token(token, expected_type="access")
+    # The session decides, not the token's expiry: a revoked session is a 401 session_revoked here.
+    # A displaced field session may still upload its queued telemetry (drain grant) — routes read the cut-off.
+    drain_not_after = await sessions.check(db, payload, path=request.url.path if request is not None else None)
+    sessions.bind_claims(payload)
+    if request is not None:
+        request.state.token_claims = payload
+        request.state.session_drain_not_after = drain_not_after
     try:
         user_id = int(payload["sub"])
     except (KeyError, TypeError, ValueError):

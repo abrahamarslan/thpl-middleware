@@ -518,3 +518,8 @@ class UserLiveLocation(IntPKMixin, MultiTenantMixin, AppMetaMixin, TimestampMixi
 
     def __repr__(self) -> str:
         return f"<UserLiveLocation user={self.user_id} recorded_at={self.recorded_at}>"
+
+
+# Sign-in sessions live in their own module (schema ``auth``); imported here so every importer of the
+# users models maps it too (alembic env, the Celery worker boot, the conformance test).
+from app.modules.users.session_model import UserSession  # noqa: E402,F401

@@ -39,10 +39,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.conf import settings
-from app.modules.fieldops import clock
+from app.modules.fieldops import clock, wire
 from app.modules.fieldops.clock import Derived, EventClock, SendContext
 from app.modules.fieldops.enums import (
+    CHARGING_STATES,
     SHIFT_LABELS,
+    BatteryState,
     VISIT_LABELS,
     LocationProvider,
     PingKind,
@@ -127,9 +129,16 @@ def build_row(
     *, user: Any, fix: FixIn, derived: Derived, recorded_at: dt.datetime, received_at: dt.datetime,
     kind: str, label: str | None, shift_uuid: uuid_lib.UUID | None, visit_uuid: uuid_lib.UUID | None,
     ctx: _Context, device_id: int | None, session_uuid: uuid_lib.UUID | None, flags: int,
-    manual_reason: str | None = None, batch_id: int | None = None,
+    manual_reason: str | None = None, batch_id: int | None = None, geofence_id: int | None = None,
 ) -> dict[str, Any]:
+    battery_state = fix.battery_state.value if getattr(fix, "battery_state", None) else None
+    is_charging = fix.is_charging if fix.is_charging is not None else (
+        battery_state in CHARGING_STATES if battery_state and battery_state != BatteryState.UNKNOWN.value else None)
     return {
+        "app_state": fix.app_state.value if getattr(fix, "app_state", None) else None,
+        "battery_state": battery_state, "geofence_uuid": getattr(fix, "geofence_uuid", None),
+        "geofence_id": geofence_id, "client_significant": getattr(fix, "client_significant", None),
+        "client_distance_m": getattr(fix, "client_distance_m", None),
         "tenant_id": user.tenant_id, "organization_id": user.organization_id, "user_id": user.id,
         "recorded_at": recorded_at, "uuid": fix.uuid, "batch_id": batch_id, "device_id": device_id,
         "device_session_uuid": session_uuid, "shift_id": ctx.shift_id, "visit_id": ctx.visit_id,
@@ -144,7 +153,7 @@ def build_row(
         "satellites": fix.satellites, "is_mock": fix.is_mock,
         "activity_type": fix.activity_type.value if fix.activity_type else None,
         "activity_confidence": fix.activity_confidence, "battery_pct": fix.battery_pct,
-        "is_charging": fix.is_charging, "power_save": fix.power_save, "network_type": fix.network_type,
+        "is_charging": is_charging, "power_save": fix.power_save, "network_type": fix.network_type,
         "quality_flags": flags, "manual_reason": manual_reason, "extras": fix.extras,
         "app_version": settings.VERSION, "app_metadata": {},
     }
@@ -240,8 +249,25 @@ async def touch_shifts(db: AsyncSession, latest: dict[int, dt.datetime]) -> None
         )
 
 
+async def _employee_codes(db: AsyncSession, user: Any) -> list[str]:
+    return list((await db.execute(text(
+        "SELECT employee_code FROM employment_records WHERE tenant_id = :t AND user_id = :u AND deleted_at IS NULL"),
+        {"t": user.tenant_id, "u": user.id})).scalars().all())
+
+
+async def _geofences(db: AsyncSession, tenant_id: int, uuids: set) -> dict:
+    if not uuids:
+        return {}
+    rows = (await db.execute(text(
+        "SELECT uuid, id FROM geo.geofences WHERE tenant_id = :t AND uuid = ANY(CAST(:u AS uuid[]))"),
+        {"t": tenant_id, "u": [str(u) for u in uuids]})).all()
+    return {r.uuid: r.id for r in rows}
+
+
 async def ingest_batch(db: AsyncSession, user: Any, send: SendContext, body: PingBatchIn,
-                       *, session: DeviceSession | None) -> PingBatchResultOut:
+                       *, session: DeviceSession | None, not_after: dt.datetime | None = None) -> PingBatchResultOut:
+    """``not_after``: a displaced session's telemetry-drain grant — items recorded after the session was
+    revoked are refused (only what the device queued while it was signed in may still arrive)."""
     started = time.monotonic()
     existing = await db.scalar(select(PingBatch).where(PingBatch.uuid == body.uuid))
     if existing is not None:
@@ -258,14 +284,28 @@ async def ingest_batch(db: AsyncSession, user: Any, send: SendContext, body: Pin
     received = clock.utc(send.received_at)
     results: list[PingItemResult] = []
     items: list[PingIn] = []
+    owners = None
+    if any(isinstance(r, dict) and (r.get("da_id") is not None or r.get("user_ref") is not None) for r in body.pings):
+        owners = wire.owner_ids(user, await _employee_codes(db, user))
     for raw in body.pings:
+        raw_id = (raw.get("uuid") or raw.get("ping_id")) if isinstance(raw, dict) else None
+        raw_id = str(raw_id) if raw_id is not None else None
         try:
-            item = PingIn.model_validate(raw)
+            item = PingIn.model_validate(wire.normalize(raw, owners=owners))
+        except wire.WireError as exc:
+            results.append(PingItemResult(uuid=raw_id, status="rejected", reason=str(exc)))
+            continue
         except ValidationError as exc:
             first = exc.errors()[0]
-            results.append(PingItemResult(uuid=str(raw.get("uuid")) if isinstance(raw, dict) else None,
-                                          status="rejected",
+            results.append(PingItemResult(uuid=raw_id, status="rejected",
                                           reason=f"{'.'.join(str(p) for p in first.get('loc', ()))}: {first.get('msg')}"))
+            continue
+        # The drain cut-off judges the BUSINESS time (monotonic-anchored), not the device's wall clock —
+        # a signed-out phone must not slip new fixes in by backdating captured_at.
+        if not_after is not None and clock.derive(
+                send, EventClock(item.client_timestamp, item.elapsed_realtime_ms, item.boot_count)).occurred_at > not_after:
+            results.append(PingItemResult(uuid=str(item.uuid), status="rejected",
+                                          reason="session_revoked: recorded after this device was signed out"))
             continue
         if item.checkpoint_label and item.checkpoint_label in VISIT_LABELS and item.visit_uuid is None:
             results.append(PingItemResult(uuid=str(item.uuid), status="rejected", reason="visit label needs visit_uuid"))
@@ -278,6 +318,7 @@ async def ingest_batch(db: AsyncSession, user: Any, send: SendContext, body: Pin
     policy = await resolve_policy(db, user)
     shifts, visits = await _contexts(db, user, {i.shift_uuid for i in items if i.shift_uuid},
                                      {i.visit_uuid for i in items if i.visit_uuid})
+    fences = await _geofences(db, user.tenant_id, {i.geofence_uuid for i in items if i.geofence_uuid})
     device_id = session.device_id if session else None
 
     prepared: list[tuple[PingIn, dict[str, Any], bool]] = []
@@ -303,7 +344,8 @@ async def ingest_batch(db: AsyncSession, user: Any, send: SendContext, body: Pin
         row = build_row(user=user, fix=item, derived=derived, recorded_at=recorded_at, received_at=received,
                         kind=kind, label=item.checkpoint_label, shift_uuid=item.shift_uuid,
                         visit_uuid=item.visit_uuid, ctx=ctx, device_id=device_id,
-                        session_uuid=send.session_uuid, flags=flags, manual_reason=item.manual_reason)
+                        session_uuid=send.session_uuid, flags=flags, manual_reason=item.manual_reason,
+                        geofence_id=fences.get(item.geofence_uuid) if item.geofence_uuid else None)
         prepared.append((item, row, clamped))
 
     fresh_clamped = await _first_seen(user.tenant_id, [i.uuid for i, _, c in prepared if c])
@@ -334,6 +376,7 @@ async def ingest_batch(db: AsyncSession, user: Any, send: SendContext, body: Pin
         if r["shift_id"] is not None:
             latest[r["shift_id"]] = max(latest.get(r["shift_id"], r["occurred_at"]), r["occurred_at"])
     await touch_shifts(db, latest)
+    await _mock_policy(db, user, [r for r in fresh_rows if r["is_mock"]])
 
     rejected = sum(1 for r in results if r.status == "rejected")
     batch = PingBatch(
@@ -351,6 +394,58 @@ async def ingest_batch(db: AsyncSession, user: Any, send: SendContext, body: Pin
                 duplicates=len(duplicates), rejected=rejected, ingest_ms=batch.ingest_ms)
     return PingBatchResultOut(batch_uuid=body.uuid, accepted=len(accepted), duplicates=len(duplicates),
                               rejected=rejected, results=results)
+
+
+async def _mock_policy(db: AsyncSession, user: Any, mock_rows: list[dict[str, Any]]) -> None:
+    """``security.mock_location_action`` on AMBIENT fixes (they are always stored — evidence of the attempt —
+    flagged MOCK and never evidence). Per shift, from its frozen policy: ``flag_only`` → info anomaly;
+    ``reject_and_alert`` → critical anomaly; ``end_shift`` → critical anomaly and the shift is closed
+    (``end_reason = policy_violation``, review pending)."""
+    if not mock_rows:
+        return
+    from app.modules.fieldops.enums import (
+        AnomalyType,
+        DurationBasis,
+        EndedBy,
+        PauseEndReason,
+        Severity,
+        ShiftEndReason,
+        SubjectType,
+        TimeBasis,
+        TransitionSource,
+        VisitCancellationReason,
+    )
+    from app.modules.fieldops.service import anomalies
+    from app.modules.fieldops.service.policy import EffectivePolicy
+
+    by_shift: dict[int, list[dict[str, Any]]] = {}
+    for row in mock_rows:
+        if row["shift_id"] is not None:
+            by_shift.setdefault(row["shift_id"], []).append(row)
+    for shift_id, rows in by_shift.items():
+        shift = await db.get(Shift, shift_id)
+        if shift is None:
+            continue
+        policy = EffectivePolicy.from_snapshot(shift.policy_snapshot)
+        action = str(getattr(policy.mock_location_action, "value", policy.mock_location_action))
+        severity = Severity.INFO if action == "flag_only" else Severity.CRITICAL
+        await anomalies.open_anomaly(
+            db, anomaly_type=AnomalyType.MOCK_LOCATION, severity=severity, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=user.id, shift_id=shift.id, dedupe_key=f"mock_location:shift:{shift.id}",
+            detector="ingest", evidence={"fixes": len(rows), "action": action,
+                                         "first_at": min(r["occurred_at"] for r in rows).isoformat()},
+        )
+        if action == "end_shift" and shift.is_open:
+            from app.modules.fieldops.service.shifts import close_shift
+
+            await close_shift(
+                db, shift, ended_at=min(r["occurred_at"] for r in rows), time_basis=TimeBasis.SERVER_RECEIPT.value,
+                received_at=dt.datetime.now(dt.UTC), ended_by=EndedBy.SYSTEM, end_reason=ShiftEndReason.POLICY_VIOLATION,
+                to_status=ShiftStatus.AUTO_CLOSED, source=TransitionSource.SYSTEM,
+                duration_basis=DurationBasis.SYSTEM_ESTIMATED, pause_reason=PauseEndReason.AUTO_CLOSED,
+                visit_reason=VisitCancellationReason.SHIFT_AUTO_CLOSED,
+            )
+            logger.warning("fieldops.shift_ended_mock_location", shift_id=shift.id, user_id=user.id)
 
 
 async def write_checkpoint(

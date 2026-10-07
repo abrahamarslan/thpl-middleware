@@ -45,6 +45,8 @@ from app.modules.fieldops.enums import (
     TransitionAxis,
     TransitionSource,
     VisitCancellationReason,
+    VisitPurpose,
+    VisitSource,
     VisitStatus,
 )
 from app.modules.fieldops.errors import (
@@ -184,6 +186,7 @@ async def _start_visit(db: AsyncSession, act: Act, body: VisitStartIn, *, can_re
                 raise FieldOpsRuleError("manual_location_not_allowed",
                                         "Your work policy does not allow manual locations")
 
+    await mock_gate(policy, body.fix)
     # "Two customers at once" — checked first for a precise 409; uq_visits_one_in_progress backs it
     # against a race (the global handler turns that unique violation into a 409 too).
     running = await in_progress_visit_of(db, user.id)
@@ -211,13 +214,30 @@ async def _start_visit(db: AsyncSession, act: Act, body: VisitStartIn, *, can_re
     db.add(visit)
     await db.flush()
 
+    await _verify_start(db, act, visit, shift=shift, policy=policy, when=when, offline=offline,
+                        fix=body.fix, manual=body.manual_location, justification=body.justification,
+                        device_id=device_id, new=True)
+    await record_activity(db, action="fieldops_visit_started", actor_id=user.id, subject_type="Visit",
+                          subject_id=visit.id, context={"uuid": str(visit.uuid), "channel": channel,
+                                                        "check": visit.start_check})
+    return visit, True
+
+
+async def _verify_start(db: AsyncSession, act: Act, visit: Visit, *, shift: Shift | None, policy: EffectivePolicy,
+                        when: Any, offline: bool, fix: Any, manual: Any, justification: Any, device_id: int | None,
+                        new: bool) -> None:
+    """The start of a visit after its row exists: the ``visit_start`` checkpoint (evidence first), the
+    verdict + enforcement (raises to refuse — the caller's savepoint rolls everything back), the
+    lifecycle transition and the anomalies. Shared by ad-hoc starts and planned stops."""
+    user = act.user
+    channel = visit.channel
+    place_id = visit.place_id
     await ingest.write_checkpoint(db, user=user, send=act.send, derived=when, label=CheckpointLabel.VISIT_START.value,
-                                  fix=body.fix, manual=body.manual_location, shift=shift, visit=visit,
-                                  device_id=device_id, policy=policy)
+                                  fix=fix, manual=manual, shift=shift, visit=visit, device_id=device_id, policy=policy)
     verdict = await verify.evaluate(
         db, subject=visit, subject_type=SubjectType.VISIT, phase=CheckPhase.START, user_id=user.id,
         at=when.occurred_at, place_id=place_id, channel=channel, policy=policy, offline=offline,
-        justified=body.justification is not None,
+        justified=justification is not None,
     )
     decision = verdict.decision
     if decision.block_code == "justification_required":
@@ -230,10 +250,16 @@ async def _start_visit(db: AsyncSession, act: Act, body: VisitStartIn, *, can_re
                                       "enforcement": "hard_block"})
     visit.start_check = verdict.result.value
     visit.distance_from_target_m = verdict.distance_m
-    record(db, subject=visit, subject_type=SubjectType.VISIT, axis=TransitionAxis.LIFECYCLE, from_state=None,
-           to_state=VisitStatus.IN_PROGRESS.value, occurred_at=when.occurred_at, time_basis=when.basis,
-           source=TransitionSource.DEVICE, client_timestamp=body.occurred.client_timestamp,
-           request_id=act.request_id, idempotency_key=act.idempotency_key)
+    if new:
+        record(db, subject=visit, subject_type=SubjectType.VISIT, axis=TransitionAxis.LIFECYCLE, from_state=None,
+               to_state=VisitStatus.IN_PROGRESS.value, occurred_at=when.occurred_at, time_basis=when.basis,
+               source=TransitionSource.DEVICE, client_timestamp=visit.start_client_timestamp,
+               request_id=act.request_id, idempotency_key=act.idempotency_key)
+    else:
+        transition(db, visit, subject_type=SubjectType.VISIT, to_state=VisitStatus.IN_PROGRESS.value,
+                   occurred_at=when.occurred_at, time_basis=when.basis, source=TransitionSource.DEVICE,
+                   client_timestamp=visit.start_client_timestamp, request_id=act.request_id,
+                   idempotency_key=act.idempotency_key, reason_code="started")
     if decision.review_pending:
         transition(db, visit, subject_type=SubjectType.VISIT, axis=TransitionAxis.REVIEW,
                    to_state=ReviewStatus.PENDING.value, occurred_at=when.occurred_at, time_basis=when.basis,
@@ -245,9 +271,9 @@ async def _start_visit(db: AsyncSession, act: Act, body: VisitStartIn, *, can_re
             dedupe_key=f"{decision.anomaly.value}:visit:{visit.id}", detector="verifier",
             evidence={"result": verdict.result.value, "distance_m": verdict.distance_m,
                       "target": verdict.target.kind.value, "offline": offline,
-                      "justification": body.justification.model_dump(mode="json") if body.justification else None},
+                      "justification": justification.model_dump(mode="json") if justification else None},
         )
-    if body.fix is None and channel == Channel.FIELD.value:
+    if fix is None and channel == Channel.FIELD.value:
         await anomalies.open_anomaly(
             db, anomaly_type=AnomalyType.MANUAL_LOCATION, severity=Severity.INFO, subject_type=SubjectType.VISIT,
             subject=visit, user_id=user.id, shift_id=visit.shift_id, dedupe_key=f"manual_location:visit:{visit.id}",
@@ -267,12 +293,136 @@ async def _start_visit(db: AsyncSession, act: Act, body: VisitStartIn, *, can_re
     await db.flush()
     if shift is not None:
         await ingest.touch_shifts(db, {shift.id: when.occurred_at})
-    await record_activity(db, action="fieldops_visit_started", actor_id=user.id, subject_type="Visit",
-                          subject_id=visit.id, context={"uuid": str(visit.uuid), "channel": channel,
-                                                        "check": visit.start_check})
     logger.info("fieldops.visit_started", visit_id=visit.id, user_id=user.id, channel=channel,
-                check=visit.start_check, action=decision.action.value)
-    return visit, True
+                check=visit.start_check, action=decision.action.value, planned=not new)
+
+
+async def start_planned(db: AsyncSession, act: Act, visit_uuid: uuid_lib.UUID, body: Any,
+                        *, device_id: int | None) -> tuple[Visit, bool]:
+    """Start a PLANNED visit (a stop of my shift). The fix is the proof-of-presence capture; verification
+    and enforcement are exactly those of an ad-hoc start. A replay returns the visit (False)."""
+    async with db.begin_nested():
+        user = act.user
+        visit = await own_visit(db, user, visit_uuid)
+        if visit.status == VisitStatus.IN_PROGRESS.value:
+            return visit, False
+        if visit.status != VisitStatus.PLANNED.value:
+            raise FieldOpsConflict("visit_not_planned", f"The visit is {visit.status}", data={"visit": visit_brief(visit)})
+        shift = await db.get(Shift, visit.shift_id) if visit.shift_id else None
+        if shift is not None and shift.status == ShiftStatus.SCHEDULED.value:
+            raise FieldOpsConflict("shift_not_active", "Start your shift before its stops",
+                                   data={"shift_uuid": str(shift.uuid)})
+        if shift is not None and shift.status == ShiftStatus.PAUSED.value:
+            raise FieldOpsConflict("shift_paused", "Resume your shift before starting a visit")
+        if shift is not None and not shift.is_open:
+            raise FieldOpsConflict("shift_not_active", f"The shift is {shift.status}")
+        policy = policy_of(shift) if shift is not None else await resolve_policy(db, user)
+        if body.fix is None:
+            if body.manual_location is None:
+                raise FieldOpsRuleError("location_required",
+                                        "A location fix is required; with no GPS send manual_location with a reason")
+            if not policy.allow_manual_location:
+                raise FieldOpsRuleError("manual_location_not_allowed", "Your work policy does not allow manual locations")
+        await mock_gate(policy, body.fix)
+        running = await in_progress_visit_of(db, user.id)
+        if running is not None:
+            raise FieldOpsConflict("visit_in_progress", "You already have a visit in progress",
+                                   data={"active_visit": visit_brief(running)})
+        when = act.when(body.occurred)
+        offline = act.send.received_at - when.occurred_at > OFFLINE_AFTER
+        visit.device_id = device_id
+        visit.started_at = when.occurred_at
+        visit.start_received_at = act.send.received_at
+        visit.start_time_basis = when.basis
+        visit.start_client_timestamp = body.occurred.client_timestamp
+        visit.start_justification_code = body.justification.code.value if body.justification else None
+        visit.start_justification_note = body.justification.note if body.justification else None
+        visit.manual_location_reason = body.manual_location.reason if body.fix is None and body.manual_location else None
+        if body.notes:
+            visit.notes = body.notes
+        await db.flush()
+        await _verify_start(db, act, visit, shift=shift, policy=policy, when=when, offline=offline, fix=body.fix,
+                            manual=body.manual_location, justification=body.justification, device_id=device_id,
+                            new=False)
+        await record_activity(db, action="fieldops_visit_started", actor_id=user.id, subject_type="Visit",
+                              subject_id=visit.id, context={"uuid": str(visit.uuid), "planned": True,
+                                                            "check": visit.start_check})
+        return visit, True
+
+
+async def plan_stops(db: AsyncSession, shift: Shift, body: Any, *, actor: Any) -> list[Visit]:
+    """Add stops (PLANNED visits) to a scheduled or open shift, in order. Where: a place uuid, coordinates
+    (found-or-created as a place), or an account's address-book place."""
+    from app.modules.fieldops.endpoints import find_or_create_place
+
+    if shift.status not in (ShiftStatus.SCHEDULED.value, ShiftStatus.ACTIVE.value, ShiftStatus.PAUSED.value):
+        raise FieldOpsConflict("shift_not_plannable", f"Stops cannot be added to a {shift.status} shift")
+    next_seq = int(await db.scalar(text(
+        "SELECT COALESCE(max(sequence_in_plan), -1) + 1 FROM fieldops.visits WHERE shift_id = :s AND deleted_at IS NULL"
+    ), {"s": shift.id}) or 0)
+    created = []
+    for item in body.stops:
+        if item.uuid is not None:
+            found = await db.scalar(select(Visit).where(Visit.uuid == item.uuid).execution_options(include_deleted=True))
+            if found is not None:
+                if found.shift_id != shift.id:
+                    raise FieldOpsConflict("uuid_conflict", f"Visit uuid {item.uuid} is already used")
+                created.append(found)
+                continue
+        account_type = account_id = None
+        if item.account:
+            account_type, account_id = str(item.account.get("type")), int(item.account.get("id"))
+            if not await entity_exists(db, account_type, account_id, shift.tenant_id):
+                raise FieldOpsRuleError("account_not_found", f"{account_type} {account_id} not found")
+        if item.place_uuid is not None:
+            place_id = await _place_id(db, item.place_uuid, shift.tenant_id)
+        elif item.latitude is not None and item.longitude is not None:
+            place_id = await find_or_create_place(db, latitude=item.latitude, longitude=item.longitude,
+                                                  address=item.address, name=item.name, tenant_id=shift.tenant_id,
+                                                  organization_id=shift.organization_id)
+        elif account_type is not None:
+            place_id = await _account_place(db, account_type, account_id, shift.tenant_id)
+        else:
+            place_id = None
+        if place_id is None and account_id is None:
+            raise FieldOpsRuleError("visit_target_required", "A stop needs a place, coordinates or an account")
+        try:
+            purpose = VisitPurpose(item.purpose).value
+        except ValueError:
+            raise FieldOpsRuleError("invalid_purpose", f"Unknown purpose {item.purpose!r}",
+                                    data={"allowed": [p.value for p in VisitPurpose]}) from None
+        visit = Visit(user_id=shift.user_id, organization_id=shift.organization_id, shift_id=shift.id,
+                      channel=Channel.FIELD.value, status=VisitStatus.PLANNED.value,
+                      review_status=ReviewStatus.NOT_REQUIRED.value, source=VisitSource.PLANNED.value,
+                      purpose=purpose, account_type=account_type, account_id=account_id, place_id=place_id,
+                      sequence_in_plan=item.sequence if item.sequence is not None else next_seq,
+                      planned_start_at=item.planned_start_at, planned_end_at=item.planned_end_at,
+                      stop_code=item.stop_code, external_ref=item.external_ref, notes=item.notes,
+                      start_check=CheckResult.NOT_CONFIGURED.value, end_check=CheckResult.NOT_CONFIGURED.value)
+        if item.uuid is not None:
+            visit.uuid = item.uuid
+        next_seq = max(next_seq, visit.sequence_in_plan) + 1
+        db.add(visit)
+        await db.flush()
+        record(db, subject=visit, subject_type=SubjectType.VISIT, axis=TransitionAxis.LIFECYCLE, from_state=None,
+               to_state=VisitStatus.PLANNED.value, occurred_at=dt.datetime.now(dt.UTC),
+               time_basis=TimeBasis.SERVER_RECEIPT.value, source=TransitionSource.MANAGER, reason_code="planned")
+        created.append(visit)
+    await db.flush()
+    await record_activity(db, action="fieldops_stops_planned", actor_id=actor.id, subject_type="Shift",
+                          subject_id=shift.id, context={"count": len(created)})
+    return created
+
+
+async def mock_gate(policy: EffectivePolicy, fix: Any) -> None:
+    """``security.mock_location_action`` on a visit action's fix (see shifts._mock_gate)."""
+    if fix is None or not getattr(fix, "is_mock", False):
+        return
+    action = str(getattr(policy.mock_location_action, "value", policy.mock_location_action))
+    if action == "flag_only":
+        return
+    raise FieldOpsRuleError("mock_location_rejected", "A mock (fake) location was detected; turn off mock location apps",
+                            data={"mock_location_action": action})
 
 
 async def end_visit(db: AsyncSession, act: Act, visit_uuid: uuid_lib.UUID, body: VisitEndIn) -> Visit:
@@ -285,6 +435,7 @@ async def end_visit(db: AsyncSession, act: Act, visit_uuid: uuid_lib.UUID, body:
     policy = policy_of(shift) if shift is not None else await resolve_policy(db, user)
     when = act.when(body.occurred)
     ended_at = max(when.occurred_at, visit.started_at)
+    await mock_gate(policy, body.fix)
     await ingest.write_checkpoint(db, user=user, send=act.send, derived=when, label=CheckpointLabel.VISIT_END.value,
                                   fix=body.fix, manual=body.manual_location, shift=shift, visit=visit,
                                   device_id=visit.device_id, policy=policy)

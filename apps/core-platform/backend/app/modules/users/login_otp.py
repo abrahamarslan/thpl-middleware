@@ -27,7 +27,6 @@ from app.modules.users.audit import Event, audit
 from app.modules.users.model import User
 from app.modules.users.schema import TokenPair
 from app.modules.users.security import generate_numeric_code, hash_one_time_code, verify_one_time_code
-from app.modules.users.tokens import issue_token_pair
 
 logger = structlog.get_logger("app.users.login_otp")
 
@@ -121,6 +120,8 @@ async def verify_login_otp(
     device_id: str | None = None,
     device_type: str | None = None,
     client: ClientInfo | None = None,
+    client_type: str | None = None,
+    installation_id: str | None = None,
 ) -> tuple[User, TokenPair]:
     user = await identifiers.resolve_user_by_identifier(db, identifier)
     if user is None:
@@ -200,4 +201,9 @@ async def verify_login_otp(
         db, Event.TOKEN_ISSUED, user=user, client=client,
         context={"method": "otp", "access": True, "refresh": True},
     )
-    return user, issue_token_pair(user)
+    from app.modules.users import sessions
+
+    device_label = " · ".join(p for p in (device_type, device_id) if p) or None
+    return user, await sessions.start(db, user, client=client,
+                                      client_type=sessions.client_type_of(client_type, device_type),
+                                      installation_id=installation_id, device_label=device_label)

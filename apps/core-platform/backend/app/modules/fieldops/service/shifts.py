@@ -29,10 +29,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.activity.recorder import record_activity
 from app.modules.fieldops import clock
+from app.modules.fieldops.endpoints import SIDES, EndpointValue
 from app.modules.fieldops.enums import (
     AnomalyType,
     CheckPhase,
     CheckpointLabel,
+    CheckResult,
+    EndpointMode,
+    Enforcement,
+    JustificationCode,
+    ShiftSource,
+    ShiftWorkType,
     DurationBasis,
     EndedBy,
     PauseEndReason,
@@ -60,7 +67,8 @@ from app.modules.fieldops.schema import (
     ShiftResumeIn,
     ShiftStartIn,
 )
-from app.modules.fieldops.service import anomalies, ingest, verify
+from app.modules.fieldops.policy.settings import MockLocationAction
+from app.modules.fieldops.service import anomalies, ingest, templates, verify
 from app.modules.fieldops.service.common import (
     by_ref,
     has_location_consent,
@@ -74,7 +82,9 @@ from app.modules.fieldops.service.common import (
 )
 from app.modules.fieldops.service.context import Act
 from app.modules.fieldops.service.policy import EffectivePolicy, resolve_policy
+from app.modules.fieldops.endpoints import from_input
 from app.modules.fieldops.service.transitions import record, transition
+from app.modules.hubs.assignments import hub_for
 
 logger = structlog.get_logger("app.fieldops.shifts")
 
@@ -102,21 +112,133 @@ def _require_location(body: Any, policy: EffectivePolicy) -> None:
 
 # ── start ───────────────────────────────────────────────────────────────────────
 
+#: Received this long after it happened = decided offline; enforcement cannot block it (as for visits).
+OFFLINE_AFTER = dt.timedelta(minutes=2)
+#: A scheduled shift never started is ``missed`` this long after its planned end.
+MISSED_AFTER = dt.timedelta(minutes=60)
+
+
+async def next_shift_code(db: AsyncSession, tenant_id: int, day: dt.date) -> str:
+    """``SH-YYYYMMDD-NNNN``, per tenant and business day. A transaction-scoped advisory lock serialises
+    the count, so two concurrent starts cannot mint the same code (uq_shifts_code_live backs it)."""
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext('fieldops.shift_code'), hashtext(:k))"),
+                     {"k": f"{tenant_id}:{day.isoformat()}"})
+    used = await db.scalar(text("SELECT count(*) FROM fieldops.shifts WHERE tenant_id = :t AND shift_code LIKE :p"),
+                           {"t": tenant_id, "p": f"SH-{day:%Y%m%d}-%"})
+    return f"SH-{day:%Y%m%d}-{int(used or 0) + 1:04d}"
+
+
+async def resolve_endpoints(db: AsyncSession, shift: Shift) -> list[str]:
+    """Freeze the shift's endpoints: ``assigned_hub`` → the hub of ``shift.hub_id`` (or ``anywhere`` when
+    the user has no hub that day — returned, for the ``no_hub_assigned`` anomaly); a hub gets its place."""
+    unresolved = []
+    for side in SIDES:
+        value = EndpointValue.of(shift, side)
+        hub_id = value.hub_id
+        if value.mode == EndpointMode.ASSIGNED_HUB.value:
+            if shift.hub_id is None:
+                unresolved.append(side)
+                EndpointValue().apply(shift, side)
+                continue
+            hub_id = shift.hub_id
+        if value.mode in (EndpointMode.ASSIGNED_HUB.value, EndpointMode.HUB.value):
+            place_id = await db.scalar(text("SELECT place_id FROM hubs WHERE id = :id"), {"id": hub_id})
+            EndpointValue(EndpointMode.HUB.value, hub_id, place_id, value.enforcement, value.radius_m).apply(shift, side)
+    return unresolved
+
+
+def cap_of(shift: Shift, policy: EffectivePolicy) -> dt.datetime:
+    """When auto-close ends ``shift``: ``min(planned end + overtime, start + max hours) + grace``. Both
+    bounds hold — a plan can shorten a shift, never stretch it past the policy's maximum."""
+    if shift.auto_close_at is not None:
+        return shift.auto_close_at
+    return compute_auto_close(shift, policy)
+
+
+def compute_auto_close(shift: Shift, policy: EffectivePolicy) -> dt.datetime:
+    cap = shift.started_at + dt.timedelta(hours=policy.number("max_shift_hours"))
+    if shift.planned_end_at is not None:
+        cap = min(cap, shift.planned_end_at + dt.timedelta(minutes=int(policy.overtime_minutes)))
+    return cap + dt.timedelta(minutes=int(policy.auto_close_grace_minutes))
+
+
+async def _scheduled_now(db: AsyncSession, user_id: int, at: dt.datetime, early: dt.timedelta) -> Shift | None:
+    return await db.scalar(select(Shift).where(
+        Shift.user_id == user_id, Shift.status == ShiftStatus.SCHEDULED.value,
+        Shift.planned_start_at - early <= at, Shift.planned_end_at > at,
+    ).order_by(Shift.planned_start_at).limit(1))
+
+
 async def start_shift(db: AsyncSession, act: Act, body: ShiftStartIn, *, device_id: int | None) -> tuple[Shift, bool]:
-    """Open a shift. Returns (shift, created); a replay of the same uuid returns the existing shift."""
+    """Open a shift. Returns (shift, created); a replay of the same uuid returns the existing shift.
+
+    The plan comes from, in order: the SCHEDULED shift whose uuid this is (adopted) → refused if another
+    scheduled shift covers now (start that one) → the user's shift TEMPLATE occurrence → ad hoc when the
+    policy allows it. Runs in a SAVEPOINT: a start refused by enforcement (after its checkpoint was
+    written as evidence) leaves nothing behind."""
+    async with db.begin_nested():
+        return await _start_shift(db, act, body, device_id=device_id)
+
+
+async def _start_shift(db: AsyncSession, act: Act, body: ShiftStartIn, *, device_id: int | None) -> tuple[Shift, bool]:
     user = act.user
+    when = act.when(body.occurred)
     existing = await db.scalar(select(Shift).where(Shift.uuid == body.uuid).execution_options(include_deleted=True))
     if existing is not None:
         if existing.user_id != user.id:
             raise FieldOpsConflict("uuid_conflict", "This shift uuid is already used")
-        return existing, False
+        if existing.status != ShiftStatus.SCHEDULED.value or existing.deleted_at is not None:
+            return existing, False                                    # a replay
+    tz = await org_timezone(db, user.organization_id)
+    base_policy = await resolve_policy(db, user, at=when.occurred_at)
+    template = None
+    if existing is None:
+        scheduled = await _scheduled_now(db, user.id, when.occurred_at,
+                                         dt.timedelta(minutes=int(base_policy.start_early_minutes)))
+        if scheduled is not None:
+            raise FieldOpsConflict("scheduled_shift_exists", "You have a scheduled shift now; start that one",
+                                   data={"shift_uuid": str(scheduled.uuid), "title": scheduled.title,
+                                         "planned_start_at": scheduled.planned_start_at.isoformat()})
+        template = await templates.by_code(db, base_policy.shift_template)
+        occ = templates.occurrence(template, when.occurred_at, tz) if template is not None else None
+        if occ is None and not base_policy.allow_unscheduled_shifts:
+            raise FieldOpsConflict("no_shift_available", "You have no scheduled shift and no shift template now",
+                                   data={"template": template.code if template else None})
+    else:
+        occ = None
+        if existing.planned_end_at is not None and when.occurred_at >= existing.planned_end_at:
+            raise FieldOpsConflict("shift_window_closed", "This scheduled shift's window is over",
+                                   data={"planned_end_at": existing.planned_end_at.isoformat()})
+        # Early on the SAME business day is fine (anomaly early_start); a shift planned for a LATER day
+        # cannot be started today — that would consume tomorrow's plan.
+        if clock.business_date(when.occurred_at, tz) < existing.shift_date:
+            raise FieldOpsConflict("shift_not_yet_startable", "This shift is scheduled for a later day",
+                                   data={"shift_date": existing.shift_date.isoformat(),
+                                         "planned_start_at": existing.planned_start_at.isoformat()
+                                         if existing.planned_start_at else None})
 
-    policy = await resolve_policy(db, user)
+    shift_date = clock.business_date(when.occurred_at, tz)
+    if existing is not None:
+        shift = existing
+    else:
+        shift = Shift(uuid=body.uuid, user_id=user.id, organization_id=user.organization_id,
+                      shift_date=shift_date, source=ShiftSource.AD_HOC.value, status=ShiftStatus.ACTIVE.value,
+                      planned_end_at=body.planned_end_at)
+        if occ is not None:
+            shift.source = ShiftSource.TEMPLATE.value
+            for key, value in templates.materialize(template, occ).items():
+                setattr(shift, key, value)
+            shift_date = occ.day
+            shift.shift_date = occ.day
+    if shift.hub_id is None:
+        shift.hub_id = await hub_for(db, tenant_id=user.tenant_id, user_id=user.id, day=shift_date)
+    policy = await resolve_policy(db, user, shift=shift, at=when.occurred_at)
+
     if policy.require_location_consent and not await has_location_consent(db, user.id):
         raise FieldOpsRuleError(
             "location_consent_required",
             "Location tracking needs your consent before a shift can start (DPDP Act 2023)",
-            data={"consent_type": "location_tracking"},
+            data={"consent_type": "location_tracking", "consent_endpoint": "/api/me/consents"},
         )
     _require_location(body, policy)
     if policy.require_start_selfie and body.selfie_media_uuid is None:
@@ -125,63 +247,163 @@ async def start_shift(db: AsyncSession, act: Act, body: ShiftStartIn, *, device_
         raise FieldOpsRuleError("selfie_not_found", "The selfie image was not found; upload it first")
     if policy.require_odometer and body.odometer_start_km is None:
         raise FieldOpsRuleError("odometer_required", "Your work policy requires the odometer reading")
-    when = act.when(body.occurred)
+    await _mock_gate(db, policy, body.fix, act=act, shift=None)
 
     current = await open_shift_of(db, user.id)
     if current is not None:
         await _supersede_or_refuse(db, act, current, when.occurred_at, device_id=device_id, policy=policy)
 
-    tz = await org_timezone(db, user.organization_id)
-    shift = Shift(
-        uuid=body.uuid, user_id=user.id, organization_id=user.organization_id, device_id=device_id,
-        policy_id=policy.policy_id, policy_snapshot=policy.snapshot(),
-        shift_date=clock.business_date(when.occurred_at, tz),
-        status=ShiftStatus.ACTIVE.value, review_status=ReviewStatus.NOT_REQUIRED.value,
-        planned_end_at=body.planned_end_at, started_at=when.occurred_at, start_received_at=act.send.received_at,
-        start_time_basis=when.basis, start_client_timestamp=body.occurred.client_timestamp,
-        start_manual_location_reason=body.manual_location.reason if body.fix is None else None,
-        start_selfie_media_uuid=body.selfie_media_uuid, vehicle_id=body.vehicle_id,
-        travel_mode=body.travel_mode.value if body.travel_mode else None,
-        odometer_start_km=body.odometer_start_km, notes=body.notes, last_activity_at=when.occurred_at,
-    )
-    db.add(shift)
-    # The open-shift check above gives the precise 409; uq_shifts_one_open backs it against a race
-    # (the global handler turns that unique violation into a 409 as well).
-    await db.flush()
-    record(db, subject=shift, subject_type=SubjectType.SHIFT, axis=TransitionAxis.LIFECYCLE, from_state=None,
-           to_state=ShiftStatus.ACTIVE.value, occurred_at=when.occurred_at, time_basis=when.basis,
-           source=TransitionSource.DEVICE, client_timestamp=body.occurred.client_timestamp,
-           request_id=act.request_id, idempotency_key=act.idempotency_key)
+    adopting = existing is not None
+    shift.device_id = device_id
+    shift.policy_id = policy.policy_id
+    shift.policy_snapshot = policy.snapshot()
+    shift.review_status = shift.review_status or ReviewStatus.NOT_REQUIRED.value
+    shift.started_at = when.occurred_at
+    shift.start_received_at = act.send.received_at
+    shift.start_time_basis = when.basis
+    shift.start_client_timestamp = body.occurred.client_timestamp
+    shift.start_manual_location_reason = body.manual_location.reason if body.fix is None else None
+    shift.start_selfie_media_uuid = body.selfie_media_uuid
+    shift.vehicle_id = body.vehicle_id if body.vehicle_id is not None else shift.vehicle_id
+    shift.travel_mode = body.travel_mode.value if body.travel_mode else shift.travel_mode
+    shift.odometer_start_km = body.odometer_start_km
+    shift.notes = body.notes or shift.notes
+    shift.last_activity_at = when.occurred_at
+    if body.planned_end_at is not None and shift.source == ShiftSource.AD_HOC.value:
+        shift.planned_end_at = body.planned_end_at
+    if shift.shift_code is None:
+        shift.shift_code = await next_shift_code(db, user.tenant_id, shift.shift_date)
+    unresolved = await resolve_endpoints(db, shift)
+    if shift.start_mode == EndpointMode.ANYWHERE.value and policy.require_start_at_place_id:
+        EndpointValue(EndpointMode.PLACE.value, None, int(policy.require_start_at_place_id)).apply(shift, "start")
+    shift.auto_close_at = compute_auto_close(shift, policy)
+    if adopting:
+        transition(db, shift, subject_type=SubjectType.SHIFT, to_state=ShiftStatus.ACTIVE.value,
+                   occurred_at=when.occurred_at, time_basis=when.basis, source=TransitionSource.DEVICE,
+                   client_timestamp=body.occurred.client_timestamp, request_id=act.request_id,
+                   idempotency_key=act.idempotency_key, reason_code="started")
+        await db.flush()
+    else:
+        db.add(shift)
+        # The open-shift check above gives the precise 409; uq_shifts_one_open backs it against a race
+        # (the global handler turns that unique violation into a 409 as well).
+        await db.flush()
+        record(db, subject=shift, subject_type=SubjectType.SHIFT, axis=TransitionAxis.LIFECYCLE, from_state=None,
+               to_state=ShiftStatus.ACTIVE.value, occurred_at=when.occurred_at, time_basis=when.basis,
+               source=TransitionSource.DEVICE, client_timestamp=body.occurred.client_timestamp,
+               request_id=act.request_id, idempotency_key=act.idempotency_key)
 
     await ingest.write_checkpoint(db, user=user, send=act.send, derived=when, label=CheckpointLabel.SHIFT_START.value,
                                   fix=body.fix, manual=body.manual_location, shift=shift, device_id=device_id,
                                   policy=policy)
-    if policy.require_start_at_place_id:
-        verdict = await verify.evaluate(
-            db, subject=shift, subject_type=SubjectType.SHIFT, phase=CheckPhase.START, user_id=user.id,
-            at=when.occurred_at, place_id=policy.require_start_at_place_id, channel="field", policy=policy,
-            enforce=False,
-        )
-        shift.start_check = verdict.result.value
+    await _check_endpoint(db, act, shift, "start", when=when, policy=policy, justification=body.justification)
+    for side in unresolved:
+        await anomalies.open_anomaly(
+            db, anomaly_type=AnomalyType.NO_HUB_ASSIGNED, severity=Severity.INFO, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=user.id, shift_id=shift.id, dedupe_key=f"no_hub_assigned:shift:{shift.id}:{side}",
+            detector="shifts", evidence={"side": side, "shift_date": shift.shift_date.isoformat()})
     if body.fix is None:
         await anomalies.open_anomaly(
             db, anomaly_type=AnomalyType.MANUAL_LOCATION, severity=Severity.INFO, subject_type=SubjectType.SHIFT,
             subject=shift, user_id=user.id, shift_id=shift.id, dedupe_key=f"manual_location:shift:{shift.id}:start",
             detector="shifts", evidence={"reason": body.manual_location.reason},
         )
-    earliest = policy.earliest_start_local
-    if earliest is not None and clock.local_time(when.occurred_at, tz) < earliest:
+    await _start_window_anomalies(db, shift, policy, when.occurred_at, tz)
+    if template is not None and occ is not None \
+            and template.planned_minutes > policy.number("max_shift_hours") * 60:
         await anomalies.open_anomaly(
-            db, anomaly_type=AnomalyType.EARLY_START, severity=Severity.INFO, subject_type=SubjectType.SHIFT,
-            subject=shift, user_id=user.id, shift_id=shift.id, dedupe_key=f"early_start:shift:{shift.id}",
-            detector="shifts", evidence={"started_local": clock.local_time(when.occurred_at, tz).isoformat(),
-                                         "earliest": earliest.isoformat()},
-        )
+            db, anomaly_type=AnomalyType.TEMPLATE_EXCEEDS_MAX_HOURS, severity=Severity.INFO,
+            subject_type=SubjectType.SHIFT, subject=shift, user_id=user.id, shift_id=shift.id,
+            dedupe_key=f"template_exceeds_max_hours:template:{template.id}:{shift.shift_date}", detector="templates",
+            evidence={"template": template.code, "planned_minutes": template.planned_minutes,
+                      "max_shift_hours": policy.max_shift_hours})
     await db.flush()
     await record_activity(db, action="fieldops_shift_started", actor_id=user.id, subject_type="Shift",
-                          subject_id=shift.id, context={"uuid": str(shift.uuid), "time_basis": when.basis})
-    logger.info("fieldops.shift_started", shift_id=shift.id, user_id=user.id, time_basis=when.basis)
+                          subject_id=shift.id, context={"uuid": str(shift.uuid), "time_basis": when.basis,
+                                                        "source": shift.source, "code": shift.shift_code})
+    logger.info("fieldops.shift_started", shift_id=shift.id, user_id=user.id, time_basis=when.basis,
+                source=shift.source, template=template.code if template is not None else None)
     return shift, True
+
+
+async def _start_window_anomalies(db: AsyncSession, shift: Shift, policy: EffectivePolicy, at: dt.datetime,
+                                  tz: str | None) -> None:
+    earliest = policy.earliest_start_local
+    early = shift.planned_start_at is not None and \
+        at < shift.planned_start_at - dt.timedelta(minutes=int(policy.start_early_minutes))
+    if early or (earliest is not None and clock.local_time(at, tz) < earliest):
+        await anomalies.open_anomaly(
+            db, anomaly_type=AnomalyType.EARLY_START, severity=Severity.INFO, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=shift.user_id, shift_id=shift.id, dedupe_key=f"early_start:shift:{shift.id}",
+            detector="shifts", evidence={"started_local": clock.local_time(at, tz).isoformat(),
+                                         "earliest": earliest.isoformat() if earliest else None,
+                                         "planned_start_at": shift.planned_start_at.isoformat()
+                                         if shift.planned_start_at else None})
+    if shift.planned_start_at is not None and \
+            at > shift.planned_start_at + dt.timedelta(minutes=int(policy.late_start_grace_minutes)):
+        await anomalies.open_anomaly(
+            db, anomaly_type=AnomalyType.LATE_START, severity=Severity.INFO, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=shift.user_id, shift_id=shift.id, dedupe_key=f"late_start:shift:{shift.id}",
+            detector="shifts", evidence={"planned_start_at": shift.planned_start_at.isoformat(),
+                                         "late_minutes": round((at - shift.planned_start_at).total_seconds() / 60, 1)})
+
+
+async def _check_endpoint(db: AsyncSession, act: Act, shift: Shift, side: str, *, when: Any, policy: EffectivePolicy,
+                          justification: Any = None) -> None:
+    """Verify the shift's start (enforced per the endpoint) or end (never blocks) against its endpoint."""
+    value = EndpointValue.of(shift, side)
+    if value.is_anywhere or value.place_id is None:
+        setattr(shift, f"{side}_check", CheckResult.NOT_CONFIGURED.value)
+        return
+    phase = CheckPhase.START if side == "start" else CheckPhase.END
+    offline = act.send.received_at - when.occurred_at > OFFLINE_AFTER
+    enforce = side == "start" and value.enforcement is not None
+    verdict = await verify.evaluate(
+        db, subject=shift, subject_type=SubjectType.SHIFT, phase=phase, user_id=shift.user_id,
+        at=when.occurred_at, place_id=value.place_id, channel="field", policy=policy, offline=offline,
+        justified=justification is not None, enforce=enforce,
+        enforcement=value.enforcement or Enforcement.ADVISORY.value, radius_m=value.radius_m, trusted=True,
+    )
+    decision = verdict.decision
+    where = "your shift's start location" if side == "start" else "your shift's end location"
+    if decision.block_code == "justification_required":
+        raise FieldOpsRuleError("justification_required", f"You are outside {where}; give a reason",
+                                data={"result": verdict.result.value, "distance_m": verdict.distance_m,
+                                      "reason_codes": [c.value for c in JustificationCode]})
+    if decision.block_code == "outside_geofence":
+        raise FieldOpsRuleError("outside_geofence", f"You are outside {where}",
+                                data={"result": verdict.result.value, "distance_m": verdict.distance_m,
+                                      "enforcement": "hard_block"})
+    setattr(shift, f"{side}_check", verdict.result.value)
+    setattr(shift, f"{side}_distance_m", round(verdict.distance_m, 1) if verdict.distance_m is not None else None)
+    if decision.review_pending and shift.review_status == ReviewStatus.NOT_REQUIRED.value:
+        transition(db, shift, subject_type=SubjectType.SHIFT, axis=TransitionAxis.REVIEW,
+                   to_state=ReviewStatus.PENDING.value, occurred_at=when.occurred_at, time_basis=when.basis,
+                   source=TransitionSource.SERVER, reason_code=decision.action.value)
+    anomaly = decision.anomaly
+    if verdict.result is CheckResult.OUTSIDE and (anomaly is None or anomaly is AnomalyType.OUTSIDE_GEOFENCE):
+        anomaly = AnomalyType.OUTSIDE_START_PLACE if side == "start" else AnomalyType.OUTSIDE_END_PLACE
+    if anomaly is not None and (value.enforcement is not None or side == "start"):
+        await anomalies.open_anomaly(
+            db, anomaly_type=anomaly, severity=decision.severity or Severity.WARNING, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=shift.user_id, shift_id=shift.id,
+            dedupe_key=f"{anomaly.value}:shift:{shift.id}:{side}", detector="verifier",
+            evidence={"side": side, "result": verdict.result.value, "distance_m": verdict.distance_m,
+                      "target": verdict.target.kind.value, "offline": offline,
+                      "justification": justification.model_dump(mode="json") if justification else None},
+        )
+
+
+async def _mock_gate(db: AsyncSession, policy: EffectivePolicy, fix: Any, *, act: Act, shift: Shift | None) -> None:
+    """``security.mock_location_action`` on an ACTION's fix (shift start/end, visit start/end): a mock fix is
+    refused under ``reject_and_alert`` / ``end_shift`` (the stream still keeps it — ingest flags it)."""
+    if fix is None or not getattr(fix, "is_mock", False):
+        return
+    action = str(getattr(policy.mock_location_action, "value", policy.mock_location_action))
+    if action == MockLocationAction.FLAG_ONLY.value:
+        return
+    raise FieldOpsRuleError("mock_location_rejected", "A mock (fake) location was detected; turn off mock location apps",
+                            data={"mock_location_action": action})
 
 
 async def _supersede_or_refuse(db: AsyncSession, act: Act, current: Shift, occurred_at: dt.datetime, *,
@@ -361,6 +583,8 @@ async def resume_shift(db: AsyncSession, act: Act, shift_uuid: uuid_lib.UUID, bo
               ended_by=EndedBy.USER, reason=PauseEndReason.RESUMED, source=TransitionSource.DEVICE,
               client_timestamp=body.occurred.client_timestamp, act=act)
     shift.paused_since = None
+    if policy.pause_extends_cap and shift.auto_close_at is not None:
+        shift.auto_close_at = shift.auto_close_at + (ended_at - pause.started_at)
     transition(db, shift, subject_type=SubjectType.SHIFT, to_state=ShiftStatus.ACTIVE.value, occurred_at=ended_at,
                time_basis=when.basis, source=TransitionSource.DEVICE, reason_code="resumed",
                client_timestamp=body.occurred.client_timestamp, request_id=act.request_id,
@@ -402,9 +626,11 @@ async def end_shift(db: AsyncSession, act: Act, shift_uuid: uuid_lib.UUID, body:
         raise FieldOpsRuleError("odometer_decreased", "The end reading is below the start reading",
                                 data={"odometer_start_km": str(shift.odometer_start_km)})
     when = act.when(body.occurred)
+    await _mock_gate(db, policy, body.fix, act=act, shift=shift)
     await ingest.write_checkpoint(db, user=user, send=act.send, derived=when, label=CheckpointLabel.SHIFT_END.value,
                                   fix=body.fix, manual=body.manual_location, shift=shift, device_id=shift.device_id,
                                   policy=policy)
+    await _check_endpoint(db, act, shift, "end", when=when, policy=policy)
     shift.odometer_end_km = body.odometer_end_km if body.odometer_end_km is not None else shift.odometer_end_km
     if body.notes:
         shift.notes = body.notes
@@ -434,9 +660,18 @@ async def end_shift(db: AsyncSession, act: Act, shift_uuid: uuid_lib.UUID, body:
 _DUE_SQL = text("""
     SELECT id FROM fieldops.shifts
      WHERE status IN ('active','paused') AND deleted_at IS NULL
-       AND now() > COALESCE(planned_end_at,
-                            started_at + COALESCE((policy_snapshot->>'max_shift_hours')::numeric, 12) * interval '1 hour')
-                   + COALESCE((policy_snapshot->>'auto_close_grace_minutes')::int, 60) * interval '1 minute'
+       AND now() > COALESCE(auto_close_at,
+                            COALESCE(planned_end_at, started_at
+                                     + COALESCE((policy_snapshot->>'max_shift_hours')::numeric, 12) * interval '1 hour')
+                            + COALESCE((policy_snapshot->>'auto_close_grace_minutes')::int, 60) * interval '1 minute')
+     ORDER BY id
+     LIMIT :limit
+     FOR UPDATE SKIP LOCKED
+""")
+
+_MISSED_SQL = text("""
+    SELECT id FROM fieldops.shifts
+     WHERE status = 'scheduled' AND deleted_at IS NULL AND planned_end_at + :after < now()
      ORDER BY id
      LIMIT :limit
      FOR UPDATE SKIP LOCKED
@@ -454,9 +689,6 @@ _LAST_ACTIVITY_SQL = text("""
 """)
 
 
-def cap_of(shift: Shift, policy: EffectivePolicy) -> dt.datetime:
-    base = shift.planned_end_at or (shift.started_at + dt.timedelta(hours=policy.number("max_shift_hours")))
-    return base + dt.timedelta(minutes=int(policy.auto_close_grace_minutes))
 
 
 async def auto_close_due(db: AsyncSession, *, limit: int = 200) -> list[int]:
@@ -503,6 +735,259 @@ async def auto_close_due(db: AsyncSession, *, limit: int = 200) -> list[int]:
                     minutes=str(shift.wall_clock_minutes), ghost=last is None)
     await db.flush()
     return closed
+
+
+_SILENT_SQL = text("""
+    SELECT id FROM fieldops.shifts
+     WHERE status = 'active' AND deleted_at IS NULL
+       AND COALESCE(last_activity_at, started_at)
+           < now() - make_interval(secs => COALESCE((policy_snapshot->>'silence_factor')::float8, 3)
+                                          * COALESCE((policy_snapshot->>'max_interval_s')::float8, 600))
+       AND COALESCE(policy_snapshot->>'tracking_mode', 'continuous') = 'continuous'
+     ORDER BY id
+     LIMIT :limit
+""")
+
+
+async def detect_silent(db: AsyncSession, *, limit: int = 500) -> int:
+    """The live zombie backstop: an ACTIVE (not paused) continuously-tracked shift with no activity for
+    ``silence_factor × max_interval_s`` raises ``tracking_silent`` — once per silent stretch (the dedupe key
+    carries the last activity instant, so a new silence after pings resumed is a new anomaly). It does
+    not close the shift: auto-close does that at ``auto_close_at``."""
+    ids = (await db.execute(_SILENT_SQL, {"limit": limit})).scalars().all()
+    raised = 0
+    for shift_id in ids:
+        shift = await db.scalar(select(Shift).where(Shift.id == shift_id).execution_options(all_tenants=True))
+        if shift is None:
+            continue
+        since = shift.last_activity_at or shift.started_at
+        policy = policy_of(shift)
+        if await anomalies.open_anomaly(
+            db, anomaly_type=AnomalyType.TRACKING_SILENT, severity=Severity.WARNING, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=shift.user_id, shift_id=shift.id,
+            dedupe_key=f"tracking_silent:shift:{shift.id}:{int(since.timestamp())}", detector="silence",
+            evidence={"silent_since": since.isoformat(), "threshold_s": policy.number("silence_factor")
+                      * policy.number("max_interval_s")},
+        ):
+            raised += 1
+    await db.flush()
+    return raised
+
+
+#: A template occurrence is listed as an upcoming (virtual) shift when it starts within this.
+VIRTUAL_HORIZON = dt.timedelta(hours=12)
+
+
+async def virtual_entries(db: AsyncSession, user: Any) -> list:
+    """Template occurrences nobody has started, for ``GET /me/shifts``: the occurrence ``now`` is in (or
+    today's, before its start) and, when it starts within 12 h, the next — skipping any day the user
+    already has a real (non-cancelled) shift. ``uuid`` is null: the app starts it with its own uuid."""
+    from app.modules.fieldops import cards
+
+    policy = await resolve_policy(db, user)
+    template = await templates.by_code(db, policy.shift_template)
+    if template is None:
+        return []
+    now = dt.datetime.now(dt.UTC)
+    tz = await org_timezone(db, user.organization_id)
+    occs = templates.next_occurrences(template, now, tz, days=2)
+    if not occs:
+        return []
+    taken = set((await db.execute(text(
+        "SELECT shift_date FROM fieldops.shifts WHERE tenant_id = :t AND user_id = :u AND deleted_at IS NULL "
+        "AND status <> 'cancelled' AND shift_date = ANY(CAST(:days AS date[]))"),
+        {"t": user.tenant_id, "u": user.id, "days": [o.day for o in occs]})).scalars().all())
+    if await open_shift_of(db, user.id) is not None:
+        return []
+    out = []
+    for i, occ in enumerate(occs):
+        if occ.day in taken or (i > 0 and occ.planned_start_at - now > VIRTUAL_HORIZON):
+            continue
+        hub_id = await hub_for(db, tenant_id=user.tenant_id, user_id=user.id, day=occ.day)
+        hub = (await cards.hubs_by_id(db, {hub_id})).get(hub_id) if hub_id else None
+        out.append(await cards.virtual_card(db, user_id=user.id, template=template, occ=occ, hub=hub))
+    return out
+
+
+async def mark_missed(db: AsyncSession, *, limit: int = 200) -> list[int]:
+    """Scheduled shifts whose planned end (+ ``MISSED_AFTER``) passed without a start → ``missed``
+    (anomaly ``missed_shift``). Template days create no row, so they never go missed."""
+    ids = (await db.execute(_MISSED_SQL, {"limit": limit, "after": MISSED_AFTER})).scalars().all()
+    now = dt.datetime.now(dt.UTC)
+    for shift_id in ids:
+        shift = await db.scalar(select(Shift).where(Shift.id == shift_id).execution_options(all_tenants=True))
+        if shift is None or shift.status != ShiftStatus.SCHEDULED.value:
+            continue
+        transition(db, shift, subject_type=SubjectType.SHIFT, to_state=ShiftStatus.MISSED.value, occurred_at=now,
+                   time_basis=TimeBasis.SERVER_RECEIPT.value, source=TransitionSource.SYSTEM, reason_code="not_started")
+        await db.flush()
+        await anomalies.open_anomaly(
+            db, anomaly_type=AnomalyType.MISSED_SHIFT, severity=Severity.WARNING, subject_type=SubjectType.SHIFT,
+            subject=shift, user_id=shift.user_id, shift_id=shift.id, dedupe_key=f"missed_shift:shift:{shift.id}",
+            detector="autoclose", evidence={"planned_start_at": shift.planned_start_at.isoformat(),
+                                            "planned_end_at": shift.planned_end_at.isoformat()})
+        logger.info("fieldops.shift_missed", shift_id=shift.id, user_id=shift.user_id)
+    await db.flush()
+    return list(ids)
+
+
+# ── scheduling (managers) ───────────────────────────────────────────────────────
+
+async def _overlapping(db: AsyncSession, user_id: int, start: dt.datetime, end: dt.datetime,
+                       exclude_id: int | None = None) -> Shift | None:
+    stmt = select(Shift).where(Shift.user_id == user_id, Shift.status == ShiftStatus.SCHEDULED.value,
+                               Shift.planned_start_at < end, Shift.planned_end_at > start)
+    if exclude_id is not None:
+        stmt = stmt.where(Shift.id != exclude_id)
+    return await db.scalar(stmt.limit(1))
+
+
+async def schedule_shift(db: AsyncSession, body: Any, *, target: Any, actor: Any) -> tuple[Shift, bool]:
+    """Create a SCHEDULED shift for ``target`` (the user starts it by its uuid). A template (``body.template``)
+    fills what the body omits. Returns (shift, created); a replay of the same uuid returns it."""
+    if body.uuid is not None:
+        existing = await db.scalar(select(Shift).where(Shift.uuid == body.uuid).execution_options(include_deleted=True))
+        if existing is not None:
+            if existing.user_id != target.id:
+                raise FieldOpsConflict("uuid_conflict", "This shift uuid is already used")
+            return existing, False
+    template = await templates.get_template(db, body.template) if body.template else None
+    start, end = body.planned_start_at, body.planned_end_at
+    tz = await org_timezone(db, target.organization_id)
+    if template is not None and (start is None or end is None):
+        zone = templates._zone(template.timezone or tz)
+        day = body.date or (start.astimezone(zone).date() if start is not None
+                            else dt.datetime.now(dt.UTC).astimezone(zone).date())
+        if not templates.applies_on(template, day):
+            raise FieldOpsRuleError("template_not_on_day", f"Template {template.code} does not apply on {day}",
+                                    data={"date": day.isoformat()})
+        start, end = templates._window(template, day, zone)
+    if start is None or end is None:
+        raise FieldOpsRuleError("planned_window_required", "Give planned_start_at and planned_end_at, or a template")
+    if end <= start:
+        raise FieldOpsRuleError("end_before_start", "planned_end_at must be after planned_start_at")
+    if end - start > dt.timedelta(hours=24):
+        raise FieldOpsRuleError("planned_window_too_long", "A shift cannot be planned for more than 24 hours")
+    clash = await _overlapping(db, target.id, start, end)
+    if clash is not None:
+        raise FieldOpsConflict("shift_overlaps", "The user already has a scheduled shift in that window",
+                               data={"shift_uuid": str(clash.uuid),
+                                     "planned_start_at": clash.planned_start_at.isoformat(),
+                                     "planned_end_at": clash.planned_end_at.isoformat()})
+    day_tz = template.timezone if template is not None and template.timezone else tz
+    shift_date = clock.business_date(start, day_tz)
+    shift = Shift(user_id=target.id, organization_id=target.organization_id, shift_date=shift_date,
+                  status=ShiftStatus.SCHEDULED.value, review_status=ReviewStatus.NOT_REQUIRED.value,
+                  source=ShiftSource.SCHEDULED.value, planned_start_at=start, planned_end_at=end,
+                  assigned_by=actor.id, notes=body.notes)
+    if body.uuid is not None:
+        shift.uuid = body.uuid
+    if template is not None:
+        fields = templates.materialize(template, templates.Occurrence(shift_date, start, end, day_tz or "UTC"))
+        for key, value in fields.items():
+            if key not in ("planned_start_at", "planned_end_at"):
+                setattr(shift, key, value)
+    shift.title = body.title or shift.title
+    shift.work_type = body.work_type.value if body.work_type else (shift.work_type or ShiftWorkType.OTHER.value)
+    for side in SIDES:
+        if side in body.model_fields_set:
+            (await from_input(db, getattr(body, side), tenant_id=target.tenant_id,
+                              organization_id=target.organization_id)).apply(shift, side)
+    shift.hub_id = await hub_for(db, tenant_id=target.tenant_id, user_id=target.id, day=shift_date)
+    shift.shift_code = await next_shift_code(db, target.tenant_id, shift_date)
+    if shift.hub_id is not None:
+        await resolve_endpoints(db, shift)   # with no hub yet, assigned_hub stays and is re-read at start
+    db.add(shift)
+    await db.flush()
+    record(db, subject=shift, subject_type=SubjectType.SHIFT, axis=TransitionAxis.LIFECYCLE, from_state=None,
+           to_state=ShiftStatus.SCHEDULED.value, occurred_at=dt.datetime.now(dt.UTC),
+           time_basis=TimeBasis.SERVER_RECEIPT.value, source=TransitionSource.MANAGER, reason_code="scheduled")
+    await db.flush()
+    await record_activity(db, action="fieldops_shift_scheduled", actor_id=actor.id, subject_type="Shift",
+                          subject_id=shift.id, context={"user_id": target.id, "code": shift.shift_code,
+                                                        "template": template.code if template else None})
+    return shift, True
+
+
+async def update_scheduled(db: AsyncSession, ref: str, body: Any, *, actor: Any) -> Shift:
+    shift = await get_shift(db, ref)
+    if shift.status != ShiftStatus.SCHEDULED.value:
+        raise FieldOpsConflict("shift_not_scheduled",
+                               f"Only a scheduled shift's plan can be edited (it is {shift.status})")
+    if shift.row_version != body.row_version:
+        raise FieldOpsConflict("row_version_conflict", "The shift changed since you loaded it; reload and retry",
+                               data={"current_row_version": shift.row_version})
+    start = body.planned_start_at or shift.planned_start_at
+    end = body.planned_end_at or shift.planned_end_at
+    if end <= start:
+        raise FieldOpsRuleError("end_before_start", "planned_end_at must be after planned_start_at")
+    clash = await _overlapping(db, shift.user_id, start, end, exclude_id=shift.id)
+    if clash is not None:
+        raise FieldOpsConflict("shift_overlaps", "The user already has a scheduled shift in that window",
+                               data={"shift_uuid": str(clash.uuid)})
+    shift.planned_start_at, shift.planned_end_at = start, end
+    for key in ("title", "notes"):
+        if key in body.model_fields_set:
+            setattr(shift, key, getattr(body, key))
+    if body.work_type is not None:
+        shift.work_type = body.work_type.value
+    for side in SIDES:
+        if side in body.model_fields_set:
+            (await from_input(db, getattr(body, side), tenant_id=shift.tenant_id,
+                              organization_id=shift.organization_id)).apply(shift, side)
+    if shift.hub_id is not None:
+        await resolve_endpoints(db, shift)
+    await db.flush()
+    await record_activity(db, action="fieldops_shift_rescheduled", actor_id=actor.id, subject_type="Shift",
+                          subject_id=shift.id, context={"fields": sorted(body.model_fields_set - {"row_version"})})
+    return shift
+
+
+async def cancel_scheduled(db: AsyncSession, ref: str, *, reason: str, actor: Any) -> Shift:
+    shift = await get_shift(db, ref)
+    if shift.status != ShiftStatus.SCHEDULED.value:
+        raise FieldOpsConflict("shift_not_scheduled",
+                               f"Only a scheduled shift can be cancelled here (it is {shift.status})")
+    now = dt.datetime.now(dt.UTC)
+    shift.cancellation_reason = reason
+    transition(db, shift, subject_type=SubjectType.SHIFT, to_state=ShiftStatus.CANCELLED.value, occurred_at=now,
+               time_basis=TimeBasis.MANAGER.value, source=TransitionSource.MANAGER, note=reason)
+    planned = (await db.scalars(select(Visit).where(Visit.shift_id == shift.id,
+                                                    Visit.status == VisitStatus.PLANNED.value))).all()
+    for visit in planned:
+        visit.cancellation_reason = VisitCancellationReason.MANAGER.value
+        visit.cancelled_at = now
+        transition(db, visit, subject_type=SubjectType.VISIT, to_state=VisitStatus.CANCELLED.value, occurred_at=now,
+                   time_basis=TimeBasis.MANAGER.value, source=TransitionSource.MANAGER, reason_code="shift_cancelled")
+    await db.flush()
+    await record_activity(db, action="fieldops_shift_cancelled", actor_id=actor.id, subject_type="Shift",
+                          subject_id=shift.id, context={"reason": reason})
+    return shift
+
+
+async def handover(db: AsyncSession, act: Act, shift_uuid: uuid_lib.UUID, *, device_id: int | None) -> Shift:
+    """Rebind my open shift to THIS device (I signed in on a new phone): its fixes stop being
+    ``foreign_device``. Recorded as a transition (with the device change) + an info anomaly."""
+    shift = await own_shift(db, act.user, shift_uuid)
+    if not shift.is_open:
+        raise FieldOpsConflict("shift_not_active", f"The shift is {shift.status}")
+    if device_id is None:
+        raise FieldOpsRuleError("device_not_registered",
+                                "Register this device (POST /me/devices) and send X-Device-Session first")
+    if shift.device_id == device_id:
+        return shift
+    previous = shift.device_id
+    shift.device_id = device_id
+    await db.flush()
+    await record_activity(db, action="fieldops_shift_device_handover", actor_id=act.user.id, subject_type="Shift",
+                          subject_id=shift.id, changes={"device_id": [previous, device_id]},
+                          context={"uuid": str(shift.uuid), "request_id": act.request_id})
+    await anomalies.open_anomaly(
+        db, anomaly_type=AnomalyType.DEVICE_HANDOVER, severity=Severity.INFO, subject_type=SubjectType.SHIFT,
+        subject=shift, user_id=shift.user_id, shift_id=shift.id,
+        dedupe_key=f"device_handover:shift:{shift.id}:{device_id}", detector="shifts",
+        evidence={"from_device_id": previous, "to_device_id": device_id})
+    return shift
 
 
 # ── manager side ────────────────────────────────────────────────────────────────
@@ -591,6 +1076,8 @@ async def delete_shift(db: AsyncSession, ref: str, *, reason: str, actor: Any) -
 
 
 __all__ = [
-    "auto_close_due", "cap_of", "close_shift", "correct_shift", "delete_shift", "end_pause", "end_shift",
-    "get_shift", "pause_shift", "policy_of", "resume_shift", "review_shift", "start_shift",
+    "auto_close_due", "cancel_scheduled", "cap_of", "close_shift", "compute_auto_close", "correct_shift",
+    "delete_shift", "end_pause", "end_shift", "get_shift", "handover", "mark_missed", "next_shift_code",
+    "pause_shift", "policy_of", "resolve_endpoints", "resume_shift", "review_shift", "schedule_shift",
+    "start_shift", "update_scheduled",
 ]

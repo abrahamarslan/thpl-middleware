@@ -530,7 +530,10 @@ def test_get_my_settings_endpoint(mocker):
         body = response.json()
         assert body["code"] == "ok"
         assert body["msg"] == "Settings retrieved successfully."
-        assert body["data"]["privacy"]["profile_visibility"] == "organization"
+        assert body["data"]["privacy"]["profile_visibility"] == "everyone"
+        assert body["data"]["privacy"]["contact_visibility"] == "hidden"
+        assert body["data"]["notifications"]["slack"] is False
+        assert body["data"]["security"]["two_factor_enabled"] is False
         assert body["data"]["appearance"]["theme"] == "system"
         assert body["data"]["notifications"]["email"] is True
     finally:
@@ -581,7 +584,8 @@ async def test_update_my_settings_deep_merges(mocker):
 
     mock_user = User(
         id=1, email="test@example.com", name="Test User",
-        application_settings={"appearance": {"theme": "dark"}, "privacy": {"show_email": True}},
+        application_settings={"appearance": {"theme": "dark"},
+                              "privacy": {"show_email": True, "show_phone": True}},
     )
     mock_update = mocker.patch("app.modules.users.service.update_user", new_callable=AsyncMock)
 
@@ -592,8 +596,10 @@ async def test_update_my_settings_deep_merges(mocker):
     sent = mock_update.await_args.args[2]
     # Unrelated stored values survive; only the sent field changes.
     assert sent.application_settings["appearance"]["theme"] == "dark"
-    assert sent.application_settings["privacy"]["show_email"] is True
-    assert sent.application_settings["privacy"]["profile_visibility"] == "private"
+    # Legacy booleans are normalized on the way through (both true → contact_visibility everyone) and are
+    # no longer stored; derived fields and the read-only security section are never persisted.
+    assert sent.application_settings["privacy"] == {"profile_visibility": "private", "contact_visibility": "everyone"}
+    assert "security" not in sent.application_settings
     assert result.appearance.theme == "dark"
     assert result.privacy.profile_visibility == "private"
 
