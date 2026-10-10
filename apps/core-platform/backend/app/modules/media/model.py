@@ -28,7 +28,7 @@ the whole map — see repository_worker.py.
 
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, CheckConstraint, Index, String, Text, text
+from sqlalchemy import BigInteger, CheckConstraint, Index, SmallInteger, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -86,4 +86,8 @@ class Media(BigIntPKWithUUIDMixin, OrgEntityMixin, SoftDeleteFilteredMixin, Base
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", server_default=text("'pending'"),
         comment="Conversion lifecycle: pending | processing | done | partial_failure",
+    )
+    position: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=0, server_default=text("0"),
+        comment="Order inside a gallery collection (0 for single-image collections)",
     )

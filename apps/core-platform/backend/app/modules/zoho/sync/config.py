@@ -84,7 +84,10 @@ class GlobalSyncDefaults(BaseModel):
 
     enabled: bool = True
     direction: SyncDirection = SyncDirection.INBOUND
-    strategy: SyncStrategyName = SyncStrategyName.INCREMENTAL
+    # FULL is the safe default (complete, merely slower); INCREMENTAL silently skips rows when a
+    # module's modified filter is wrong. Every registered module declares its strategy explicitly
+    # (tests/zoho_core/test_registry.py enforces it), so this only decides a module that forgets.
+    strategy: SyncStrategyName = SyncStrategyName.FULL
     # N+1 handling: fetch the full record before upserting?
     detail_required: bool = False
     # inline  — fetch details in the same task (respects wait_between_calls)
@@ -101,6 +104,11 @@ class GlobalSyncDefaults(BaseModel):
     # the index one (provenance), and once a row already holds the detail
     # document of the listed version, neither phase spends a call or a write.
     index_then_detail: bool = False
+    # Re-fetch a record's DETAIL once the stored one is older than this, even when the listed
+    # last_modified_time has not moved (0 = never; trust the timestamp). For resources whose children
+    # may change without bumping the parent's timestamp — Zoho does not document whether editing a
+    # price list's item rates bumps the list's last_modified_time (Zoho: /pricebooks). Each refresh costs one call per record.
+    detail_max_age_minutes: int = Field(default=0, ge=0)
     batch_size: int = Field(default=200, ge=1, le=200)   # Zoho page cap is 200
     # Above this many records an incremental run escalates to a full run
     full_sync_threshold: int = 25_000
@@ -112,6 +120,9 @@ class GlobalSyncDefaults(BaseModel):
     modified_since_param: str | None = "last_modified_time"
     sort_column: str | None = "last_modified_time"
     soft_delete_missing: bool = False   # full sync soft-deletes vanished rows
+    # Before tombstoning, GET each missing record's detail: only Zoho's "not found" is a deletion
+    # (paging under concurrent deletes can hide a live row). One call per missing id.
+    confirm_missing_by_detail: bool = False
     # ── "When to stop" — every run is a bounded slice (0 = no limit) ────────
     # A run that hits a budget ends YIELDED, keeps its page/cursor, and the
     # planner resumes it on the next tick (docs/zoho-sync-implementation/

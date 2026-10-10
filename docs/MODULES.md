@@ -375,6 +375,77 @@ here?" for a chain of owners (line → item → category), most specific first, 
 the organization default. HTTP: `/api/taxes/assignments`. Full design, recipe and evidence:
 `docs/implementation-plan/tax-assignments.md`.
 
+## Accounting — `app/modules/accounting/` (schema `accounting`, migration `20261008_0700_e4c737170f12`)
+
+The chart of accounts and "which account does *this entity* use?". **`accounting.accounts`** is
+one ledger account of one organization (`OrgEntityMixin`), synced from Zoho Books
+`/chartofaccounts` through the crosswalk (`zoho_id` echo, module `chart_of_accounts`, FULL by
+default). Database triggers derive the **normal side** (from the type, inverted for a contra
+account) and the **depth** (cascaded on re-parent), refuse cycles, and refuse a soft delete while
+children or assignments live. **`accounting.account_types`** carries all 46 Zoho types (the
+documented list ∪ the tenant's own response, with Zoho's numeric ids).
+
+**Account assignments** (`accounting.account_assignments`) are the `tax_assignments` shape for
+accounts: an owner (`owner_type_code` + `owner_id`) → an account, for a **purpose** (`sales`,
+`purchase`, `inventory_asset`, `receivable`, `output_tax`, …). Organization defaults are
+assignments whose owner is the organization. **Making an entity carry accounts** is
+`accounting.registration.register_account_owner_type` (from its migration) + `HasAccountsMixin`.
+Zoho tax components' `tax_account_id` / `purchase_tax_account_id` / `tds_payable_account_id`
+become real assignments (pending until the chart syncs). HTTP: `/api/accounting`. Design and
+evidence: `docs/implementation-plan/accounts-module.md`; adapter:
+`docs/zoho-sync-implementation/adapters/chart-of-accounts.md`.
+
+## Price lists — `app/modules/price_lists/` (schema `pricing`, migrations `02b470ed2792` + rename `7c3e91a05d24`)
+
+Zoho Books price lists (Zoho's API: *pricebooks*), organization-scoped (THPL by default).
+**`pricing.price_lists`** is one price list (crosswalk module `price_lists`, endpoint `/pricebooks`,
+`zoho_id` echo, FULL, list + detail); its **`pricing.price_list_items`** (unit rates, keyed by Zoho
+`item_id` until an items module exists) and **`pricing.price_list_item_brackets`** (volume brackets) are
+projected from the detail document as a replace-set (soft delete for leavers). The detail is re-confirmed
+at least daily (`detail_max_age_minutes`, a generic engine knob) because Zoho's list timestamp is not
+known to move on item edits. Read-only HTTP: `/api/price-lists` (list, detail, `/{ref}/price` quote).
+Design: `docs/implementation-plan/price-lists-module.md`; adapter:
+`docs/zoho-sync-implementation/adapters/price-lists.md`.
+
+## Parties — `app/modules/parties/` (schema `party`, migration `20261009_0900_934e2e5ea8cb`)
+
+Customers and vendors — Zoho **contacts** — in ONE table, **`party.parties`** (`party_type`), organization-scoped
+(THPL), synced from Zoho `/contacts` through the crosswalk (module `parties`; FULL, list + detail, rate-limit-safe,
+deletions confirmed by detail, merged duplicates redirected). **`party.contact_persons`** (one primary each; own
+crosswalk rows) and **`party.payment_terms`** (learned from Zoho). Everything structured lives in its hub:
+addresses in `geo.place_links` → `geo.places` (Zoho `address_id` on the link), GSTIN / PAN / Udyam in
+**`tax.tax_registrations`** (new, polymorphic), default tax in `tax.tax_assignments`, control accounts in
+`accounting.account_assignments`, custom fields in `extfields` (definitions learned with `zoho_field_id`), the
+sub-category in categories (taxonomy `customer_sub_category`), media / documents / comments via their mixins.
+Documents that name a party use **`HasCustomerMixin` / `HasVendorMixin` / `HasPartyMixin`**. New platform mixins:
+`HasCurrencyMixin` (currencies), `HasAddressesMixin` (geo), `HasMediaMixin` (media). HTTP: `/api/parties`.
+Design: `docs/implementation-plan/contacts-module.md`; adapter: `docs/zoho-sync-implementation/adapters/parties.md`.
+
+## Catalogue — `app/modules/catalogue/` (schema `catalogue`, phase 1: migration `20261010_0900_66d0b2e09e76`)
+
+The item master, built in phases (plan: `docs/implementation-plans/catalogue/`). **Phase 1 (built):** the masters
+items are described with — **`catalogue.uqc_codes`** (GLOBAL GSTN Unit Quantity Codes, seeded),
+**`catalogue.units`** (ONE table for count units *and* physical units: `unit_class` + `si_factor`; every
+organization gets the standard set from `catalogue.seed_standard_units()`, re-run for each new organization by the
+`AFTER INSERT` trigger `trg_organizations_seed_catalogue`), **`catalogue.packaging_types`**,
+**`catalogue.sales_channels`** (`zoho_code` ↔ the Zoho contact `sales_channel`), **`catalogue.item_groups`**
+(merchandising tree — not categories, not Zoho item groups) and **`catalogue.attributes`** /
+**`attribute_options`** (variant axes). All organization-scoped (`OrgEntityMixin`, composite FKs, soft delete).
+HTTP: `/api/catalogue/{uqc-codes,units,packaging-types,sales-channels,item-groups,attributes}`; writes need
+`catalogue.<resource>:<action>`. Zoho units / manufacturers adapters wait for the P0 probes. Next phases: items +
+packaging hierarchy (P2), Zoho items (P3), batches (P4), pricing & schemes (P5), inventory (P6).
+
+## Resolution engine — `app/modules/resolution/` (table `core.resolution_policies`)
+
+"What applies here?" for every facet — **taxes** and **accounts** today — along an owner chain
+(a document line → its item → the item's categories → the contact → the organization default).
+Facets register into it (`taxes/resolution.py`, `accounting/resolution.py`); expanders too
+(`categories/resolution.py`: an owner → its categories). The default precedence per (facet,
+subject kind) is code (accountant-approved 2026-10-08); a tenant or organization overrides it
+through `/api/resolution/policies/{facet}/{subject}`. Batched (a fixed number of statements for
+any number of lines), fail-closed on an unusable answer, `explain=true` returns the trace.
+`taxes.assignment_service.resolve_taxes` runs on it. Design: accounts-module plan §7.
+
 ## Custom fields — `app/modules/custom_fields/` (schema `extfields`)
 A typed, definition-driven key/value store: any registered entity type can carry
 a growing set of custom fields without schema churn. Three tables, because the

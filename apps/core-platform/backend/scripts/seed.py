@@ -7,12 +7,15 @@ Runs all domain seeders in topological dependency order:
   3. custom_fields.data_types (the Zoho custom-field data-type lookup)
   4. company (the deployment's tenant + root organization, from COMPANY_* settings)
   5. fieldops.defaults (the company tenant's Work Shift template + default and member policy layers)
+  6. accounting.defaults (the company organization's UNAMBIGUOUS default accounts — run after the first
+     chart-of-accounts sync; everything ambiguous is listed for an admin, never guessed)
 
 Usage:
   python scripts/seed.py
   python scripts/seed.py --only users.reference
   python scripts/seed.py --only company
   python scripts/seed.py --only fieldops.defaults
+  python scripts/seed.py --only accounting.defaults
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ sys.path.insert(0, str(backend_dir))
 
 from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 
+from app.modules.accounting.seed import run_seed_accounting  # noqa: E402
 from app.modules.custom_fields.seed import seed_data_types  # noqa: E402
 from app.modules.documents.seed import seed_document_types  # noqa: E402
 from app.modules.fieldops.seed import run_seed_fieldops  # noqa: E402
@@ -55,7 +59,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Master seeder orchestrator.")
     parser.add_argument("--only",
                         choices=["users.reference", "documents.types", "custom_fields.data_types", "company",
-                                 "fieldops.defaults"],
+                                 "fieldops.defaults", "accounting.defaults"],
                         help="Run a specific seeder only")
     parser.add_argument("--database-url", default=None, help="Database URL")
     args = parser.parse_args()
@@ -69,10 +73,11 @@ def main() -> None:
     run_data_types = not args.only or args.only == "custom_fields.data_types"
     run_company = not args.only or args.only == "company"
     run_fieldops = not args.only or args.only == "fieldops.defaults"
+    run_accounting = not args.only or args.only == "accounting.defaults"
 
     print("=== Running Seeders ===")
     if run_reference:
-        print("[1/5] Seeding reference data (countries & timezones)...")
+        print("[1/6] Seeding reference data (countries & timezones)...")
         json_file = str(backend_dir / "data" / "countries" / "countries.json")
         if not os.path.exists(json_file):
             json_file = str(backend_dir / "data" / "countries.json")
@@ -82,17 +87,17 @@ def main() -> None:
         print(f"      ✓ {results['countries']} countries, {results['timezones']} timezones, {results['mappings']} mappings seeded.")
 
     if run_documents:
-        print("[2/5] Seeding the document-type catalog...")
+        print("[2/6] Seeding the document-type catalog...")
         added = asyncio.run(_run_sync(db_url, seed_document_types))
         print(f"      ✓ {added} document types added (existing rows are never overwritten).")
 
     if run_data_types:
-        print("[3/5] Seeding the custom-field data-type lookup...")
+        print("[3/6] Seeding the custom-field data-type lookup...")
         added = asyncio.run(_run_sync(db_url, seed_data_types))
         print(f"      ✓ {added} custom-field data types added (existing rows are never overwritten).")
 
     if run_company:
-        print("[4/5] Seeding the tenant + root organization (COMPANY_* settings)...")
+        print("[4/6] Seeding the tenant + root organization (COMPANY_* settings)...")
         result = asyncio.run(run_seed_company(db_url))
         tenant, org = result["tenant"], result["organization"]
         verb = "created" if result["tenant_created"] else "updated"
@@ -108,13 +113,19 @@ def main() -> None:
             print(f"      ✓ Admin user '{admin.email}' {verb} (role={admin.role_id}).")
 
     if run_fieldops:
-        print("[5/5] Seeding field-ops defaults (Work Shift template, default + member policy layers)...")
+        print("[5/6] Seeding field-ops defaults (Work Shift template, default + member policy layers)...")
         result = asyncio.run(run_seed_fieldops(db_url))
         made = [k for k in ("template", "default_layer", "member_layer") if result[k]]
         print(f"      ✓ {', '.join(made) if made else 'nothing new'} "
               f"(existing templates/layers are never overwritten).")
         if result["member_role_id"] is None:
             print("      ! No 'member' role at the root organization — member layer skipped.")
+
+    if run_accounting:
+        print("[6/6] Assigning the company organization's unambiguous default accounts...")
+        result = asyncio.run(run_seed_accounting(db_url))
+        print(f"      ✓ assigned: {', '.join(result['assigned']) or 'nothing new'}; "
+              f"kept: {len(result['kept'])}; unassigned (set them in the app): {len(result['unassigned'])}.")
 
     print("=== All Seeders Executed Successfully ===")
 

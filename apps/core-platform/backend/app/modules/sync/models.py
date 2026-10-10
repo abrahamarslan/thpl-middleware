@@ -67,6 +67,9 @@ class LinkState:
     LINKED = "linked"            # entity_id points at a real, fully synced row
     PROVISIONAL = "provisional"  # a stub created to satisfy a reference; awaiting enrichment
     ORPHANED = "orphaned"        # the entity is gone; reported, never silently deleted
+    #: A retired source id (a merged-away duplicate) redirected to the SURVIVOR's entity. Resolves like
+    #: ``linked``; never part of a module's live set, so its absence from a scan tombstones nothing.
+    MERGED = "merged"
 
 
 class SyncOutcome:
@@ -272,7 +275,7 @@ class PendingReference(LedgerMixin, Base):
 #: is not de-TOASTed on every payload (§2.1, hot-path rule).
 GATE_COLUMNS: tuple[str, ...] = (
     "id", "entity_id", "entity_table", "link_state", "source_modified_at",
-    "raw_hash", "raw_source", "remote_deleted_at", "sync_version",
+    "raw_hash", "raw_source", "raw_synced_at", "remote_deleted_at", "sync_version",
 )
 
 

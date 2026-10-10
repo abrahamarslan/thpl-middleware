@@ -1,6 +1,6 @@
 # Accounts module: Chart of Accounts, account assignments, and the path to a ledger
 
-**Status:** proposed, not built yet · **Owner:** backend / platform data
+**Status:** Phase 1 **BUILT** (2026-10-08, migration `e4c737170f12`) — see *As built* below; Phases 2–6 proposed · **Owner:** backend / platform data
 **Schema:** `accounting` · **Package:** `app/modules/accounting/` · **Postgres:** 18
 **Inputs reconciled:** the v1 `accounts_module.sql`, the v2 audit (`accounts_module_v2.sql`,
 `accounts_module_validation.sql` and their report), Zoho Books `/chartofaccounts`
@@ -12,82 +12,166 @@
 
 ---
 
+## As built — Phase 1 (2026-10-08)
+
+Everything in §5–§8 and §11–§12 for Phase 1 is in the code, with these deliberate differences
+from the text below (the text is kept as the design record):
+
+| Plan said | Built | Why |
+|---|---|---|
+| owners addressed by UUID in the API | owners addressed by `(owner_type, owner_id)` — the `/api/taxes/assignments` convention | one convention for both assignment APIs; accounts themselves are addressed by id **or** uuid |
+| `Account` with tags / documents / custom fields | `HasCommentsMixin` only (`account` registered commentable); Zoho custom fields stay on the crosswalk | no consumer yet; each is one mixin + one registration later |
+| `tax.assert_owner_scope` reused | promoted to **`core.assert_owner_scope`** (an organization owns itself); `tax.*` delegates to it; `entities.crud.owner_info` likewise shared | one owner-scope rule for every polymorphic-assignment module |
+| type and group rules on every assignment | judged for **local** rows (service + deferred trigger); a **source's** rows are trusted and misfits logged (`accounting.assignment.source_misfit`) | Zoho masters its own tax ↔ account links; refusing them would also fail the reconcile lane's whole batch |
+| policies configurable "per tenant / organization" (§7.5) | `core.resolution_policies` (+ `/api/resolution/policies/{facet}/{subject}?scope=organization\|tenant`); effective = organization → tenant → code. A tenant-wide row is inserted with Core: the ORM insert hook would stamp the request's organization onto it | accountant-approved defaults stay in code; overrides are validated against the registry before they are stored |
+| `ModuleSyncConfig.strategy` default → FULL | done; `tests/test_accounting.py` asserts every adapter declares its strategy | the default never decides a real module |
+
+| `index_then_detail` + inline detail (§6.1) | **list-only by default** (`detail_required=False`); detail is a control-plane override | documented limits: 100 requests/min per organization and 1 000–10 000 requests/DAY by plan (`docs/zoho-docs-md/introduction.md`) — one detail call per account would spend 231 calls per full scan on THPL. And the LIVE list row already carries `currency_id`, `description`, `placeholder`, `show_on_dashboard` (the documented list example does not) |
+| `tds_payable_account_id` → purpose `tds_payable` | for a **GST leg** (cgst/sgst/igst/utgst/cess) with no `purchase_tax_account_id`, it is read as **`input_tax`** (`taxes/zoho/hooks.tax_account_refs`) | observed on all THPL GST taxes: Zoho leaves `purchase_tax_account_id` empty and puts "Input CGST/IGST/SGST" in `tds_payable_account_id`. Not documented by Zoho; one tenant's data — a real TDS tax keeps the literal mapping |
+| — | **engine fix** (`zoho/sync/engine.py`): a single-record apply (the detail phase, retries) now writes its DEFER waiters | they were dropped by the next page's reset, leaving a detail-only reference NULL forever and invisible to reconcile. Mutation-checked |
+| — | `accounting/model.py` imports the currency and registry models | any process importing only accounts (a seeder, a task) failed with `NoReferencedTableError` |
+
+**Live (dev stack, real Zoho, 2026-10-08).**
+- Migration `e4c737170f12` applied.
+- First list-only sync: **2 calls, 231 accounts, 0 errors**. All 231 have a currency, 74 children are linked (max depth 1), no account sits under a parent of another group or of a type that disallows sub-accounts, and no account code is duplicated (decision 3 settled).
+- 16 account types are used. The most common is `other_expense` (61 accounts), one of the 5 types missing from the owner's 41-code list.
+- Tax backfill: all 10 stored tax documents were replayed, giving 12 tax → account links (Output/Input per GST leg).
+- Seed step `accounting.defaults` assigned `receivable` and `payable`. `inventory_asset` was left unassigned on purpose: there are 3 stock accounts, so it is ambiguous.
+- Resolver through the API: CGST20 posts output to Output CGST and input to Input CGST; with no contact, receivable resolves to the organization's Accounts Receivable.
+
+**Synced vs live Zoho — field-by-field audit (2026-10-08, migration `487a10ab6c4e`).**
+- **Match:** 231 = 231 accounts (none missing on either side), with **zero mismatches** across name, code, type,
+  status, system / user-created flags, expense-claim flag, dashboard flag, placeholder, description, parent,
+  currency and depth. All 231 crosswalk rows are linked, dated and in THPL's organization; nothing is pending.
+- **Second scan:** 231 unchanged, 0 writes, no new history, 2 calls.
+- **Not synced before, synced now:** `is_register_supported_account` (228 true) and `is_standalone_account`
+  (35 true) are in every live list row. They now land in `accounts.is_register_supported` / `is_standalone`,
+  filled from the stored documents (zero API calls).
+- **Zoho-fed assignments keep their Zoho account id:** `external_ref` is now filled on every Zoho-fed row,
+  not only while pending.
+- **Zoho's `isdebit` is NOT the normal side.** It is the side of the *current balance*:
+  - every zero-balance account reports `false` whatever its type;
+  - "Discount" (income) reports `true`, because it carries a debit balance;
+  - "IDBI Bank" reports `false`, because it is in credit (likely a cash-credit / overdraft account).
+  - The v2 design's mapping `isdebit` → `normal_balance_is_debit` would have been wrong for 9 of 20 sampled
+    accounts. Ours stays derived from the type; `isdebit` is in the no-op-hash volatile keys.
+  - "Discount" and "Purchase Discounts" behave as contra accounts: `is_contra` is ours to set (PATCH); not
+    changed automatically.
+- **The detail document has no `currency_id`** (contradicting the docs example). It adds `custom_fields`
+  (empty on every sampled account), `isdebit`, the balance and an embedded `transactions` list — so
+  list-only stays the default.
+- **`placeholder` is Zoho's slug of the account NAME** (`gl_laptop`, `gl_racks` …), not a system-role
+  marker as §5.2 assumed. The comment is corrected; nothing keys on it.
+- **Personal data in the chart:** several THPL account names carry employees' names (salary ledgers). That
+  is P2 data in `account_name` (and in Zoho itself) — a DPDP note for the owner, not changed here.
+- **Why no `zoho_id` on purposes, policies or assignments:** purposes and policies are our own vocabulary,
+  with no Zoho counterpart, so the column would be permanently NULL (the categories review's "fourteen
+  NULL columns" mistake). An assignment is a link with no Zoho id of its own; the Zoho id it carries is
+  the ACCOUNT's, stored as `external_ref` (source-neutral, the `tax_assignments` convention).
+- **Known, not changed:** Zoho deletions do not propagate. `soft_delete_missing` is off: with it on, a full
+  scan tombstoning a parent and its children in one statement would trip the delete guard and fail the run.
+  To revisit with the tombstone path.
+
+**Observed, not documented — one occurrence each.** With detail ON, the first full sync got HTTP 429 with an undocumented `code: 43` ("blocked for some time … requests per minute"):
+- It came after ~190 detail calls in ~3.5 minutes, although this process stayed at ≤ 58 calls/minute by its own log.
+- The block took ~15–20 minutes to lift.
+- Scheduled lanes retrying during the block appear to have prolonged it.
+- Zoho documents a per-ACCOUNT variant (code 44) that counts the connected user's web and other-app traffic; that may explain it, but this is unverified.
+- The engine rolls a run back on a 429, so a detail-on first sync of a large chart may never converge — another reason detail stays off.
+- `backend/.env` sets `ZOHO_RATE_LIMIT=150`/min, above the documented 100: worth lowering (owner's call).
+
+**Verified:** migration up → down → up on a scratch PG18; autogenerate drift on the owned tables
+= 0; `lint-imports` 10/10 contracts kept (two new: accounting never imports a consumer; the
+resolution engine imports no feature); `tests/test_accounting.py` + `tests/test_resolution.py`
+(31) and the extended `tests/zoho_core/test_masters_e2e.py` green.
+
 ## 0. Summary
 
-1. **The v2 schema is a good ledger design, but it was written for a database we do not
-   have.** It rebuilds about a third of the platform under new names: tenancy
-   (`public.organizations` + a tenant-fill trigger), audit columns, a polymorphic
-   registry, currencies and exchange rates, Zoho identity (`account_external_identities`),
-   row versioning and an audit log. Each of those already exists here and is enforced by
-   conformance tests. **We keep v2's accounting rules and replace its infrastructure with
-   ours** (§2).
-2. **Build it in phases, starting with what has consumers today.** Phase 1 builds:
+> **Revision 2 (2026-10-08)**, after review with the owner. Changes:
+> - **All 46 account types are seeded.** That is Zoho's documented list plus the tenant's
+>   own account-types response, each with its Zoho numeric id as `zoho_id` (§5.1, §2.4).
+> - **`zoho_id` echoes** are on `accounts` and `account_types`.
+> - **A platform resolution engine** (`app/modules/resolution/`) answers "what applies
+>   here?" for taxes, accounts and later facets, for any owner chain (a document line →
+>   item → category → contact → organization). It runs in one query per facet (§7).
+> - **Contacts carry taxes and accounts**, resolved through the same engine (§8.2).
+> - **Zoho tax ids resolve to `app/modules/taxes`**, and tax components' account ids
+>   resolve to `accounting` (§8.3).
+> - **Sync default is FULL.** `last_modified_time` is trusted, so INCREMENTAL is a runtime
+>   override, not a deploy (§6.1).
+> - **Tenant and organization default: THPL** (`backend/.env`), with no new setting (§6.4).
+
+1. **Nothing the platform has is rebuilt.** v2's tenancy, audit / soft-delete / row-version
+   columns, type registry, currencies and exchange rates, Zoho identity edge and audit log
+   all map onto what exists (§2.2): `OrgEntityMixin`, `AuditMixin`,
+   `SoftDeleteFilteredMixin`, `RowVersionMixin`, `core.entity_types`, `currency.currencies`
+   / `currency.exchange_rates`, `sync.sync_records`, and the activity recorder. What
+   remains is the accounting itself.
+2. **Phase 1** is:
    - the **Chart of Accounts** (`accounting.account_types` and `accounting.accounts`);
    - **account assignments**, so any entity can say "use this account for this purpose"
      (`accounting.account_assignments` + `HasAccountsMixin`);
+   - the **resolution engine**;
    - the **Zoho sync** of `/chartofaccounts`.
 
-   The general ledger (journal entries, periods, posting rules, balances) comes in Phases 2
-   and 3. Nothing writes ledger entries yet (no invoices, bills or payments module), and a
-   balance trigger with no writer is speculative surface area (master prompt, directive 7).
-3. **"Customers and Items can have accounts" means assignments, not more accounts.**
-   - An item's sales, purchase and inventory accounts (Zoho: `account_id`,
+   The general ledger comes in Phases 2–3, when invoices and bills exist to write to it.
+3. **"Customers and Items can have accounts" means assignments, never more accounts.**
+   - An item's sales, purchase and inventory accounts (Zoho `account_id`,
      `purchase_account_id`, `inventory_account_id`) are three assignment rows.
-   - A customer's receivable account is an optional override of the organization's AR
+   - A contact's receivable account is an optional override of the organization's AR
      control account.
-   - There is **never one GL account per retailer.** At thousands of retailers that is the
-     classic chart-of-accounts explosion; the counterparty belongs on the ledger line
-     (v2 R15-10, agreed).
-4. **One mechanism replaces three of v2's.** Organization-level defaults (v2's
-   `account_roles` + `account_role_assignments`, the five account columns on
-   `organization_inventory_preferences`, and the `is_retained_earnings` /
-   `is_accounts_receivable` / … singleton flags) become **assignments whose owner is the
-   organization.** "Which account applies here?" then has one resolver with one fallback
-   chain: owner → organization (§7).
-5. **Organization-scoped throughout** (`OrgEntityMixin`: `tenant_id` and `organization_id`
-   NOT NULL, composite FK to the organization). Zoho account ids belong to a Zoho
+   - There is never one GL account per retailer. Control accounts plus subledgers are the
+     standard design (§2.4); the counterparty belongs on the ledger line.
+4. **Organization defaults are assignments whose owner is the organization.** This one
+   mechanism replaces v2's `account_roles`, its role assignments, the inventory-preference
+   account columns and the `is_retained_earnings`-style singleton flags.
+5. **Organization-scoped** (`OrgEntityMixin`). Zoho account ids belong to a Zoho
    organization, and so do our rows.
-6. **Findings that change the design** (§2.3):
-   - v2's account-type seed and Zoho's documented vocabulary disagree; the type table must
-     be their union.
-   - v2's overlap trigger for fiscal periods is race-prone. `btree_gist` is *already
-     installed* (the geo migration installed it), so we use a real `EXCLUDE` constraint.
-   - v2's immutability guard contradicts its own erasure rule.
-   - v2's `balance_cache` on the account row would rewrite the row on every sync.
-   - The organization row already carries the base currency and the fiscal-year start month.
-
----
+6. **Corrections to v2 that change the design** (§2.3):
+   - The type vocabulary must be the union of three sources. Your 41-code list is also
+     missing 5 types the tenant itself reports (§2.4).
+   - The fiscal-period overlap trigger races. `btree_gist` is already installed, so we use
+     `EXCLUDE`.
+   - The immutability guard contradicts the erasure rule.
+   - `balance_cache` on the master row rewrites it on every balance change.
+   - Base currency and fiscal-year month already live on `organizations`.
 
 ## 1. Understanding
 
-**Asked:** implement Chart of Accounts, income/purchase/inventory accounts, etc., as an
-organization-scoped module that Customers and Items (and later other entities) can carry
-accounts from, integrated with the existing mixins and the sync crosswalk.
+**Asked:**
+- Chart of Accounts and the income, purchase and inventory account pickers, as an
+  organization-scoped module.
+- Contacts (customers and vendors) and Items carry accounts *and* taxes, resolved properly
+  by an enterprise-grade resolver shared across modules.
+- Zoho tax ids resolve into `app/modules/taxes`.
+- `zoho_id` wherever a row has a Zoho identity.
+- FULL as the default strategy.
+- THPL as the default tenant and organization.
 
 **Read for this plan:**
 
-- `app/database/mixins.py`: the table classes ENTITY / LEDGER / GLOBAL, and
-  `OrgEntityMixin`, `VerificationMixin`, `HashGuardMixin`.
-- The four "Has…Mixin" precedents: `tags`, `comments`, `documents`, and
-  `taxes/mixins.py` + `taxes/assignment.py` + `taxes/registration.py`.
-- `zoho/sync/mixins.py`: deprecated for new modules; the crosswalk replaces it.
-- The sync contract (`sync/contract.py`) and the categories/taxes adapters.
-- `core.entity_types` and `core.assert_entity_exists()`.
-- `currency.currencies`, and `org_management.organizations` (which has `currency_id` and
+- `app/database/mixins.py`, plus the `tags`, `comments`, `documents`, `custom_fields` and
+  `taxes` mixins.
+- `taxes/assignment.py`, `assignment_service.py` (`resolve_taxes`, `select_applicable`),
+  `registration.py`, `preference.py` (org default taxes), `org_tax.py` (per-organization
+  grants), `component.py` (the opaque `*_account_id` echoes) and `zoho/spec.py`.
+- `zoho/sync/mixins.py` (deprecated for new modules), `zoho/sync/config.py` (the
+  `ModuleSyncConfig` defaults) and `zoho/control/config.py` (runtime per-module overrides).
+- `sync/contract.py`, `crosswalk.py`, `references.py`, `reconcile.py`.
+- The categories adapter (its same-module parent hook).
+- `currencies/model.py` (org-scoped, `uq_currencies_tenant_id`, with `zoho_id` /
+  `currency_id` echoes) and `currencies/zoho/spec.py`.
+- `entities/model.py` (`core.entity_types`) and `organizations/model.py` (`currency_id`,
   `fiscal_year_start_month`).
-- The tenancy conformance test (`tests/test_tenancy.py`), `_OWNED_SCHEMAS` in
-  `alembic/env.py`, and the RBAC catalogue.
+- `tests/test_tenancy.py`, `alembic/env.py`, `rbac/catalogue.py`, `backend/.env`.
+- The vendored Zoho docs `chart-of-accounts.md`, `contact.md`, `items.md`, `taxes.md`,
+  `journals.md`.
 
-**Not in the repo, needed before Phase 1 is coded.** The six JSON samples the v2 report was
-built from (`account-types.json`, `accounts-list.json`, `account-single.json`,
-`accounts-single-2.json`, the purchase/income/inventory lists) are not vendored. They show
-fields the documented API does not have, such as `account_type_int`, `placeholder`,
-`is_user_created`, the role flags and `price_precision`. Per the guardrails, a payload shape
-we only have second-hand is not one to build on, so **vendor them under
-`docs/zoho-docs-md/samples/accounts/` first** (§13, decision 1). The mapping in §6 marks
-every field as *documented* or *sample-only*.
-
----
+**Samples.** The tenant's account-types response (26 types, with Zoho's numeric ids) was
+provided in review and is vendored as `docs/zoho-docs-md/samples/accounts/account-types.json`
+in Phase 1. The other samples (chart list, single account, the
+income/purchase/inventory lists) are still outstanding (§13, decision 1). Only the picker
+eligibility flags (§7.11) depend on them.
 
 ## 2. The v2 design against the platform
 
@@ -181,11 +265,67 @@ every field as *documented* or *sample-only*.
 
 ---
 
+### 2.4 Research findings (2026-10-08)
+
+**Account types: your list, checked.** There are three sources, and none of them alone is
+complete:
+
+| Source | Codes | What it says |
+|---|---|---|
+| Zoho Books API docs, `account_type` allowed values ([Chart of Accounts API](https://www.zoho.com/books/api/v3/chart-of-accounts)) | 38 | includes IFRS-style types (`right_to_use_asset`, `lease_liability`, `finance_income`, `other_comprehensive_income`, `*_expense` by nature) |
+| THPL's own account-types response (provided in review) | 26 | the types this tenant's edition actually offers, **with Zoho's numeric ids** (`"id": "1"` … `"112"`) and per-type rules |
+| Your list | 41 | |
+
+**Union: 46 codes, all seeded** (§5.1).
+
+Your 41-code list is **missing 5 types the tenant itself returns**: `intangible_asset` (25),
+`long_term_asset` (26, "Non Current Asset"), `capital_work_in_progress` (111),
+`intangible_assets_under_development` (112) and `other_expense` (18). Two of these are
+Schedule III balance-sheet lines (CWIP and IAUD), and `other_expense` is a type Zoho
+explicitly allows sub-accounts under. They have to be in the seed: an account of a missing
+type fails its sync (the type is an FK).
+
+**Which types a given organization sees depends on its edition.**
+- Zoho's India help page lists the 9 asset, 7 liability, equity, income/other income and
+  expense defaults, with no IFRS types
+  ([Zoho Books India help: Chart of Accounts](https://www.zoho.com/in/books/help/accountant/chart-of-accounts.html)).
+- The tenant response has 26 types and no IFRS ones.
+- So the 20 documented-only types belong to other editions. They are seeded with
+  `zoho_id = NULL`, because their numeric id has never been observed. The id is filled the
+  first time a tenant reports it.
+
+**Sub-account rules disagree between Zoho's own sources.**
+- The KB article lists sub-accounts as allowed for: Cash, Cost of Goods Sold, Equity,
+  Expense, Fixed Asset, Income, Long Term Liability, Other Asset, Other Current Asset, Other
+  Current Liability, Other Expense, Other Income, Other Liability, Stock
+  ([Zoho KB](https://www.zoho.com/books/kb/accountant/accounts-supporting-sub-accounts.html)).
+- The tenant response also says `true` for `accounts_receivable`, `accounts_payable`,
+  `intangible_asset` and `long_term_asset`.
+- **The seed follows the tenant response**: it is machine data from the live product, and
+  the KB page is prose that lags.
+- This is also why type rules are service-level, not triggers (§2.3 #6): Zoho stays the
+  final arbiter of its own chart.
+
+**Control accounts and subledgers.**
+- Standard practice is a small number of control accounts (AR, AP) that subledgers roll up
+  into.
+- Customer and vendor detail lives in the subledger or in dimensions, not as one GL account
+  each. Over-granular charts clutter reports and multiply reconciliations.
+- Control accounts are locked against manual journals except approved corrections
+  ([Sage control-account practice](https://cleverence.com/articles/sage-documentation/about-subsidiary-accounts-sage-4831)).
+- This confirms §0 point 3, and it gives Phase 3 a rule: native manual journals to an
+  account assigned as `receivable` / `payable` need `accounting.journal:post_control`.
+
+**Schedule III.** Zoho Books does not produce a Schedule III balance sheet; the accounts are
+mapped to Schedule III lines outside it
+([Patron Accounting, Apr 2026](https://www.patronaccounting.com/blog/zoho-books-chart-of-accounts-india-setup)).
+That keeps the statutory mapping table in Phase 3+ (§10).
+
 ## 3. Phases
 
 | # | Phase | Delivers | Unblocks |
 |---|---|---|---|
-| **1** | **Chart of Accounts** | `account_types`, `accounts`, `account_purposes`, `account_purpose_policies`, `account_assignments`; `HasAccountsMixin`; registration helper; resolver; `/chartofaccounts` sync (INBOUND); API; organization defaults + tax-component accounts wired | Items and Customers modules can declare accounts on day one |
+| **1** | **Chart of Accounts** | `account_types`, `accounts`, `account_purposes`, `account_purpose_policies`, `account_assignments`; `HasAccountsMixin`; registration helper; **resolution engine** (`app/modules/resolution/`, TaxFacet + AccountFacet); 46-type seed; `/chartofaccounts` sync (INBOUND, FULL default); API; organization defaults + tax-component accounts wired | Items and Contacts can declare taxes and accounts on day one; documents resolve both in O(1) queries |
 | 2 | Accounting calendar & settings | `organization_accounting_settings` (lock date, books start, basis), `fiscal_years`, `accounting_periods` (EXCLUDE) | posting rules |
 | 3 | General ledger | `journal_entries`, `journal_entry_lines`, dimensions, `document_sequences`, `account_period_balances`, ledger audit trail; posting, immutability, reversal | invoices / bills / payments modules |
 | 4 | Zoho transactions projection | `/chartofaccounts/transactions` and `/journals` → `external_projection` entries | ledger reports over Zoho history |
@@ -215,6 +355,8 @@ app/modules/accounting/
   assignment_service.py put_assignments, resolve_account(s)
   api.py               /api/accounting/account-types, /api/accounting/accounts
   assignment_api.py    /api/accounting/assignments/..., /api/accounting/resolve
+  seed_data.py         the 46 account types (§5.1) and the purposes (§5.4) — data, loaded by the migration
+  resolution.py        AccountFacet (§7.4) + the account policies this module owns
   zoho/
     fields.py          the field map (§6.2)
     codecs.py          account_type, blank→NULL, tolerant bool, Zoho offset datetimes
@@ -243,38 +385,98 @@ Mixins are listed most-specific first; `Base` is always last. Every table goes i
 
 `BigIntPKWithUUIDv7Mixin, AuditMixin, AppMetaMixin, TimestampMixin, Base`. It is **not**
 soft-deletable: it is an FK target by `code`, and PostgreSQL cannot reference a partial
-unique index (the same reason given in `tax.taxable_entity_types`). A type is retired with
-`is_enabled = false`. It is listed in `GLOBAL_TABLES` with the reason "Zoho/IFRS account-type
-vocabulary, identical for every tenant — reference data like countries".
+unique index (the reason `tax.taxable_entity_types` gives). A type is retired with
+`is_enabled = false`. `GLOBAL_TABLES` reason: "Zoho / IFRS account-type vocabulary,
+identical for every tenant — reference data like countries".
 
 | Column | Type | Null | Notes |
 |---|---|---|---|
-| `code` | `String(64)` | NO | **UNIQUE (non-partial)**, the FK target. Zoho's `account_type` string (`cost_of_goods_sold`) |
-| `name` | `Text` | NO | `Cost Of Goods Sold` |
+| `code` | `String(64)` | NO | **UNIQUE (non-partial)**, the FK target; Zoho `account_type` |
+| `zoho_id` | `String(16)` | YES | Zoho's numeric type id (`"1"`…`"112"`), a vendor-wide constant; partial unique `WHERE zoho_id IS NOT NULL`. NULL = never observed in a tenant response |
+| `name` | `Text` | NO | `account_type_formatted` / `text` |
 | `account_group` | `String(16)` | NO | CHECK `asset / liability / equity / income / expense` |
-| `default_normal_balance_is_debit` | `Boolean` | NO | asset/expense → true; liability/equity/income → false. Stored, not inferred, so an odd type can override its group |
-| `is_sub_account_allowed` | `Boolean` | NO | default true; `bank`, `credit_card`, `payment_clearing`, … false |
-| `can_show_opening_balance` | `Boolean` | NO | |
-| `is_sales_eligible` / `is_purchase_eligible` / `is_inventory_eligible` | `Boolean` | NO | which pickers list it (§7.4). Replaces v1's per-account `is_sales_account` / … flags |
-| `asset_type` | `String(32)` | YES | `fixed_asset`, `cwip`, `iaud` (sample-only vocabulary) |
-| `zoho_type_int` | `SmallInteger` | YES | `account_type_int` (`'1'..'112'`) from samples; a vendor-wide constant, partial unique |
-| `is_documented` | `Boolean` | NO | true = in Zoho's documented list; false = observed only in samples. Tells an operator which rows are evidence-backed |
+| `default_normal_balance_is_debit` | `Boolean` | NO | asset/expense true; liability/equity/income false |
+| `is_sub_account_allowed` | `Boolean` | YES | Zoho flag; NULL = not reported (the 20 documented-only types) → the service allows it and Zoho decides on push |
+| `can_show_opening_balance` | `Boolean` | YES | Zoho sends the **string** `"true"`; tolerant bool |
+| `can_enable_in_ze` | `Boolean` | YES | usable in Zoho Expense |
+| `asset_type` | `String(32)` | YES | `fixed_asset`, `cwip`, `iaud` |
+| `is_documented` | `Boolean` | NO | in the API docs' allowed values |
+| `is_sales_eligible` / `is_purchase_eligible` / `is_inventory_eligible` | `Boolean` | NO | picker eligibility (§7.11) |
 | `is_enabled` | `Boolean` | NO | default true |
-| `sort_order` | `SmallInteger` | YES | |
+| `sort_order` | `SmallInteger` | NO | the tenant response's order; documented-only types after their group |
 | `description` | `Text` | YES | |
 
-**Seed:** the union of the 38 documented codes and the 8 sample-only codes (§2.3 #1), each
-with its group and normal side.
-- Groups for the documented-only codes are by name (`*_asset` → asset, `*_liability` →
-  liability, `*_income` → income, `*_expense` → expense).
-- `contingent_asset` / `contingent_liability` are off-balance-sheet in most frameworks; they
-  are seeded with their nominal group and **flagged for accountant review** (§13, decision 5).
+**Seed: all 46 types.** In the table below:
+- **Doc** = in the API's allowed values; **Tenant** = in THPL's response.
+- **Sub / OB / ZE** = `is_sub_account_allowed`, `can_show_opening_balance`,
+  `can_enable_in_ze`.
+- **—** = not reported, stored as NULL.
+- The normal side follows the group (Dr for asset and expense).
 
-**Unknown code from Zoho:** `accounts.account_type` is an FK to `code`, so the record's
-insert fails with an FK violation. The engine records it per record (`zoho_sync_events`,
-one record only, never the page), the account is missing from the replica, and an operator
-adds the seed row. This is deliberate: a guessed group would derive a wrong normal balance
-and corrupt every report built on it.
+| # | code | zoho_id | name | group | Sub | OB | ZE | asset_type | Doc | Tenant |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `other_asset` | 1 | Other Asset | asset | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 2 | `other_current_asset` | 2 | Other Current Asset | asset | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 3 | `cash` | 3 | Cash | asset | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 4 | `bank` | 4 | Bank | asset | ✗ | ✗ | ✓ | | ✓ | ✓ |
+| 5 | `fixed_asset` | 6 | Fixed Asset | asset | ✓ | ✓ | ✓ | `fixed_asset` | ✓ | ✓ |
+| 6 | `accounts_receivable` | 5 | Accounts Receivable | asset | ✓ | ✗ | ✗ | | ✓ | ✓ |
+| 7 | `stock` | 19 | Stock | asset | ✓ | ✗ | ✗ | | | ✓ |
+| 8 | `payment_clearing` | 20 | Payment Clearing Account | asset | ✗ | ✓ | ✗ | | | ✓ |
+| 9 | `intangible_asset` | 25 | Intangible Asset | asset | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 10 | `long_term_asset` | 26 | Non Current Asset | asset | ✓ | ✓ | ✗ | | | ✓ |
+| 11 | `deferred_tax_asset` | 27 | Deferred Tax Asset | asset | ✗ | ✓ | ✗ | | | ✓ |
+| 12 | `capital_work_in_progress` | 111 | Capital Work In Progress | asset | ✗ | ✓ | ✗ | `cwip` | | ✓ |
+| 13 | `intangible_assets_under_development` | 112 | Intangible Assets Under Development | asset | ✗ | ✓ | ✗ | `iaud` | | ✓ |
+| 14 | `right_to_use_asset` | — | Right To Use Asset | asset | — | — | — | | ✓ | |
+| 15 | `financial_asset` | — | Financial Asset | asset | — | — | — | | ✓ | |
+| 16 | `contingent_asset` | — | Contingent Asset | asset | — | — | — | | ✓ | |
+| 17 | `contract_asset` | — | Contract Asset | asset | — | — | — | | ✓ | |
+| 18 | `other_current_liability` | 8 | Other Current Liability | liability | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 19 | `credit_card` | 9 | Credit Card | liability | ✗ | ✗ | ✓ | | ✓ | ✓ |
+| 20 | `long_term_liability` | 11 | Non Current Liability | liability | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 21 | `other_liability` | 12 | Other Liability | liability | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 22 | `accounts_payable` | 10 | Accounts Payable | liability | ✓ | ✗ | ✗ | | ✓ | ✓ |
+| 23 | `overseas_tax_payable` | 22 | Overseas Tax Payable | liability | ✗ | ✓ | ✗ | | | ✓ |
+| 24 | `deferred_tax_liability` | 28 | Deferred Tax Liability | liability | ✗ | ✓ | ✗ | | | ✓ |
+| 25 | `contract_liability` | — | Contract Liability | liability | — | — | — | | ✓ | |
+| 26 | `refund_liability` | — | Refund Liability | liability | — | — | — | | ✓ | |
+| 27 | `loans_and_borrowing` | — | Loans And Borrowing | liability | — | — | — | | ✓ | |
+| 28 | `lease_liability` | — | Lease Liability | liability | — | — | — | | ✓ | |
+| 29 | `employee_benefit_liability` | — | Employee Benefit Liability | liability | — | — | — | | ✓ | |
+| 30 | `contingent_liability` | — | Contingent Liability | liability | — | — | — | | ✓ | |
+| 31 | `financial_liability` | — | Financial Liability | liability | — | — | — | | ✓ | |
+| 32 | `equity` | 13 | Equity | equity | ✓ | ✓ | ✗ | | ✓ | ✓ |
+| 33 | `income` | 14 | Income | income | ✓ | ✓ | ✗ | | ✓ | ✓ |
+| 34 | `other_income` | 15 | Other Income | income | ✓ | ✓ | ✗ | | ✓ | ✓ |
+| 35 | `finance_income` | — | Finance Income | income | — | — | — | | ✓ | |
+| 36 | `other_comprehensive_income` | — | Other Comprehensive Income | income | — | — | — | | ✓ | |
+| 37 | `expense` | 16 | Expense | expense | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 38 | `cost_of_goods_sold` | 17 | Cost Of Goods Sold | expense | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 39 | `other_expense` | 18 | Other Expense | expense | ✓ | ✓ | ✓ | | ✓ | ✓ |
+| 40 | `manufacturing_expense` | — | Manufacturing Expense | expense | — | — | — | | ✓ | |
+| 41 | `impairment_expense` | — | Impairment Expense | expense | — | — | — | | ✓ | |
+| 42 | `depreciation_expense` | — | Depreciation Expense | expense | — | — | — | | ✓ | |
+| 43 | `employee_benefit_expense` | — | Employee Benefit Expense | expense | — | — | — | | ✓ | |
+| 44 | `lease_expense` | — | Lease Expense | expense | — | — | — | | ✓ | |
+| 45 | `finance_expense` | — | Finance Expense | expense | — | — | — | | ✓ | |
+| 46 | `tax_expense` | — | Tax Expense | expense | — | — | — | | ✓ | |
+
+Accounting notes the accountant signs off (§13, decision 5):
+- `contingent_asset` / `contingent_liability` are disclosed, not recognised, under
+  Ind AS 37. They are seeded in Zoho's nominal group.
+- `other_comprehensive_income` closes to equity (OCI reserve), not to retained earnings.
+  This matters for the Phase 3 year-end close, not for Phase 1.
+
+**Where the seed comes from.**
+- The seed is data in `accounting/seed_data.py`, loaded by the migration with
+  `ON CONFLICT (code) DO UPDATE` of `zoho_id` only when it is NULL. Re-runs never overwrite
+  an operator's change.
+- The vendored response is the test oracle: `test_account_type_seed_matches_tenant_response`
+  asserts each of the 26 observed rows field by field.
+- **Unknown code from Zoho:** `accounts.account_type` is an FK, so one record fails visibly
+  (`zoho_sync_events`), never the page, and never coerced into a guessed group. A guessed
+  group derives a wrong normal balance and corrupts every report built on it.
 
 ### 5.2 `accounting.accounts`: the chart, ENTITY
 
@@ -310,7 +512,7 @@ class Account(
 | `placeholder` | `Text` | YES | sample-only Zoho template slug (`gl_goods_in_transit`). **The robust key for recognising system accounts** across organizations; matching on names is not robust |
 | `is_expense_claim_enabled` | `Boolean` | YES | Zoho `can_show_in_ze` |
 | `show_on_dashboard` | `Boolean` | YES | create/update argument only (not in the documented response) |
-| `zoho_id` | `String(50)` | YES | **engine-maintained echo** of `account_id` (`identity_echo`), never written by hand |
+| `zoho_id` | `String(50)` | YES | **engine-maintained echo** of Zoho `account_id` (`SyncContract.identity_echo`), never written by hand, never the identity of record (that is `sync.sync_records`). Partial unique per organization. Answers "is this row Zoho-linked?" without a join, which every local edit asks |
 
 **Lifecycle, one signal.**
 - `status` (from `StatusMixin`) is CHECKed to `active` / `inactive`. Zoho's `is_active` maps
@@ -440,7 +642,11 @@ Rows are written by the owning module's migration through
 ### 5.6 `accounting.account_assignments`: ENTITY, polymorphic
 
 `BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFilteredMixin, Base`. This is
-`tax.tax_assignments` with accounts in place of taxes.
+`tax.tax_assignments` with accounts in place of taxes. Tax and account assignments are
+**separate tables on purpose**: taxes carry contexts, exemptions, ordered groups and frozen
+snapshots, and accounts carry a purpose and a currency. One merged table would be a union
+of two shapes with half its columns NULL. They are unified where it matters, at read time,
+by the resolution engine (§7).
 
 | Column | Notes |
 |---|---|
@@ -448,31 +654,39 @@ Rows are written by the owning module's migration through
 | `owner_id` `BigInteger` NOT NULL | no FK (polymorphic); proved at COMMIT |
 | `purpose_code` `String(48)` NOT NULL | |
 | composite FK `(owner_type_code, purpose_code)` → `account_purpose_policies (entity_type_code, purpose_code)` | the class is registered **and** opted in to this purpose, in the database |
-| `account_id` `BigInteger` NULL | composite FK `(tenant_id, organization_id, account_id)` → `accounts`: same organization, structurally |
-| `currency_id` `BigInteger` NULL | composite tenant FK → `currency.currencies`; NULL = any / base. Only meaningful when `purpose.per_currency` |
-| `external_ref` `Text` NULL, `source_system` `String(32)` NULL | **pending** link: a source named an account we have not synced yet (an item synced before the chart). The reconcile lane links it |
+| `account_id` `BigInteger` NULL | composite FK `(tenant_id, organization_id, account_id)` → `accounts`: the account is in the assignment's organization, structurally |
+| `currency_id` `BigInteger` NULL | composite tenant FK → `currency.currencies`; NULL = any / base; only when `purpose.per_currency` |
+| `external_ref` `Text` NULL, `source_system` `String(32)` NULL | **pending** link: a source named an account not synced yet. The reconcile lane links it |
 | CHECK `account_id IS NOT NULL OR (external_ref IS NOT NULL AND source_system IS NOT NULL)` | |
-| `uq_account_assignments_slot` on `(owner_type_code, owner_id, purpose_code, currency_id)` **NULLS NOT DISTINCT**, live | one account per slot. This replaces v2's singleton indexes: "one retained-earnings account" is the slot `(organization, X, retained_earnings, NULL)` |
-| `ix_account_assignments_owner` on `(owner_type_code, owner_id)`, live | the read path |
-| `ix_account_assignments_account` on `(account_id)`, live and not null | impact analysis ("who uses this account?") + the delete guard |
+| `uq_account_assignments_slot` on `(organization_id, owner_type_code, owner_id, purpose_code, currency_id)` **NULLS NOT DISTINCT**, live | one account per slot **per organization** (below) |
+| `ix_account_assignments_owner` on `(owner_type_code, owner_id)`, live | read path, and the engine's candidate query |
+| `ix_account_assignments_account` on `(account_id)`, live and not null | impact analysis + the delete guard |
 
-**`accounting.check_account_assignment_integrity()`** is a deferred constraint trigger, the
-same shape as `tax.check_tax_assignment_integrity()`. It checks that:
-1. the owner exists: `core.assert_entity_exists(owner_type_code, owner_id)`;
-2. the owner is in the **same tenant and organization** as the row;
-3. the policy row is enabled;
-4. the account's group ∈ `purpose.allowed_groups` (and its type ∈ `allowed_types` when set);
-5. `currency_id` is NULL unless `purpose.per_currency`.
+**Why `organization_id` is in the slot.** Some owners are **tenant-wide**:
+`tax.tax_components` is `TenantEntityMixin` (`organization_id` NULL = shared, granted per
+organization via `organization_tax_components`). One CGST component can post to account X in
+organization A and account Y in organization B, because charts of accounts are
+per-organization. So:
+- An assignment always belongs to the organization of its **account**.
+- The slot is unique per organization.
+- The integrity check accepts an owner that is either in the same organization or
+  tenant-wide in the same tenant.
 
-`accounting.find_orphan_account_assignments()` is the scheduled safety net, run in the
-reconcile lane.
+Contacts and items are org-scoped, so for them this degenerates to "same organization".
+
+**`accounting.check_account_assignment_integrity()`** (deferred constraint trigger) checks:
+1. the owner exists (`core.assert_entity_exists`);
+2. the owner's tenant equals the row's, and the owner's organization is NULL or equals the
+   row's;
+3. the policy is enabled;
+4. the account's group ∈ `purpose.allowed_groups` (and its type ∈ `allowed_types`);
+5. `currency_id` is NULL unless `per_currency`.
+
+`accounting.find_orphan_account_assignments()` runs in the reconcile lane.
 
 **`source_system`:**
 - `NULL` = maintained locally.
-- `'zoho'` = fed by a sync (an item's accounts). Read-only through the API, exactly like
-  `tax_assignments`.
-
----
+- `'zoho'` = fed by a sync, read-only through the API (the `tax_assignments` rule).
 
 ## 6. Zoho sync: `chart_of_accounts`
 
@@ -483,15 +697,15 @@ CHART_OF_ACCOUNTS_CONFIG = resolve_module_config(
     module="chart_of_accounts",
     endpoint="/chartofaccounts",
     zoho_id_attr="account_id",
-    strategy=SyncStrategyName.INCREMENTAL,     # list documents a last_modified_time filter
-    modified_since_param="last_modified_time",
+    strategy=SyncStrategyName.FULL,            # the default (owner decision); INCREMENTAL is a runtime override
+    modified_since_param="last_modified_time", # declared + trusted, so the override needs no deploy
     sort_column=None,                          # only account_name / account_type are sortable; neither is time-ordered
     direction=SyncDirection.INBOUND,           # Zoho masters the chart (Phase 6 adds outbound)
     detail_required=True,
     detail_dispatch="inline",
     index_then_detail=True,
     sync_interval_minutes=1440,
-    weekly_full_enabled=True,                  # the only lane that can see a delete
+    weekly_full_enabled=False,                 # the scheduled lane already IS full; set True with the INCREMENTAL override
     field_map=CHART_OF_ACCOUNTS_FIELDS,
     contract=SyncContract(
         source_system="zoho",
@@ -499,7 +713,7 @@ CHART_OF_ACCOUNTS_CONFIG = resolve_module_config(
         crosswalk=True,
         identity_echo=("zoho_id",),
         match_on=("zoho_id",),                 # re-adoption only (categories precedent), never a business-key merge
-        history_raw=True,                      # a master: keep every document
+        history_raw=True,
         capture_custom_fields=True,
         owned_fields=ZOHO_OWNED_ACCOUNT_FIELDS, # = frozenset(TRANSLATOR.readable)
         references=(
@@ -510,47 +724,51 @@ CHART_OF_ACCOUNTS_CONFIG = resolve_module_config(
 )
 ```
 
-Why each choice:
+**Strategy: FULL by default, INCREMENTAL one switch away.**
+- `last_modified_time` is trusted (owner decision), so the module declares
+  `modified_since_param` now.
+- Switching to INCREMENTAL is a control-plane override
+  (`zoho/control/config.py`: `{"strategy": "incremental", "weekly_full_enabled": true}`).
+  It is per module, takes effect at runtime, and shows its layer in
+  `GET /api/zoho/admin/modules/{name}/config`.
+- The weekly full must come with it: an incremental list never shows a delete.
+- Under FULL the apply gate makes an unchanged chart nearly free. Every row is hashed, and
+  an unchanged one costs no write and no detail call.
 
-- **INCREMENTAL, unsorted.**
-  - The list takes `last_modified_time`, and each row carries one.
-  - Zoho can only sort by `account_name` or `account_type`, so the engine must not advance a
-    page-by-page watermark. This is the categories reasoning, which also left `sort_column`
-    as `None`.
-  - Confirm the filter's semantics on the live tenant before trusting it (decision 2).
-    Until confirmed, run FULL; the apply gate makes an unchanged chart nearly free.
+**Platform default → FULL.** `ModuleSyncConfig.strategy` (`zoho/sync/config.py:87`)
+defaults to `INCREMENTAL` today. Phase 1 changes the default to `FULL`. This is safe
+**today**: all nine registered modules declare `strategy=` explicitly (brands, taxes ×3,
+locations, zoho_users, categories, currencies, organizations — checked), so none changes
+behaviour. Only a future module that forgets to declare a strategy is affected, and FULL is
+the safe failure (complete, just slower). INCREMENTAL silently skips rows when a module's
+modified filter is wrong.
+
+Why the other choices:
 - **`index_then_detail` + inline detail.**
   - The list row lacks `currency_id`, `description`, `custom_fields` and
     `include_in_vat_return`.
-  - Writing the index row first means an item referencing the account resolves the moment
-    the account is listed.
-  - First sync: one detail call per account. A few hundred calls at ~90/min is a few minutes,
-    once. After that the gate spends calls only on changed accounts.
+  - Writing the index row first means an item or tax naming the account resolves the moment
+    it is listed.
+  - First sync: one detail call per account. A few hundred calls at the governor's budget is
+    minutes, once.
 - **Never `showbalance=true`.**
   - `current_balance` changes without the account changing. In the raw hash it would make
     every scan a write.
-  - It is also listed in the translator's volatile keys, in case Zoho ever returns it
-    unasked.
-- **`match_on=("zoho_id",)`, never `account_name`.**
-  - Zoho allows identical names in different branches of the tree
-    (`Cash Ledger : Interest`).
-  - A name match would merge two ledgers, and that is unrecoverable once lines post to them.
-- **Parent: a hook, not a `ReferenceRule`.**
-  - A child usually arrives in the same page as its parent. A page-level rule resolves
-    before the page is written, so it would defer every such child.
-  - `post_upsert` resolves `parent_account_id` through `crosswalk.resolve_many` and queues
-    what it cannot resolve on `sync.pending_references` (`waiting_table =
-    "accounting.accounts"`, `waiting_column = "parent_id"`).
-  - The reconcile lane links it with a bare UPDATE. The §5.3 triggers then recompute
-    `depth` and `row_version` for the moved subtree.
-  - This is the categories pattern, copied, not re-invented.
-- **Currency: `DEFER`.** An account whose currency is not synced keeps `currency_id = NULL`
-  (base currency) until the reconcile lane links it. It is never a stub currency.
-- **Organization.** The connection's organization (delta-v3 §2.1). Every row lands in the
-  organization whose node carries `ZOHO_ORGANIZATION_ID`.
-- **Planner ordering.** `chart_of_accounts` depends on `organizations` and `currencies`.
-  Until delta-v3 §6.2 (the `depends_on` DAG) is built, the reconcile lane makes either
-  order converge. Register `depends_on` the day the planner supports it.
+  - It is also listed in the translator's volatile keys.
+- **`match_on=("zoho_id",)`, never `account_name`.** Zoho repeats child names across
+  branches (`Cash Ledger : Interest`). A name match merges two ledgers, and that is
+  unrecoverable once lines post to them.
+- **Parent: a hook, not a `ReferenceRule`** (the categories pattern).
+  - `post_upsert` resolves `parent_account_id` through `crosswalk.resolve_many`.
+  - It queues the unresolved ones on `sync.pending_references`
+    (`accounting.accounts.parent_id`).
+  - The reconcile lane's bare UPDATE fires the §5.3 triggers (depth, `row_version`).
+- **Currency: `DEFER`.** An unsynced currency leaves `currency_id` NULL (= base) until the
+  reconcile lane links it. It is never a stub currency.
+- **Planner ordering.** `chart_of_accounts` depends on `organizations` and `currencies`;
+  `taxes`, and later `items` and `contacts`, depend on `chart_of_accounts` for their account
+  links. Until the `depends_on` DAG exists (delta-v3 §6.2), pending references make any
+  order converge.
 
 ### 6.2 Field map
 
@@ -563,7 +781,7 @@ did not send is skipped, never decoded to NULL).
 | `account_name` | `account_name` | BOTH | | D |
 | `account_code` | `account_code` | BOTH | `blank_to_null` | D |
 | `account_type` | `account_type` | BOTH | identity on the code. Unknown → FK failure per record (§5.1) | D |
-| `account_type_int` | — | IN | **not on the account**; it is a type constant. Cross-checked against `account_types.zoho_type_int` and a warning logged on mismatch | S |
+| `account_type_int` | — | IN | **not on the account**; it is a type constant. If `account_types.zoho_id` is NULL for that code the hook fills it (set-once, logged); a mismatch logs `accounting.type_id_mismatch` and changes nothing | S |
 | `currency_id` | `currency_id` | BOTH | `ReferenceRule` → `currencies` | D |
 | `currency_code` | — | IN | derivable; kept raw | D |
 | `description` | `description` | BOTH | | D |
@@ -594,78 +812,262 @@ did not send is skipped, never decoded to NULL).
 ### 6.3 Ownership and local edits
 
 - `ZOHO_OWNED_ACCOUNT_FIELDS = frozenset(TRANSLATOR.readable)`. A PATCH touching an owned
-  field on a Zoho-linked row (`zoho_id IS NOT NULL`) gets **422
-  `zoho_owned_field`**, the `categories/service._guard_zoho_owned` precedent. The next sync
-  would revert the edit anyway.
-- Local-only accounts are allowed (`zoho_id IS NULL`), but they are **not pushable** until
-  Phase 6. **Decision 4 (§13):** for a Zoho-connected organization, either refuse local
-  creation outright, or allow it with a "local-only" badge. The recommendation is to refuse:
-  an item that references a local-only account cannot be pushed to Zoho, and that failure
-  would surface far from its cause.
-- `to_zoho_payload()` (create/update) is written in Phase 1 as the seam the outbox will call.
-  - Required-on-create rules are checked locally, with the field named, before an API call
-    is spent.
-  - Zoho marks every create argument "Optional", but `account_name` and `account_type` are
-    plainly required, so the translator's CREATE intent requires them.
+  field on a Zoho-linked row (`zoho_id IS NOT NULL`) gets **422 `zoho_owned_field`**, the
+  `categories/service._guard_zoho_owned` precedent.
+- Local-only accounts are allowed in organizations without a Zoho connection.
+  - In a Zoho-connected organization, local creation is refused before Phase 6
+    (`422 zoho_mastered_chart`).
+  - The reason: an item pointing at a local-only account could never be pushed, and that
+    failure would surface far from its cause.
+- `to_zoho_payload()` (create/update) is written in Phase 1 as the seam the outbox will
+  call.
+  - The CREATE intent requires `account_name` and `account_type`, checked locally with the
+    field named.
+  - Zoho's docs mark every argument "Optional", but neither field is.
 
----
+### 6.4 Tenant and organization: THPL by default
 
-## 7. Assignments and resolution: "which account applies here?"
+There is nothing new to configure. The engine places every row through
+`zoho/control/tenancy.py::zoho_tenant` (delta-v3 §2.1):
+1. the organization node carrying `ZOHO_ORGANIZATION_ID` (`60015628348`), which is THPL
+   after the seeder's adoption;
+2. otherwise the configured default, `DEFAULT_TENANT_CODE=THPL` /
+   `DEFAULT_ORGANIZATION_CODE=THPL` (`backend/.env`);
+3. otherwise the tenant's only organization.
 
-### 7.1 Read
+Two things must hold:
+- `deployment/.env` must carry the same `DEFAULT_*` values, and `docker-compose.yml` must
+  pass them. This is delta-v3 gotcha #1, which caused the two-tenant incident.
+- The startup check proposed in delta-v3 §6.5 would catch drift.
 
-`HasAccountsMixin` gives `Model.account_assignments`: viewonly, `lazy="raise_on_sql"`, read
-with `selectinload(Model.account_assignments).joinedload(AccountAssignment.account)`. That is
-one extra query per result set, never N+1.
+GLOBAL seeds (types, purposes, policies) have no tenant. THPL's **organization default
+assignments** are written by a seed step after the first chart sync (§8.5).
 
-### 7.2 Write
+## 7. The resolution engine: "what applies here?", for every facet
 
-`PUT /api/accounting/assignments/{owner_type}/{owner_uuid}` with
-`[{purpose, account_uuid, currency_code?}]`:
-- It replaces the owner's locally-maintained assignments in one transaction (soft-deletes
-  dropped slots).
-- It refuses to touch `source_system='zoho'` rows.
-- It pre-flights every rule the trigger enforces, so the user gets a named 422 instead of a
-  constraint error at COMMIT.
+### 7.1 Why one engine
 
-### 7.3 Resolve
+The question "which X applies to this line?" is about to be asked by every document module,
+for several X:
 
-`assignment_service.resolve_accounts(db, refs, purposes, currency_id=None)` is **batched**:
-an invoice page resolving 200 lines × 3 purposes is one query.
-
-For each `(owner, purpose)` it returns `ResolvedAccount(account, source)` and tries, in
-order:
-
-| Step | Looks for | `source` |
+| Facet | Today | Needed by |
 |---|---|---|
-| 1 | the owner's assignment in the exact currency | `owner` |
-| 2 | the owner's assignment with `currency_id NULL` | `owner` |
-| 3 | if the policy `falls_back_to_organization`: the organization's assignment, same two steps | `organization` |
-| 4 | nothing found | `None` |
+| taxes | `taxes.assignment_service.resolve_taxes`: a loop of **one query per owner**, the org default from `org_default_tax_preferences`, the chain hand-built by each caller | items, contacts, invoices, bills, sales orders |
+| accounts | — | the same documents, plus ledger posting |
+| later: price list, payment terms, salesperson, warehouse, discount account | — | sales & purchase documents |
 
-On step 4 the caller decides: an invoice raises 422 `account_unresolved` naming the owner and
-purpose, while a report shows "unassigned". The resolver never invents an account by type or
-name.
+The cost of not having one engine:
+- Every module hand-writes its own precedence, and the precedences drift. A sales order and
+  an invoice for the same item to the same customer pick different accounts, and nobody can
+  say which is right.
+- A loop of per-owner queries is an N+1 at invoice scale: 200 lines × 4 owners × 2 facets
+  is 1,600 queries.
 
-It is one SQL statement. The candidates are a `VALUES` list unioned with the organization
-rows, ranked with `row_number()` over (owner, purpose) ordered by step. It is the tax
-resolver's shape, with the step order as data.
+The engine fixes both:
+- **Precedence becomes data**: a named, versioned policy per (facet, subject kind).
+- **Resolution becomes batched**: one query per facet per page, whatever the number of lines.
 
-### 7.4 Pickers: "income accounts", "purchase accounts", "inventory accounts"
+### 7.2 Concepts
 
-These are **views, not tables**:
+| Concept | What it is |
+|---|---|
+| `OwnerRef(type_code, id)` | an entity that can *carry* facet values: `item:4`, `contact:12`, `category:2`, `organization:1`. `type_code` is a `core.entity_types.code` |
+| **Subject** | the thing being resolved *for*: one invoice line. Holds a role → owner map, e.g. `{"line": OwnerRef("invoice_line", 9), "item": …, "contact": …}`, plus `organization_id` and a context |
+| **Facet** | a kind of answer (`tax`, `account`). It owns: how candidates are loaded for many owners at once, how one owner's candidates are narrowed by context, what the organization default is, and what makes a value unusable |
+| **Context** | the facet's typed question. Tax: `specification` (inter/intra), `transaction_type`. Account: `purpose`, `currency_id` |
+| **Policy** | ordered **steps** for one (facet, subject kind): which role to ask, with an optional candidate filter, and what to do when the answer is unusable |
+| **Expander** | turns one owner into the owners it inherits from: an item → its tax-category assignments (`core.categorizables` in the tax taxonomy). Registered by the module that owns the relationship, batched |
+| **Resolution** | value(s) + provenance (`via` step, `owner`) + an optional **trace** of every step tried and why it did not answer |
 
-`GET /api/accounting/accounts?usage=sales|purchase|inventory` lists live, active accounts
-whose type has `is_sales_eligible` / `is_purchase_eligible` / `is_inventory_eligible`. The
-eligibility flags are seeded from Zoho's item-form lists (the purchase/income/inventory list
-samples). Until those are vendored, the flags follow `purpose.allowed_groups` (§13,
-decision 1).
+### 7.3 Package and dependency direction
 
----
+```
+app/modules/resolution/          source-neutral, imports NO feature module
+  types.py        OwnerRef, Subject, Step, Policy, Resolution, TraceEntry, Unusable
+  registry.py     register_facet / register_policy / register_expander; boot validation
+  engine.py       resolve_many()  — batched, the only entry point
+  api.py          POST /api/resolution/{facet}  (+ ?explain=true)
+  schema.py
+```
+
+- Features **register into** it, the same inversion as the Zoho registry:
+  - `taxes/resolution.py` registers `TaxFacet` and the tax policies;
+  - `accounting/resolution.py` registers `AccountFacet` and the account policies;
+  - `categories` registers the item → category expander.
+- `.importlinter`: `app.modules.resolution` may not import feature modules; feature modules
+  may import it.
+- Registration happens at import through the same autodiscovery as `_ENTITY_PACKAGES`.
+- A policy naming an unknown facet, role or expander **fails the boot**, like a bad sync
+  spec.
+
+### 7.4 The facet contract
+
+```python
+class Facet(Protocol[Ctx, Candidate, Value]):
+    code: str                                    # "tax" | "account"
+    context_model: type[Ctx]                     # pydantic; validated at the API edge
+
+    async def load(self, db: AsyncSession, owners: Collection[OwnerRef], ctx: Ctx
+                   ) -> Mapping[OwnerRef, Sequence[Candidate]]:
+        """ONE query for every owner of the page (pending rows excluded)."""
+
+    def select(self, candidates: Sequence[Candidate], ctx: Ctx) -> Sequence[Candidate]:
+        """PURE. Narrow one owner's candidates to what applies in ctx; [] = no answer here."""
+
+    async def organization_default(self, db: AsyncSession, org_ids: Collection[int], ctx: Ctx
+                                   ) -> Mapping[int, Sequence[Candidate]]:
+        """ONE query. The last step of every policy."""
+
+    def unusable(self, candidate: Candidate) -> str | None:
+        """Why an answer cannot be used (inactive / deleted / not granted), else None."""
+
+    def value(self, chosen: Sequence[Candidate]) -> Value: ...
+```
+
+| | `TaxFacet` | `AccountFacet` |
+|---|---|---|
+| `load` | `tax_assignments` for the owners, joined to component / exemption | `account_assignments` for the owners and `ctx.purpose`, joined to the account |
+| `select` | **the existing `select_applicable`**, unchanged: most-specific context level wins, then `position` | exact `currency_id` > NULL currency; a single winner |
+| `organization_default` | `org_default_tax_preferences` for `ctx.specification` | `account_assignments` where `owner = ("organization", org)` |
+| `unusable` | component inactive / not granted to the organization (`organization_tax_components`) | account `inactive` or soft-deleted |
+| `value` | ordered components + exemptions (several taxes apply together) | one account |
+
+### 7.5 Policies are data
+
+A policy is a tuple of steps:
+
+```python
+Step(role: str, filter: str | None = None, on_unusable: Literal["fail", "skip"] = "fail")
+```
+
+The **organization default is always the implicit last step**. Policies are registered by
+the module that owns the subject kind (the invoices module registers `sales_line` policies).
+The tables below are the **proposed defaults**, signed off with the accountant (§13,
+decision 10).
+
+**Sales document line: taxes** (`facet=tax, subject=sales_line`)
+
+| Step | Role | Filter | Why |
+|---|---|---|---|
+| 1 | `line` | — | an explicit tax typed on the line wins |
+| 2 | `contact` | `exemption_only` | an exempt customer (SEZ, overseas, a tax-exempt body) overrides the item's tax. Zoho applies a contact's exemption over the item preference |
+| 3 | `item` | — | the item's intra/inter preference (`item_tax_preferences`) |
+| 4 | `item_category` (expander) | — | the category's taxes (`category_tax_preferences`, already synced) |
+| 5 | `contact` | `taxes_only` | the contact's default tax (`contact.tax_id`) |
+| — | organization default | | `org_default_tax_preferences` for the specification |
+
+**Sales document line: income account** (`facet=account, ctx.purpose=sales`)
+
+| Step | Role | Why |
+|---|---|---|
+| 1 | `line` | explicit |
+| 2 | `item` | Zoho item `account_id` |
+| 3 | `item_category` | a category-level income account (local, optional) |
+| 4 | `contact` | a customer-specific income account (local, rare) |
+| — | organization `sales` | |
+
+**Purchase line: expense / COGS account** (`purpose=purchase`): `line → item →
+item_category → contact (vendor) → organization`.
+
+**Inventory account** (`purpose=inventory_asset`): `item → item_category → organization`.
+
+**Document header: control account** (`subject=sales_document, purpose=receivable`):
+`contact → organization`. **Payable** is the same with `purpose=payable`.
+
+**Tax posting accounts** (`subject=tax_line, purpose=output_tax|input_tax|tds_payable`):
+`tax_component → organization`. This is how a resolved tax finds its ledger account.
+
+### 7.6 The algorithm (`engine.resolve_many`)
+
+```
+resolve_many(db, facet, policy, subjects, ctx_of)                      # ctx may differ per subject
+  1. owners  = ⋃ subject roles named by the policy
+  2. owners += expanders(owners)          # one query per expander, batched
+  3. cands   = facet.load(db, owners, …)  # ONE query
+  4. dflt    = facet.organization_default(db, {s.organization_id}, …)   # ONE query
+  5. per subject, per step (pure, in memory):
+        rows = filter(cands[owner(step.role)])
+        hit  = facet.select(rows, ctx)
+        if hit and any(facet.unusable(h)):
+            step.on_unusable == "fail"  → Resolution.error(unusable, owner, reason)
+            step.on_unusable == "skip"  → trace, continue
+        if hit → Resolution(value, via=step.role, owner=…)          # first step that answers wins
+     fall through → organization default → else Resolution.none
+```
+
+**Cost:** a fixed number of statements for any number of subjects. That is 2 per facet,
+plus 1 per expander used, regardless of the line count. The N+1 test asserts exactly that
+(§12.3).
+
+**Rules that make it safe:**
+- **Fail closed on an unusable assignment** (`on_unusable="fail"` is the default). If an
+  item's sales account was deactivated, falling silently to the organization default posts
+  revenue to the wrong account. The caller gets `422 assigned_value_unusable` naming the
+  owner, facet and reason. `skip` is opt-in per step, for genuinely optional layers.
+- **Pending assignments never answer**, and the trace shows them as `pending`. A pending row
+  means the source named something we have not synced. Resolving past it would hide that.
+- **Determinism:** ties inside a step are broken by the facet's `select` (`position`, then
+  `id`). Same inputs, same answer, every time.
+- **No guessing:** nothing found anywhere → `Resolution.none`. The caller decides: a draft
+  shows "unassigned", issuing a document raises `422 unresolved`. The engine never picks an
+  account by type or name.
+
+### 7.7 Context is the caller's, derived once
+
+The engine does not compute context. The document module does, once per document:
+- **Inter / intra:** `taxes.context.specification_for(org_state, place_of_supply)` compares
+  the organization's GST state with the place of supply (Zoho `place_of_contact` /
+  `place_of_supply`).
+- **Transaction type:** from the document kind.
+- **Currency:** from the document.
+
+Keeping this outside the engine keeps it pure and testable, and it means GST rules evolve in
+`taxes`, not in a generic layer.
+
+### 7.8 Freezing and explainability
+
+- **Drafts re-resolve**; **issued documents freeze**.
+  - Taxes already have `freeze_owner` (snapshot + immutable row).
+  - For accounts, the posted ledger line's `account_id` *is* the freeze.
+- `explain=True` returns the trace: every step, its owner, and one of
+  `no_candidates` / `filtered` / `pending` / `unusable:<reason>` / `answered`. It feeds
+  `POST /api/resolution/{facet}?explain=true` and a "why this tax / account?" panel.
+- An issued document may store its trace in `app_metadata` for audit (document module's
+  choice).
+
+### 7.9 Moving taxes onto the engine without breaking it
+
+- `resolve_taxes(db, owners, …)` keeps its signature and becomes a thin wrapper.
+  - It builds an ad-hoc policy from its `owners` list (one step per owner, in order) and
+    calls `resolve_many` for one subject.
+  - It maps the result back to `ResolvedTaxes(resolved_from, via, …)`.
+- **The existing tax tests run unchanged, as the parity gate.**
+- The only observable difference is the query count, which drops from one per owner to a
+  constant.
+- `categories` (the one current caller) then moves to a named policy at leisure.
+
+### 7.10 What it is not
+
+- **Not a rules engine.** No expressions, no scripting: steps, filters and facets are code
+  reviewed in PRs.
+- **Not a cache.** Assignments are small and indexed, and one page costs 2–4 indexed
+  queries. Caching would add invalidation for no measured gain.
+- **Not a writer.** Assignments are written only by each facet's service
+  (`taxes.assignment_service.replace_assignments`,
+  `accounting.assignment_service.put_assignments` / `sync_source_assignments`).
+
+### 7.11 Pickers: "income accounts", "purchase accounts", "inventory accounts"
+
+These are **views, not tables**: `GET /api/accounting/accounts?usage=sales|purchase|inventory`
+lists live, active accounts whose type is `is_sales_eligible` / `is_purchase_eligible` /
+`is_inventory_eligible`.
+- Until the item-form list samples are vendored (decision 1), eligibility is seeded from the
+  purposes: sales ← income group; purchase ← expense group + `fixed_asset` / `other_asset` /
+  `other_current_asset`; inventory ← `stock`.
 
 ## 8. Integration: making an entity carry accounts
 
-### 8.1 The recipe (Items and Customers follow it, unchanged)
+### 8.1 The recipe (Items and Contacts follow it, unchanged)
 
 **1. Migration of the owning module**, after its table exists:
 
@@ -715,31 +1117,93 @@ This is the categories → `tax_assignments` path, applied to accounts.
 assignments and emits the three ids. That needs `zoho_id` on each referenced account; an
 account without one makes the push refuse with the account named.
 
-### 8.2 Customers specifically
+### 8.2 Contacts (customers and vendors): taxes **and** accounts
 
-Zoho's documented contact API carries **no account fields**. Customer accounts are therefore
-local data:
-- an optional `receivable` override (a key account with a dedicated AR sub-ledger);
-- `customer_advance`;
-- an optional `sales` default for that customer's invoices.
+Zoho has one contact entity (`contact_type` customer / vendor), so we register one owner
+class, `contact`.
 
-Everything else falls back to the organization. With thousands of retailers, the normal
-customer has **zero** assignments and uses the AR control account. Their statement comes from
-`counterparty_type='customer', counterparty_id=…` on the ledger lines (Phase 3).
+**Registration**, in the contacts module's migration:
+- `register_taxable_entity_type(code="contact", allows_exemption=True, …)`;
+- `register_account_owner_type(code="contact", purposes={"receivable": True, "payable": True,
+  "customer_advance": True, "vendor_advance": True, "sales": True, "purchase": True})`.
 
-### 8.3 Wired in Phase 1 (so the mechanism is proved before Items exist)
+**From the Zoho contact payload** (`docs/zoho-docs-md/contact.md`), in the contacts adapter's
+`post_upsert`:
 
-- **`organization`**: every org-default purpose (`falls_back_to_organization = false`, since
-  it is the end of the chain). `register_account_owner_type(code="organization",
-  target_schema="org_management", target_table="organizations", …)`.
+| Zoho field | Becomes | Through |
+|---|---|---|
+| `tax_id` | a Zoho-sourced **tax assignment** on the contact (any context) | `taxes.assignment_service.replace_assignments(source_system="zoho")`; unknown id → **pending** + `sync.pending_references`, linked by the reconcile lane |
+| `tax_exemption_id` | a Zoho-sourced **exemption assignment** | same |
+| `tds_tax_id` | a tax assignment, `transaction_type="purchase"` | same. Whether Zoho's TDS id is a `tax_components` row or a separate TDS entity is **unverified** (decision 11); until verified it stays in the crosswalk raw only |
+| `gst_treatment`, `place_of_contact`, `gst_no`, `tax_treatment`, `is_taxable` | **contact columns**, not assignments | they are *context inputs* (§7.7), not answers |
+| `currency_id` | `contacts.currency_id` FK | `ReferenceRule(module="currencies")` |
+| (no account fields in Zoho's contact API) | — | accounts on a contact are **local overrides** only |
+
+**Accounts:**
+- The normal retailer has **zero** account assignments and resolves `receivable` to the
+  organization's AR control account (§7.5).
+- Overrides are for exceptions: a key account with its own AR sub-ledger, or a customer
+  whose sales post to a separate income account.
+- Statements come from `counterparty_type='contact'` on ledger lines (Phase 3), not from
+  per-contact GL accounts.
+
+### 8.3 Zoho tax ids resolve to `app/modules/taxes`, Zoho account ids to `accounting`
+
+A Zoho reference is never stored as an opaque id on a business row when its target module
+exists. Every reference goes through the crosswalk and becomes a local FK or an assignment:
+
+| Where the id appears | Target | How |
+|---|---|---|
+| item `tax_id`, `item_tax_preferences[]` | `tax.tax_components` | tax assignments on the item (`source_system="zoho"`), the categories pattern |
+| category `category_tax_preferences[]` | `tax.tax_components` | **already built** (`categories/zoho/hooks.py`) |
+| contact `tax_id`, `tax_exemption_id` | `tax.tax_components` / `tax.tax_exemptions` | §8.2 |
+| item `account_id`, `purchase_account_id`, `inventory_account_id` | `accounting.accounts` | account assignments on the item (§8.1) |
+| tax `tax_account_id`, `purchase_tax_account_id`, `tds_payable_account_id` | `accounting.accounts` | account assignments on the `tax_component` (§8.4) |
+| any `currency_id` | `currency.currencies` | `ReferenceRule` |
+
+One shared helper does the id → local resolution for all of them:
+`sync.crosswalk.resolve_many`, one query per page. One shared lane does the "not synced yet"
+case: `sync.pending_references` + `reconcile`. No module grows its own lookup.
+
+### 8.4 Wired in Phase 1 (so the mechanism is proved before Items and Contacts exist)
+
+- **`organization`**: every org-default purpose. `register_account_owner_type(code="organization",
+  target_schema="org_management", target_table="organizations", …)`;
+  `falls_back_to_organization = false`, because it *is* the end of the chain.
 - **`tax_component`**: `output_tax`, `input_tax`, `tds_payable`.
-  - `taxes/zoho/hooks.py` already has the account ids. They are opaque echoes today
-    (`tax_account_id`, `purchase_tax_account_id`, `tds_payable_account_id`).
-  - They become Zoho-sourced assignments, which gives tax components real account links.
-  - The echo columns stay until a release has shown the assignments filled. Then they are
-    dropped in a follow-up (§11).
+  - `taxes/zoho/hooks.py` already receives `tax_account_id`, `purchase_tax_account_id` and
+    `tds_payable_account_id`, stored today as opaque echoes.
+  - It calls `accounting.assignment_service.sync_source_assignments` and they become real,
+    per-organization account assignments (§5.6).
+  - The echo columns are dropped one release after the live acceptance shows the
+    assignments filled (§13, decision 8).
+  - This is the dependency direction the import linter allows: `taxes` imports
+    `accounting.assignment_service`, and `accounting` never imports `taxes`.
+  - The `TaxFacet` registration lives in `taxes/resolution.py`.
+- **The resolution engine** with `TaxFacet` (parity-wrapped `resolve_taxes`) and
+  `AccountFacet`, plus the `tax_line` account policy. That is enough to answer "which
+  account does this CGST post to in THPL?" end to end before any document module exists.
 
----
+### 8.5 THPL organization defaults
+
+After the first chart sync, `scripts/seed.py --only accounting.defaults` assigns THPL's
+organization defaults **only where the chart makes them unambiguous**: exactly one live
+account of the defining type.
+
+| Purpose | Rule |
+|---|---|
+| `receivable` | the single live `accounts_receivable` account |
+| `payable` | the single live `accounts_payable` account |
+| `inventory_asset` | the single live `stock` account, else the account with `placeholder` = Zoho's inventory slug (sample-only, decision 1) |
+
+- Everything else (`sales`, `purchase`, `cost_of_goods_sold`, `retained_earnings`,
+  `round_off`, …) is **listed as unassigned** for an admin to set through
+  `PUT /api/accounting/assignments/organization/{uuid}`.
+- Picking by name ("Sales", "Retained Earnings") is exactly the guess §7.6 forbids.
+- If the sample-only Zoho flags (`is_retained_earnings`, `is_accounts_receivable`, …) are
+  confirmed in a real response, the sync hook writes those defaults as `source_system="zoho"`
+  assignments, and the seed step only fills what is still empty.
+- The step is idempotent and never overwrites an existing assignment.
 
 ## 9. Phases 2–3: the ledger, reconciled with v2
 
@@ -859,7 +1323,8 @@ balance per account. The plan:
 | POST | `/api/accounting/accounts/{uuid}/activate`, `/deactivate` | |
 | DELETE | `/api/accounting/accounts/{uuid}` | soft delete; refused by guard with reason |
 | GET/PUT | `/api/accounting/assignments/{owner_type}/{owner_uuid}` | §7.2 |
-| POST | `/api/accounting/resolve` | batch: `[{owner_type, owner_uuid, purpose, currency_code?}]` → resolved accounts with `source` |
+| POST | `/api/resolution/{facet}` | **generic engine endpoint** (§7): `{policy, subjects: [{roles: {role: {type, uuid}}, context}], explain}` → one `Resolution` per subject, with trace when `explain=true`. `facet` ∈ registered facets (`tax`, `account`) |
+| POST | `/api/accounting/resolve` | convenience: one owner chain + purposes → accounts (wraps the engine with the default policy) |
 
 Owners are addressed by **UUID** in the API and translated to `owner_id` by the service
 through `core.entity_types`. Internal ids never leave the process.
@@ -907,14 +1372,30 @@ Greenfield: no backfill. v1/v2 never ran against this database.
 
 ### 12.2 Wiring checklist
 
-- `alembic/env.py` imports `app.modules.accounting.model` / `.assignment`.
+- `alembic/env.py` imports `app.modules.accounting.model` / `.assignment`, and
+  `_OWNED_SCHEMAS += {"accounting"}`.
 - `tests/test_tenancy.py` → `GLOBAL_TABLES` += `accounting.account_types`,
-  `accounting.account_purposes`, `accounting.account_purpose_policies`, each with its reason.
-- `tests/conftest.py` → `_TEST_TABLES` += `accounting.account_assignments`,
+  `accounting.account_purposes` and `accounting.account_purpose_policies`, each with its
+  reason.
+- `tests/conftest.py` → `_TEST_TABLES` += `accounting.account_assignments` and
   `accounting.accounts` (FK-safe order). GLOBAL seeds are not truncated.
-- `.importlinter` adds the `accounting` layer (§4).
-- The Zoho registry's `_ENTITY_PACKAGES` gains `app.modules.accounting.zoho`.
-- `config/logging/modules/accounting.yaml` declares namespace `app.accounting`.
+- `.importlinter`:
+  - `accounting` layer below feature modules;
+  - `resolution` imports no feature module;
+  - `taxes` → `accounting` allowed, the reverse forbidden.
+- Zoho registry `_ENTITY_PACKAGES` += `app.modules.accounting.zoho`. The resolution registry
+  autodiscovers `taxes.resolution` and `accounting.resolution`.
+- `zoho/sync/config.py`: `ModuleSyncConfig.strategy` default → `FULL` (§6.1).
+  `tests/zoho_core` gets a test that every registered spec declares `strategy` explicitly,
+  so the default can never again decide a real module's behaviour.
+- Vendor `docs/zoho-docs-md/samples/accounts/account-types.json` (the response provided in
+  review). It is the seed test's oracle.
+- `scripts/seed.py`: new step `accounting.defaults` (§8.5), after `company`. Never run
+  against the pytest database (memory: seeding vs test DB).
+- `config/logging/modules/accounting.yaml` (`app.accounting`) and `resolution.yaml`
+  (`app.resolution`).
+- `deployment/.env` and `docker-compose.yml`: confirm `DEFAULT_TENANT_CODE` and
+  `DEFAULT_ORGANIZATION_CODE` = THPL reach the containers (§6.4).
 
 ### 12.3 Tests
 
@@ -946,8 +1427,24 @@ Greenfield: no backfill. v1/v2 never ran against this database.
 - a Zoho-owned field PATCH → 422;
 - tombstone on a weekly full with the delete guard honoured.
 
-**N+1:** query count on `GET /accounts` (constant) and on a 50-owner
-`resolve_accounts` (one statement).
+**Resolution engine** (pure + DB):
+- every step type: line wins, contact exemption beats item, category expander, contact
+  default, organization default;
+- `on_unusable` fail vs skip;
+- pending never answers;
+- deterministic ties;
+- trace content;
+- a policy naming an unknown role or expander fails registration;
+- tax-component accounts resolve per organization (one component, two organizations, two
+  accounts).
+
+**Tax parity:** the existing `resolve_taxes` tests pass unchanged on the engine.
+
+**Seed:** all 46 codes present; the 26 tenant-observed rows match the vendored response
+field by field; every code has a group and normal side.
+
+**N+1:** constant query count on `GET /accounts`, and on `resolve_many` for 1, 50 and 500
+subjects across 2 facets. Exactly 2 statements per facet + 1 per expander, asserted.
 
 **API:** route smoke; RBAC (a branch admin cannot set another organization's defaults);
 Slim list uses `load_only` (assert the selected columns).
@@ -968,25 +1465,27 @@ doc's shape), `docs/rbac-module.md` (new permissions), this plan's status.
 
 ## 13. Open decisions
 
-| # | Decision | Recommendation |
+| # | Decision | Status / recommendation |
 |---|---|---|
-| 1 | Vendor the six JSON samples (`docs/zoho-docs-md/samples/accounts/`) | **Required before coding §6.** Sample-only fields and the picker eligibility flags rest on them |
-| 2 | Trust `last_modified_time` on `/chartofaccounts` for INCREMENTAL | Probe once on the live tenant (edit one account, list with the filter); until then FULL daily |
-| 3 | `account_code` unique per organization | Check THPL's chart (`GROUP BY account_code HAVING count(*) > 1`) before shipping `uq_accounts_code`; if Zoho tolerates duplicates, drop the index, never the data |
-| 4 | Local account creation in a Zoho-connected organization before Phase 6 | Refuse (422 `zoho_mastered_chart`); allow for organizations without a Zoho connection |
-| 5 | Purpose → allowed groups/types seed; the group of `contingent_*` and other documented-only types | Accountant sign-off on both tables before release |
-| 6 | Customer-level account overrides at all, or organization control accounts only | Allow the override (cheap, opt-in); default every customer to the control account |
-| 7 | Ledger audit trail obligation (Companies (Accounts) Rules, audit-trail amendment) and whether the chart of accounts is in its scope | Ask the auditor before Phase 3; the design supports either answer |
-| 8 | Drop `tax_components.*_account_id` echoes once assignments are proven | Yes, one release after the live acceptance shows them populated |
-| 9 | `document_sequences` here or `core.number_series` | Here for Phase 3; move it the day a second module needs numbering |
-
----
+| 1 | Vendor the remaining samples (chart list, single account, income/purchase/inventory lists) | **Open.** The account-types response is in hand (§5.1). The lists only refine picker eligibility (§7.11) and the `placeholder`-based defaults (§8.5) |
+| 2 | Trust `last_modified_time` | **Decided: trusted.** Declared; INCREMENTAL is a runtime override, FULL is the default (§6.1) |
+| 3 | `account_code` unique per organization | Check THPL's chart before shipping `uq_accounts_code`. If Zoho tolerates duplicates, drop the index, never the data |
+| 4 | Local creation in a Zoho-connected organization before Phase 6 | Refuse (`422 zoho_mastered_chart`) (§6.3) |
+| 5 | Purpose → allowed groups; contingent types; OCI close | Accountant sign-off |
+| 6 | Contact-level account overrides | Allow (opt-in); default every contact to the control account |
+| 7 | Ledger audit-trail obligation and the chart's scope | Ask the auditor before Phase 3 |
+| 8 | Drop `tax_components.*_account_id` echoes | One release after the assignments are proven live |
+| 9 | `document_sequences` here or `core.number_series` | Here for Phase 3; move when a second module needs numbering |
+| 10 | The default resolution policies (§7.5), especially "contact exemption beats item tax" and "item beats contact for the income account" | Accountant sign-off. Policies are data, so changing one is a PR, not a redesign |
+| 11 | Contact `tds_tax_id`: a `tax_components` row or a separate TDS entity in Zoho | Capture one real contact with TDS before mapping it |
+| 12 | Tenant and organization defaults | **Decided: THPL** from `backend/.env`; ensure `deployment/.env` matches (§6.4) |
+| 13 | Platform `ModuleSyncConfig.strategy` default → FULL | **Decided** (§6.1); safe because all 9 modules declare their strategy |
 
 ## Appendix A: where every v1/v2 table went
 
 | v1/v2 table | Outcome |
 |---|---|
-| `accounting.account_types` | **kept**, GLOBAL, vocabulary corrected (§5.1); `zoho_id` → `zoho_type_int`; + eligibility flags, `is_documented`, `is_enabled` |
+| `accounting.account_types` | **kept**, GLOBAL, vocabulary corrected (§5.1); `zoho_id` kept (Zoho numeric type id), all 46 types seeded; + eligibility flags, `is_documented`, `is_enabled` |
 | `accounting.inventory_valuation_methods` | **moved to the inventory/items module**: a valuation method is a property of stock costing, not of the chart. The five account columns of `organization_inventory_preferences` become organization assignments (`inventory_asset`, `cost_of_goods_sold`, `inventory_adjustment`, `goods_in_transit`, `price_variance`) |
 | `accounting.organization_inventory_preferences` | split as above; the valuation choice goes to the inventory module's settings |
 | `accounting.accounts` | **kept**, reconciled (§5.2) |
@@ -1023,7 +1522,7 @@ doc's shape), `docs/rbac-module.md` (new permissions), this plan's status.
     `is_fx_gain_loss`, `is_default`, `is_default_purchase_discount`, `is_primary_account`:
     organization assignments;
   - `is_purchase_account`, `is_sales_account`, `is_inventory_account`: type eligibility
-    (§7.4);
+    (§7.11);
   - `is_tax_account`, `disable_tax`: tax-component assignments / the tax module.
 - **Raw only until a consumer exists:** `price_precision`, `ignore_currency`,
   `allow_multi_currency`, `icon`, `account_hint`, `is_standalone`, `balance_sheet_category`,

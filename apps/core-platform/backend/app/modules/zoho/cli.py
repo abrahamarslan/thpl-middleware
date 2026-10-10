@@ -219,7 +219,23 @@ async def cmd_reconcile(limit: int) -> int:
 
 # ── entry point ─────────────────────────────────────────────────────────────
 
+def _register_every_model() -> None:
+    """Map every module's models before the first ORM flush — the CLI twin of the Celery
+    ``worker_init`` hook (``app/tasks/celery_app.py``).
+
+    The CLI imports only the sync registry's adapters, so a flush that touches a foreign key into a
+    model no adapter imports failed per record: syncing a contact person raised "Foreign key associated
+    with column 'contact_persons.user_id' could not find table 'users'" (13 contacts on 2026-10-10).
+    Loaded BY STRING, like the registry loads adapters: a static import would make the entity-agnostic
+    platform depend on every feature (``.importlinter`` contract ``zoho-platform-entity-agnostic``).
+    """
+    import importlib
+
+    importlib.import_module("app.router")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _register_every_model()
     parser = argparse.ArgumentParser(prog="python -m app.modules.zoho.cli", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check", help="token, governor, switches (and optionally one live call)")

@@ -79,6 +79,29 @@ _TEST_TABLES = (
     "tax.tax_components",
     "tax.tax_exemptions",
     "tax.gst_treatment_types",
+    # Accounting: assignments before accounts (FK order). account_types / account_purposes /
+    # account_purpose_policies are reference data seeded by the migration — NOT truncated.
+    "accounting.account_assignments",
+    "accounting.accounts",
+    # Pricing: brackets before items before books (composite FK order).
+    # Parties: persons before parties before terms (FK order); registrations are polymorphic.
+    "tax.tax_registrations",
+    "party.contact_persons",
+    "party.parties",
+    "party.payment_terms",
+    "pricing.price_list_item_brackets",
+    "pricing.price_list_items",
+    "pricing.price_lists",
+    "core.resolution_policies",
+    # Catalogue: options before attributes, children before parents (composite FK order).
+    # catalogue.uqc_codes is GLOBAL reference data seeded by the migration — NOT truncated; the standard
+    # units are re-seeded by trg_organizations_seed_catalogue when the default organization is restored.
+    "catalogue.attribute_options",
+    "catalogue.attributes",
+    "catalogue.item_groups",
+    "catalogue.sales_channels",
+    "catalogue.packaging_types",
+    "catalogue.units",
     # Core master data: children before parents (FK order). core.entity_types is
     # reference data seeded by the migration — NOT truncated.
     "core.entity_aliases",

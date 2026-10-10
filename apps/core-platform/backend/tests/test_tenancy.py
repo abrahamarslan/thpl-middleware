@@ -177,6 +177,19 @@ GLOBAL_TABLES = {
         "(comments.registration.register_commentable_entity_type). The comments that use it ARE "
         "organization-scoped"
     ),
+    "accounting.account_types": (
+        "account-type vocabulary (Zoho's documented list + the tenant-reported types, with Zoho's numeric "
+        "ids) — identical for every tenant, reference data like countries; FK target by code"
+    ),
+    "accounting.account_purposes": (
+        "vocabulary of WHY an entity points at an account (sales, receivable, output_tax, …) and which "
+        "account groups may answer it — a platform rule, not tenant data"
+    ),
+    "accounting.account_purpose_policies": (
+        "platform-wide policy: which entity classes may carry which account purposes — a property of the "
+        "class, written by the owning module's migration (accounting.registration). The assignments that "
+        "use it ARE organization-scoped"
+    ),
     "tax.gst_treatment_types": (
         "CBIC-defined GST treatment vocabulary (business_gst, consumer, overseas, …), identical for "
         "every tenant — reference data like countries; provenance is the nullable owner_type/owner_id pair"
@@ -191,6 +204,10 @@ GLOBAL_TABLES = {
         "countries or document_types, code-owned by app/modules/rbac/catalogue.py and "
         "inserted-if-missing by app/modules/rbac/seed.py. What a role of a tenant's organization "
         "HOLDS (rbac.role_permissions, rbac.user_roles) IS tenant-scoped"
+    ),
+    "catalogue.uqc_codes": (
+        "GSTN-prescribed Unit Quantity Codes (BTL, PCS, KGS, …) — national GST law, identical for every "
+        "tenant, reference data like countries; the units that point at it ARE organization-scoped"
     ),
 }
 DEACTIVATABLE = {

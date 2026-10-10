@@ -2,6 +2,10 @@
 
 from fastapi import APIRouter
 
+from app.modules.accounting.api import router as accounting_router
+from app.modules.price_lists.api import router as price_lists_router
+from app.modules.parties.api import router as parties_router
+from app.modules.catalogue.api_masters import router as catalogue_masters_router
 from app.modules.activity.api import router as activity_router
 from app.modules.brands.api import router as brands_router
 from app.modules.categories.api import (
@@ -51,6 +55,7 @@ from app.modules.teams.api import (
     teams_router,
 )
 from app.modules.tenants.api import router as tenants_router
+from app.modules.resolution.api import router as resolution_router
 from app.modules.taxes.api import router as taxes_router
 from app.modules.users.api import auth_router, countries_router, me_router, users_router
 from app.modules.vehicles.api import driving_licenses_router, vehicles_router
@@ -102,6 +107,11 @@ api_router.include_router(geocoding_router, prefix="/geocoding", tags=["geocodin
 # Zoho: specific sub-routers BEFORE the generic /zoho router (route priority)
 api_router.include_router(zoho_auth_router, prefix="/zoho/auth", tags=["zoho:auth"])
 api_router.include_router(taxes_router, prefix="/taxes", tags=["taxes"])
+api_router.include_router(accounting_router, prefix="/accounting", tags=["accounting"])
+api_router.include_router(price_lists_router, prefix="/price-lists", tags=["price-lists"])
+api_router.include_router(parties_router, prefix="/parties", tags=["parties"])
+api_router.include_router(catalogue_masters_router, prefix="/catalogue", tags=["catalogue"])
+api_router.include_router(resolution_router, prefix="/resolution", tags=["resolution"])
 api_router.include_router(zoho_locations_router, prefix="/zoho/locations", tags=["zoho:locations"])
 api_router.include_router(zoho_users_router, prefix="/zoho/users", tags=["zoho:users"])
 api_router.include_router(zoho_sync_engine_router, prefix="/zoho/sync-engine", tags=["zoho:sync-engine"])

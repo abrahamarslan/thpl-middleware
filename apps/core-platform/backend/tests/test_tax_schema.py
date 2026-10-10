@@ -100,9 +100,14 @@ def test_all_eight_tables_live_in_the_tax_schema_and_no_table_carries_a_source_i
     tables = {t.name: t for t in Base.metadata.tables.values() if t.schema == "tax"}
     assert set(tables) == {"tax_components", "tax_group_members", "tax_exemptions",
                            "organization_tax_components", "org_default_tax_preferences",
-                           "gst_treatment_types", "taxable_entity_types", "tax_assignments"}
-    for table in tables.values():
-        assert not {"zoho_id", "external_id", "zoho_raw"} & set(table.c.keys()), table.fullname
+                           "gst_treatment_types", "taxable_entity_types", "tax_assignments",
+                           "tax_registrations"}
+    # tax_registrations is not a crosswalked master: its rows are projected from a party's Zoho document
+    # (tax_info_list) by the parties hook, so Zoho's tax_info_id IS the row's identity (price-list items
+    # follow the same rule). It never carries a raw document.
+    for name, table in tables.items():
+        forbidden = {"external_id", "zoho_raw"} if name == "tax_registrations" else {"zoho_id", "external_id", "zoho_raw"}
+        assert not forbidden & set(table.c.keys()), table.fullname
 
 
 def test_tax_rows_pass_the_tenancy_classes():

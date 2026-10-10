@@ -35,6 +35,12 @@ from app.modules.rbac import model as _rbac_model  # noqa: F401
 from app.modules.teams import model as _teams_model  # noqa: F401
 from app.modules.currencies import model as _currencies_model  # noqa: F401
 from app.modules.taxes import model as _taxes_model  # noqa: F401
+from app.modules.accounting import model as _accounting_model  # noqa: F401
+from app.modules.accounting import assignment as _accounting_assignment  # noqa: F401
+from app.modules.price_lists import model as _price_lists_model  # noqa: F401
+from app.modules.parties import model as _parties_model  # noqa: F401
+from app.modules.catalogue import model as _catalogue_model  # noqa: F401
+from app.modules.resolution import model as _resolution_model  # noqa: F401
 from app.modules.locations import model as _zoho_locations_model  # noqa: F401
 from app.modules.entities import model as _entities_model  # noqa: F401
 from app.modules.custom_fields import model as _custom_fields_model  # noqa: F401
@@ -95,7 +101,8 @@ def _include_object(obj, name, type_, reflected, compare_to):
 #: tables in org_management; everything else (topology, tiger, …) belongs to
 #: PostGIS extensions and is never compared.
 _OWNED_SCHEMAS = {None, "public", "org_management", "geo", "currency", "sync", "tax", "core", "extfields", "media", "teams",
-                  "rbac", "fieldops", "auth"}
+                  "rbac", "fieldops", "auth", "accounting", "pricing",
+                  "party", "catalogue"}
 
 
 def _include_name(name, type_, parent_names):

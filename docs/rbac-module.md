@@ -738,6 +738,8 @@ module-level mapping below is the starting checklist.
 | geo (+ geocoding) | `TenantAdmin` | `geo.place:*`, `geo.address:*`, `geo.geofence:*`, `geo.geocoding:manage` |
 | currencies | `TenantAdmin` | `currency.currency:manage` |
 | taxes (assignments) | `TenantAdmin` | `tax.assignment:manage` |
+| accounting *(new, 2026-10-08)* | — | `accounting.account:create/update/delete`, `accounting.assignment:manage` |
+| resolution policies *(new, 2026-10-08)* | — | `resolution.policy:manage` |
 | brands / manufacturers / categories / entities | `TenantAdmin` | `core.<resource>:create/update/delete` |
 | documents (verify, request resubmission) | `TenantAdmin` | `documents.document:verify` |
 | hubs / fleet_partners / vehicles | `TenantAdmin` | `hubs.hub:*`, `fleet.partner:*`, `fleet.vehicle:*` |

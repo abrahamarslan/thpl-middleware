@@ -54,7 +54,7 @@ import asyncio
 import dataclasses
 import time
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -77,7 +77,12 @@ from app.modules.zoho.control.events import build_diff
 from app.modules.zoho.control.events import enabled_for as events_enabled_for
 from app.modules.zoho.control.events import new_event as new_sync_event
 from app.modules.zoho.core.client import ZohoClient, zoho_client
-from app.modules.zoho.core.exceptions import ZohoApiError, ZohoNotFoundError
+from app.modules.zoho.core.exceptions import (
+    ZohoApiError,
+    ZohoCircuitOpenError,
+    ZohoNotFoundError,
+    ZohoRateLimitedError,
+)
 from app.modules.zoho.sync.apply import (
     Decision,
     Incoming,
@@ -154,6 +159,8 @@ class _StoredVersion:
     modified: datetime | None
     source: str | None
     tombstoned: bool
+    #: When the stored raw document was last written or confirmed (crosswalk ``raw_synced_at``).
+    checked_at: datetime | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -176,6 +183,7 @@ class _CrosswalkState:
     remote_deleted_at: datetime | None
     sync_version: int
     entity_deleted_at: datetime | None = None
+    raw_synced_at: datetime | None = None
 
     @classmethod
     def of(cls, mapping: Any) -> "_CrosswalkState":
@@ -190,6 +198,7 @@ class _CrosswalkState:
             remote_deleted_at=mapping["remote_deleted_at"],
             sync_version=mapping["sync_version"],
             entity_deleted_at=mapping.get("entity_deleted_at"),
+            raw_synced_at=mapping.get("raw_synced_at"),
         )
 
 
@@ -252,6 +261,9 @@ class ZohoSyncEngine:
         self._pending_links: list[tuple[int, str, Any, Any]] = []
         #: index_then_detail: ids listed this page whose detail is still owed.
         self._detail_backlog: list[str] = []
+        #: Set when the detail phase stopped on a rate limit / open circuit: the page's work so far is
+        #: committed and the error re-raised at the page boundary (see _run_list_pipeline).
+        self._halted: Exception | None = None
         # Reference resolution (redesign §4). The budget and the single-flight
         # set are per RUN, not per page: a ceiling that reset every page would
         # not be a ceiling. The cache is per page.
@@ -493,11 +505,28 @@ class ZohoSyncEngine:
         digest = payload_hash(payload, cfg.hash_volatile_keys)
 
         state = await self._crosswalk_state(defn, external_id, batch=batch)
+        if state is not None and state.link_state == LinkState.MERGED:
+            # A merged-away id redirects REFERENCES to the survivor; its own payload must never be applied
+            # to the survivor's row. Zoho listing it again means the merge record was wrong — report it.
+            logger.warning("zoho.sync.merged_id_listed", module=defn.name, external_id=external_id,
+                           survivor_entity_id=state.entity_id)
+            decision = Decision(Outcome.STALE_IGNORED, reason="merged_redirect")
+            self._record_event(defn, None, event_type=decision.outcome.value, source=source,
+                               zoho_last_modified_time=modified, message=decision.reason, zoho_id=external_id)
+            return ApplyResult(None, decision.outcome, decision)
         decision = decide(
             None if state is None else _state_row_state(state),
             Incoming(modified=modified, payload_hash=digest, source=source),
         )
         if not decision.outcome.writes:
+            if cfg.detail_max_age_minutes and source == "detail_fetch" and state is not None:
+                # A forced detail refresh that found nothing new still CONFIRMED the stored document:
+                # stamp it, or the age gate would re-fetch it on every scan from now on.
+                await self.db.execute(
+                    update(SyncRecord)
+                    .where(SyncRecord.id == state.id, SyncRecord.source_system == contract.source_system)
+                    .values(raw_synced_at=datetime.now(UTC))
+                )
             self._record_event(defn, None, event_type=decision.outcome.value, source=source,
                                zoho_last_modified_time=modified, message=decision.reason,
                                zoho_id=external_id)
@@ -639,6 +668,12 @@ class ZohoSyncEngine:
         # queue row names the row that is waiting, and only now do we have it.
         for rule, missing_id in reference_plan.defer:
             self._pending_reference_writes.append((defn, entity, rule, missing_id))
+        if not batch:
+            # A single-record apply (the detail phase of index_then_detail, the one-by-one retry, a
+            # webhook) has no page-end _run_deferred to write these: without this the waiters sat in
+            # memory until the next page's _reset_batch dropped them, and a reference only the DETAIL
+            # document names (a chart account's currency_id) stayed NULL forever, invisible to reconcile.
+            await self._flush_pending_references()
 
         self._record_event(defn, entity, event_type=decision.outcome.value, changed=changed,
                            diff=diff, source=source, zoho_last_modified_time=modified,
@@ -1058,6 +1093,16 @@ class ZohoSyncEngine:
             await self._apply_page(defn, to_apply, report)
             # Phase 3 — index_then_detail: the rows now exist; fill them in.
             await self._apply_detail_backlog(defn, report)
+            if self._halted is not None:
+                # Zoho said "slow down" mid-page. Keep everything this page already applied (list rows
+                # and the details fetched so far) and leave the cursor ON this page: the next run lists it
+                # again and the gate skips every detail already stored, so nothing is fetched twice.
+                halted, self._halted = self._halted, None
+                report.stop_reason = "rate_limited"
+                current = page.page_context.page if page.page_context and page.page_context.page else page_number
+                if page_hook is not None:
+                    await page_hook(report, current)
+                raise halted
 
             context = page.page_context
             page_number = (context.page if context and context.page else page_number)
@@ -1226,6 +1271,13 @@ class ZohoSyncEngine:
                 # Deleted upstream between the listing and the detail fetch.
                 report.skipped += 1
                 logger.warning("zoho_detail_gone", module=defn.name, zoho_id=external_id)
+            except (ZohoRateLimitedError, ZohoCircuitOpenError) as exc:
+                # Throttled (429, quota, governor pacing) or the breaker opened: stop asking, keep what
+                # this page already applied. Re-raised at the page boundary after the commit.
+                logger.warning("zoho.sync.detail_phase_halted", module=defn.name, zoho_id=external_id,
+                               remaining=len(backlog) - backlog.index(external_id), error=type(exc).__name__)
+                self._halted = exc
+                return
             except ZohoApiError:
                 raise                      # upstream failure — the runner decides
             except Exception as e:  # one bad detail never sinks the run
@@ -1305,7 +1357,8 @@ class ZohoSyncEngine:
         cfg = defn.config
         needs_detail = cfg.detail_required and mode is not SyncStrategyName.INDEX
 
-        if needs_detail and zoho_id and stored is not None and _already_current(stored, record):
+        if needs_detail and zoho_id and stored is not None and _already_current(
+                stored, record, max_age_minutes=cfg.detail_max_age_minutes):
             # The row already holds the detail document of this exact version:
             # the detail call would only confirm it. Spend nothing.
             report.unchanged += 1
@@ -1388,6 +1441,10 @@ class ZohoSyncEngine:
             )
             return 0
 
+        if crosswalk and defn.config.confirm_missing_by_detail:
+            missing = await self._confirm_missing(defn, missing)
+            if not missing:
+                return 0
         if crosswalk:
             return await self._tombstone_crosswalk(defn, missing)
 
@@ -1409,6 +1466,34 @@ class ZohoSyncEngine:
                 deleted += 1
         await self.db.flush()
         return deleted
+
+    async def _confirm_missing(self, defn: ZohoModuleDefinition, missing: list[str]) -> list[str]:
+        """Ask Zoho about each record a complete scan did not list; only a "not found" is a deletion.
+
+        Paging is not a snapshot: a record deleted on an earlier page shifts every later row up by one,
+        so one live record can slip between two pages and look deleted. Deletions are rare, so a detail
+        call per missing id is cheap insurance against tombstoning a live record (whose next listing the
+        gate would then fence as older than the tombstone). A record Zoho still returns is re-applied.
+        """
+        cfg = defn.config
+        confirmed: list[str] = []
+        for external_id in missing:
+            if cfg.wait_between_calls:
+                await asyncio.sleep(cfg.wait_between_calls)
+            try:
+                response = await self.client.get(cfg.detail_path(external_id), **_api_kw(cfg))
+            except ZohoNotFoundError:
+                confirmed.append(external_id)
+                continue
+            except (ZohoRateLimitedError, ZohoCircuitOpenError):
+                logger.warning("zoho.sync.confirm_missing_halted", module=defn.name,
+                               confirmed=len(confirmed), unconfirmed=len(missing) - len(confirmed))
+                break                      # tombstone only what was proven; the next scan retries the rest
+            if isinstance(response.data, dict):
+                logger.info("zoho.sync.missing_but_alive", module=defn.name, external_id=external_id)
+                async with self.db.begin_nested():
+                    await self.apply_payload(defn, response.data, source="detail_fetch")
+        return confirmed
 
     async def _tombstone_crosswalk(self, defn: ZohoModuleDefinition, missing: list[str]) -> int:
         """Tombstone records the source stopped listing — BOTH sides, one transaction.
@@ -1467,6 +1552,7 @@ class ZohoSyncEngine:
                 external_id: _StoredVersion(
                     state.source_modified_at, state.raw_source,
                     state.remote_deleted_at is not None or state.entity_deleted_at is not None,
+                    state.raw_synced_at,
                 )
                 for (_, external_id), state in states.items()
             }
@@ -1586,15 +1672,20 @@ def _state_row_state(state: _CrosswalkState) -> RowState:
     )
 
 
-def _already_current(stored: _StoredVersion, record: dict) -> bool:
-    """True when the stored row is the detail document of the listed version."""
+def _already_current(stored: _StoredVersion, record: dict, *, max_age_minutes: int = 0) -> bool:
+    """True when the stored row is the detail document of the listed version — and, when the module
+    sets ``detail_max_age_minutes``, was fetched or confirmed recently enough to trust."""
     listed = parse_zoho_datetime(record.get("last_modified_time"))
-    return (
+    current = (
         listed is not None
         and not stored.tombstoned
         and stored.modified == listed
         and provenance_rank(stored.source) >= 2
     )
+    if current and max_age_minutes:
+        checked = stored.checked_at
+        return checked is not None and datetime.now(UTC) - checked < timedelta(minutes=max_age_minutes)
+    return current
 
 
 def _budget_hit(cfg, report: SyncRunReport, started: float) -> str | None:

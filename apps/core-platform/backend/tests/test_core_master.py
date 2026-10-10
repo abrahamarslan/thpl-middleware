@@ -34,7 +34,9 @@ def test_the_nine_core_tables_live_in_the_core_schema():
                       "brand_manufacturers", "manufacturer_identifiers", "entity_aliases",
                       "taxonomies", "taxonomy_entity_types", "categories", "categorizables",
                       # platform idempotency ledger (app/modules/idempotency), not master data
-                      "idempotency_keys"}
+                      "idempotency_keys",
+                      # tenant / organization overrides of the resolution policies (app/modules/resolution)
+                      "resolution_policies"}
 
 
 def test_normalized_columns_are_stored_generated_columns():

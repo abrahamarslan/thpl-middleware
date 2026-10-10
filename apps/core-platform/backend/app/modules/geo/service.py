@@ -434,6 +434,24 @@ async def _refresh_owner_caches(db: AsyncSession, link: PlaceLink) -> None:
     await users_service.refresh_primary_place(db, link.owner_id)
 
 
+#: What a person may still change on a Zoho-fed address link: our own annotations, never Zoho's text.
+_LOCAL_LINK_FIELDS = frozenset({"label", "landmark", "delivery_instructions", "custom_attributes", "app_metadata"})
+
+
+def _refuse_zoho_owned_link(link: PlaceLink, changes: dict) -> None:
+    """A link carrying a Zoho ``address_id`` mirrors Zoho: its type, primary flag, attention and phone
+    come from the next sync. Editing them here would be silently undone, so it is refused up front."""
+    if link.zoho_id is None:
+        return
+    blocked = sorted(set(changes) - _LOCAL_LINK_FIELDS)
+    if blocked:
+        raise GeoRuleError(
+            f"This address comes from Zoho (address {link.zoho_id}); change it in Zoho — the next sync brings "
+            f"it here. Only {', '.join(sorted(_LOCAL_LINK_FIELDS))} can be edited locally.",
+            data={"zoho_owned": blocked},
+        )
+
+
 #: Per-link overrides a repeated attach may refresh. Identity (owner, place, link
 #: type, purpose) is what matched, so it is never rewritten here.
 _LINK_OVERRIDES = ("label", "attention", "landmark", "delivery_instructions", "contact_phone",
@@ -553,6 +571,7 @@ async def update_address(
     changes = body.model_dump(exclude_unset=True, exclude={"row_version"})
     if "link_type" in changes and changes["link_type"] is not None:
         changes["link_type"] = changes["link_type"].value
+    _refuse_zoho_owned_link(link, changes)
 
     before = {k: getattr(link, k, None) for k in changes}
     for field, value in changes.items():
@@ -590,6 +609,7 @@ async def detach_address(db: AsyncSession, ref: str, *, reason: str, actor_id: i
     link = await get_address(db, ref)
     if link.is_frozen:
         raise GeoRuleError("A frozen document address cannot be detached; it is part of the record.")
+    _refuse_zoho_owned_link(link, {"detach": True})
     link.close()
     link.soft_delete(reason=reason, by=actor_id)
     await db.flush()

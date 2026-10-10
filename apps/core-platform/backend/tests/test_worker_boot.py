@@ -42,3 +42,28 @@ def test_a_worker_boots_with_every_model_mapped():
     )
     # the models the failure was about are all there
     assert "tenants" in result.stdout and "organizations" in result.stdout and "categories" in result.stdout
+
+
+_CLI_BOOT = textwrap.dedent("""
+    from sqlalchemy.orm import configure_mappers
+
+    from app.database.db import Base
+    from app.modules.zoho import cli
+    from app.modules.zoho.sync.registry import sync_registry
+
+    sync_registry.all()            # what `cli sync` imports: the adapters
+    cli._register_every_model()    # what `cli.main` does first
+    configure_mappers()
+    # a contact person's FK into users is what failed per record (2026-10-10)
+    assert "users" in Base.metadata.tables and "party.contact_persons" in Base.metadata.tables
+    print("CLI_MAPPERS_OK")
+""")
+
+
+def test_the_zoho_cli_maps_every_model_before_syncing():
+    """The Zoho CLI twin of the worker test: `cli sync parties` used to fail on every contact person."""
+    result = subprocess.run([sys.executable, "-c", _CLI_BOOT], cwd=BACKEND, capture_output=True, text=True,
+                            timeout=120)
+    assert result.returncode == 0 and "CLI_MAPPERS_OK" in result.stdout, (
+        result.stdout[-1500:] + result.stderr[-2500:]
+    )

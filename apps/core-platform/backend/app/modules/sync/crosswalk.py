@@ -34,7 +34,7 @@ from sqlalchemy import Select, Update, and_, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.sync.models import SyncRecord, gate_columns
+from app.modules.sync.models import LinkState, SyncRecord, gate_columns
 
 #: Columns the guarded upsert overwrites on conflict. The identity columns
 #: (tenant/source/module/external_id) and ``first_seen_at`` are never updated.
@@ -169,6 +169,9 @@ def live_external_ids(*, tenant_id: int, source_system: str, module: str) -> Sel
         SyncRecord.source_system == source_system,
         SyncRecord.module == module,
         SyncRecord.remote_deleted_at.is_(None),
+        # A merged-away id points at the survivor: Zoho never lists it again, and treating it as missing
+        # would tombstone the SURVIVOR's entity.
+        SyncRecord.link_state != LinkState.MERGED,
     )
 
 

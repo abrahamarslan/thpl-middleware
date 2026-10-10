@@ -20,6 +20,9 @@ forbidden_modules =
     app.modules.zoho_users
     app.modules.categories
     app.modules.brands
+    app.modules.accounting
+    app.modules.price_lists
+    app.modules.parties
 
 [importlinter:contract:features-never-call-zoho-directly]
 name = Features never import the Zoho transport (reads = local mirror, writes = outbox)
@@ -32,6 +35,10 @@ source_modules =
     app.modules.zoho_users
     app.modules.categories
     app.modules.brands
+    app.modules.accounting
+    app.modules.price_lists
+    app.modules.parties
+    app.modules.resolution
     app.modules.tenants
     app.modules.roles
     app.modules.geo
@@ -48,6 +55,7 @@ modules =
     app.modules.locations
     app.modules.zoho_users
     app.modules.brands
+    app.modules.price_lists
 
 # A consumer of taxes (categories carry them; items, customers, invoice lines will)
 # depends on ``taxes``; ``taxes`` never depends on a consumer. That direction is what
@@ -59,6 +67,32 @@ source_modules =
     app.modules.taxes
 forbidden_modules =
     app.modules.categories
+
+# Accounting is a lower layer: entities that CARRY accounts (taxes today; items, contacts next)
+# import ``accounting``; accounting never imports them (docs/implementation-plan/accounts-module.md §4).
+[importlinter:contract:accounting-never-imports-a-consumer]
+name = Accounting never imports a module that carries accounts (consumers import accounting)
+type = forbidden
+source_modules =
+    app.modules.accounting
+forbidden_modules =
+    app.modules.taxes
+    app.modules.categories
+    app.modules.brands
+
+# The resolution engine is feature-neutral: facets, policies and expanders REGISTER into it
+# (by package name, like the Zoho adapters); it never imports them.
+[importlinter:contract:resolution-engine-is-feature-neutral]
+name = The resolution engine never imports a feature (features register facets into it)
+type = forbidden
+source_modules =
+    app.modules.resolution
+forbidden_modules =
+    app.modules.taxes
+    app.modules.accounting
+    app.modules.categories
+    app.modules.brands
+    app.modules.currencies
 
 [importlinter:contract:location-hub-below-masters]
 name = The location hub never imports a Zoho master (locations projects INTO geo, not the reverse)
@@ -125,3 +159,25 @@ source_modules =
     app.modules.hubs
 forbidden_modules =
     app.modules.fieldops
+
+# Parties sit ABOVE the hubs they use (geo, taxes, accounting, currencies, price lists, custom fields,
+# categories, media, documents, comments): those hubs never import parties. Documents that name a party
+# (invoices, payments) import parties.mixins — the reverse direction is the bug this contract catches.
+[importlinter:contract:hubs-never-import-parties]
+name = The hubs a party uses never import the parties module
+type = forbidden
+source_modules =
+    app.modules.geo
+    app.modules.taxes
+    app.modules.accounting
+    app.modules.currencies
+    app.modules.price_lists
+    app.modules.custom_fields
+    app.modules.categories
+    app.modules.media
+    app.modules.documents
+    app.modules.comments
+    app.modules.resolution
+forbidden_modules =
+    app.modules.parties
+allow_indirect_imports = True

@@ -295,6 +295,59 @@ unique index).
 `categories` is searchable via `search/registry.py`; Debezium
 `table.include.list` carries `core.taxonomies`/`core.categories`/`core.categorizables`.
 
+#### `app/modules/accounting/` — chart of accounts + account assignments (migration `20261008_0700_e4c737170f12`)
+
+| Path | Purpose / usage |
+|---|---|
+| `accounting/model.py` | `AccountType` (global, 46 codes), `Account` (org-scoped; derived normal side / depth). |
+| `accounting/assignment.py` | `AccountPurpose`, `AccountPurposePolicy` (global), `AccountAssignment` (owner → account, per purpose). |
+| `accounting/seed_data.py` | The 46 types and 25 purposes — data the migration loads; the vendored response is the test oracle. |
+| `accounting/{crud,service,schema,api}.py` | The chart: Slim/Fat reads, pickers (`usage=`), tree, local writes with Zoho's sub-account rules, `/api/accounting`. |
+| `accounting/assignment_service.py` | The one writer (`put_assignments`), `sync_source_assignments` (source ids → crosswalk → assignments / pending). |
+| `accounting/mixins.py` · `registration.py` | `HasAccountsMixin`; `register_account_owner_type` — the one call a module makes to opt an entity in. |
+| `accounting/resolution.py` | `AccountFacet` + the account policies (sales_line, purchase_line, inventory, document_party, tax_line). |
+| `accounting/seed.py` | `seed_organization_defaults` — only the unambiguous defaults (receivable / payable / inventory). |
+| `accounting/zoho/` | `chart_of_accounts` adapter: fields, `account_status` codec, parent hook, spec. |
+
+#### `app/modules/price_lists/` — Zoho price lists (migrations `02b470ed2792`, rename `7c3e91a05d24`)
+
+| Path | Purpose / usage |
+|---|---|
+| `price_lists/model.py` | `PriceList`, `PriceListItem`, `PriceListItemBracket` (schema `pricing`, org-scoped, composite scope FKs). |
+| `price_lists/zoho/` | `price_lists` adapter for Zoho `/pricebooks`: fields, spec (detail + daily age refresh), hook projecting items/brackets. |
+| `price_lists/service.py` | `quote` / `compute_price` — unit, volume bracket, percentage + rounding; base-rate fallback. |
+| `price_lists/{crud,schema,api,errors}.py` | Read-only `/api/price-lists` (list, detail with items, price quote). |
+
+#### `app/modules/parties/` — customers & vendors (migration `20261009_0900_934e2e5ea8cb`)
+
+| Path | Purpose / usage |
+|---|---|
+| `parties/model.py` | `Party` (customer / vendor), `ContactPerson`, `PaymentTerm` (schema `party`, org-scoped). |
+| `parties/mixins.py` | `HasCustomerMixin` / `HasVendorMixin` / `HasPartyMixin` — a document's party FK + relationship + Zoho reference rule. |
+| `parties/zoho/` | `parties` adapter for Zoho `/contacts`: fields, hooks → persons, addresses (geo), registrations (tax), custom fields (extfields), taxes, accounts, payment terms, merges. |
+| `parties/{crud,service,schema,api}.py` | `/api/parties`: list / search (name, mobile, GSTIN), detail, persons, person avatar, payment terms. |
+| `taxes/tax_registration.py` | `TaxRegistration` — GSTIN / PAN / Udyam / VAT of any owner. |
+| `currencies/mixins.py` · `geo/mixins.py` · `media/mixins.py` | `HasCurrencyMixin`, `HasAddressesMixin`, `HasMediaMixin`. |
+
+#### `app/modules/catalogue/` — item master (phase 1: masters, migration `20261010_0900_66d0b2e09e76`)
+
+| Path | Purpose / usage |
+|---|---|
+| `catalogue/enums.py` | `CATALOGUE_SCHEMA`, `UnitClass` (`is_physical`), `QuantityKind`, `ChannelKind`, `AttributeInputType`, `MasterStatus`. |
+| `catalogue/model/reference.py` | `UqcCode` (GLOBAL), `Unit`, `PackagingType`, `SalesChannel`, `ItemGroup`, `Attribute`, `AttributeOption`. |
+| `catalogue/{schema,crud,service}/masters.py` | Slim/Fat DTOs; `load_only` pages; rules (codes, unit classes, UQC, cycles, in-use deletes, Zoho-owned unit fields, row_version). |
+| `catalogue/api_masters.py` | `/api/catalogue/...` masters endpoints. |
+| `catalogue/errors.py` | `CatalogueRuleError` (422), `CatalogueInUseError` / `ZohoOwnedFieldError` (409), `require_organization`. |
+
+#### `app/modules/resolution/` — the resolution engine
+
+| Path | Purpose / usage |
+|---|---|
+| `resolution/types.py` · `facet.py` | `OwnerRef`, `Subject`, `Step`, `Policy`, `Resolution`; the `Facet` contract. |
+| `resolution/registry.py` | Facets, expanders, default policies — registered by features; validated at boot. |
+| `resolution/engine.py` | `resolve_many` — batched, fail-closed, traceable; effective policy = org → tenant → code. |
+| `resolution/model.py` · `service.py` · `api.py` | `core.resolution_policies` overrides; `/api/resolution`. |
+
 #### `app/modules/taxes/` — tax assignments (the polymorphic layer; migrations `20260925_1600_84daf73430b6`, `20260925_1610_cbdb4590446e`)
 
 Beside the six tax masters, the module owns **`tax.tax_assignments`** (an owning entity →

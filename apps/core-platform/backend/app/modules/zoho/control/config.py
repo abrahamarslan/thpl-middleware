@@ -101,6 +101,13 @@ KNOBS: dict[str, Knob] = {
     "batch_size": Knob(int, 1, 200, help="Records per list page (Zoho max 200)"),
     "detail_dispatch": Knob(str, choices=("inline", "queued"), help="N+1 detail fetch mode"),
     "wait_between_calls": Knob(float, 0.0, 10.0, help="Seconds between inline detail calls"),
+    "detail_required": Knob(bool, help="Fetch each record's DETAIL document (one call per record)"),
+    "index_then_detail": Knob(bool, help="Write the listed row first, then complete it from the detail"),
+    "detail_max_age_minutes": Knob(int, 0, 43_200,
+                                   help="Re-fetch a detail older than this even if its timestamp did not move "
+                                        "(0 = trust the timestamp)"),
+    "confirm_missing_by_detail": Knob(bool, help="GET each record a full scan missed; only Zoho's 'not found' "
+                                                 "tombstones it"),
     # Stop budgets. max_run_seconds is capped below Celery's soft time limit (540 s).
     "max_run_seconds": Knob(int, 10, 480, help="Slice wall-clock budget"),
     "max_pages_per_run": Knob(int, 0, 100_000, help="Slice page budget (0 = none)"),

@@ -43,6 +43,12 @@ _ADAPTER_PACKAGES = [
     "app.modules.categories.zoho",
     # brands mirrors Zoho Books' undocumented /brands into core.brands.
     "app.modules.brands.zoho",
+    # chart_of_accounts mirrors Zoho Books /chartofaccounts into accounting.accounts.
+    "app.modules.accounting.zoho",
+    # price_lists mirrors Zoho Books /pricebooks (+ items/brackets from the detail) into pricing.price_list*.
+    "app.modules.price_lists.zoho",
+    # parties mirrors Zoho Books /contacts (customers + vendors, persons, addresses …) into party.*.
+    "app.modules.parties.zoho",
 ]
 _ENTITY_PACKAGES = _ADAPTER_PACKAGES      # v1 name, kept for existing references
 

@@ -91,7 +91,8 @@ OWNER_TYPES: tuple[str, ...] = (
     "department",      # teams.departments — where a department sits (docs/rbac-module.md §5.6)
     "team",            # teams.teams
     "customer",
-    "contact_person",
+    "party",           # party.parties — customers and vendors (Zoho contacts)
+    "contact_person",  # party.contact_persons
     "vendor",
     "warehouse",
     "zoho_location",
@@ -151,10 +152,17 @@ class PlaceLink(
               postgresql_where=text("deleted_at IS NULL")),
         # The reverse: "who uses this place?" — needed before archiving one.
         Index("ix_place_links_place", "place_id", postgresql_where=text("deleted_at IS NULL")),
+        # A Zoho address (billing / shipping / additional) of one owner is ONE link: Zoho's address_id
+        # identifies the link, never the place (a place is shared by owners — Design Rule Zero).
+        Index("uq_place_links_zoho_id", "tenant_id", "zoho_id", unique=True,
+              postgresql_where=text("deleted_at IS NULL AND zoho_id IS NOT NULL")),
         {"schema": GEO_SCHEMA, "comment": "Polymorphic address book: any entity ↔ a canonical place."},
     )
 
     place_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="The place this address points at")
+    zoho_id: Mapped[str | None] = mapped_column(
+        String(50), comment="Zoho address_id of this owner's address; NULL = local. Zoho-owned when set",
+    )
     owner_type: Mapped[str] = mapped_column(
         String(50), nullable=False, comment="Owning entity class — WHO owns the link",
     )

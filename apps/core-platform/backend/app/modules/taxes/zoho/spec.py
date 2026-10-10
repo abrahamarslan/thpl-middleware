@@ -44,9 +44,9 @@ from app.modules.taxes.exemption import TaxExemption
 from app.modules.taxes.component import TaxComponent
 from app.modules.taxes.zoho.fields import EXEMPTION_FIELDS, TAX_FIELDS, TAX_GROUP_FIELDS
 from app.modules.taxes.zoho.hooks import (
+    after_tax,
     after_tax_group,
     enforce_group_shape,
-    grant_to_context_organization,
 )
 from app.modules.taxes.zoho.translator import (
     EXEMPTION_TRANSLATOR,
@@ -139,7 +139,7 @@ SPEC = ZohoModuleDefinition(
     config=TAXES_CONFIG,
     model=TaxComponent,
     translator=TAX_TRANSLATOR,
-    post_upsert=grant_to_context_organization,
+    post_upsert=after_tax,
     tags=["settings", "o1-master"],
 )
 

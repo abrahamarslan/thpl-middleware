@@ -25,6 +25,7 @@ UNGUARDED = [
     (r"^/api/emails/webhooks/resend$", "provider webhook, verified by signature"),
     (r"^/api/zoho/auth/.*$", "the Zoho OAuth handshake carries its own state check"),
     (r"^/api/tenants(/.*)?$", "platform administrators — outside every tenant's RBAC (PlatformAdmin)"),
+    (r"^/api/resolution/[^/]+/[^/]+/resolve$", "a READ sent as POST (a batch of subjects in the body); changes nothing"),
 ]
 
 #: Mutating routes acting on ONE row of these resources must judge the action at that row's organization.

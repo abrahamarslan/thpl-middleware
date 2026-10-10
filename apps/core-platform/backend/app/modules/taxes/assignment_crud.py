@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import uuid as uuid_lib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
 
-from app.modules.entities.model import EntityType
+from app.modules.entities.crud import OwnerInfo, owner_info  # noqa: F401 — re-exported (moved to the registry)
 from app.modules.taxes.assignment import TaxableEntityType, TaxAssignment
 from app.modules.taxes.component import TaxComponent, TaxGroupMember
 from app.modules.taxes.exemption import TaxExemption
@@ -29,15 +27,6 @@ _COMPONENT_SLIM = (
     TaxComponent.tax_specification, TaxComponent.is_default_tax, TaxComponent.is_inactive,
     TaxComponent.status,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class OwnerInfo:
-    """What the registry says about one owning entity."""
-
-    exists: bool
-    tenant_id: int | None = None
-    organization_id: int | None = None
 
 
 # ── policy ───────────────────────────────────────────────────────────────────
@@ -53,38 +42,6 @@ async def list_policies(db: AsyncSession) -> list[TaxableEntityType]:
 
 
 # ── the owner (resolved through the registry) ────────────────────────────────
-
-async def owner_info(db: AsyncSession, entity_type_code: str, owner_id: int) -> OwnerInfo:
-    """Does the owner exist, and which tenant/organization does it belong to?
-
-    The table is known only from ``core.entity_types`` (``target_schema.target_table``),
-    so the read is dynamic. Both identifiers come from that registry row, never from a
-    request, and are quoted by PostgreSQL's ``format('%I')`` rather than concatenated.
-    A class whose table has no ``tenant_id`` / ``organization_id`` reports ``None`` for it
-    — the database trigger checks the same columns the same way.
-    """
-    registered = (await db.execute(
-        select(EntityType.target_schema, EntityType.target_table).where(EntityType.code == entity_type_code)
-    )).first()
-    if registered is None:
-        return OwnerInfo(exists=False)
-    schema, table = registered
-    qualified = str(await db.scalar(text("SELECT format('%I.%I', CAST(:s AS text), CAST(:t AS text))"),
-                                    {"s": schema, "t": table}))
-    scope_columns = set((await db.scalars(
-        text("SELECT column_name FROM information_schema.columns "
-             "WHERE table_schema = :s AND table_name = :t AND column_name IN ('tenant_id', 'organization_id')"),
-        {"s": schema, "t": table},
-    )).all())
-    tenant_sql = "tenant_id" if "tenant_id" in scope_columns else "NULL::bigint"
-    org_sql = "organization_id" if "organization_id" in scope_columns else "NULL::bigint"
-    row = (await db.execute(
-        text(f"SELECT {tenant_sql}, {org_sql} FROM {qualified} WHERE id = :id"), {"id": owner_id},
-    )).first()
-    if row is None:
-        return OwnerInfo(exists=False)
-    return OwnerInfo(exists=True, tenant_id=row[0], organization_id=row[1])
-
 
 # ── assignments ──────────────────────────────────────────────────────────────
 

@@ -12,7 +12,7 @@ from app.modules.zoho.control.switches import zoho_switches
 
 
 async def test_tick_enqueues_due_lanes_persists_quota_and_publishes_health(db, redis_available, monkeypatch):
-    monkeypatch.setattr(settings, "ZOHO_PLANNER_MAX_CONCURRENT_RUNS", 10)   # every registered module due
+    monkeypatch.setattr(settings, "ZOHO_PLANNER_MAX_CONCURRENT_RUNS", 20)   # every registered module due
     zoho_switches.invalidate()
     enqueued: list[tuple[str, str, str | None]] = []
 

@@ -7,7 +7,12 @@ procedural:
     group, whatever the payload says about ``tax_type``;
   * ``project_group_members`` — turn ``taxes[]`` into ``tax_group_members`` rows;
   * ``grant_to_context_organization`` — record that the organization whose
-    connection synced a component may use it.
+    connection synced a component may use it;
+  * ``link_tax_accounts`` — the ledger accounts a tax posts to (``tax_account_id``,
+    ``purchase_tax_account_id``, ``tds_payable_account_id``) become real, per-organization
+    ``accounting.account_assignments`` (purposes ``output_tax`` / ``input_tax`` /
+    ``tds_payable``) instead of opaque ids — resolved through the crosswalk, pending until the
+    chart of accounts is synced.
 
 Nothing here matches on a source id column: the crosswalk is the identity of
 record, and members are resolved through it (``sync.crosswalk.resolve_many``).
@@ -22,6 +27,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_object_session
 
 from app.database.tenancy import current_organization_id
+from app.modules.accounting import assignment_service as account_assignments
+from app.modules.accounting.errors import AccountRuleError
+from app.common.exception.errors import ConflictError
 from app.modules.sync.crosswalk import resolve_many
 from app.modules.taxes.component import TaxComponent, TaxGroupMember
 from app.modules.taxes.enums import TAX_SCHEMA, TaxType
@@ -79,6 +87,65 @@ async def grant_to_context_organization(component: TaxComponent, payload: dict) 
             tax_component_id=component.id,
         ))
         await db.flush()
+
+
+#: Zoho attribute → the account purpose it names (detail document only).
+TAX_ACCOUNT_PURPOSES = {
+    "tax_account_id": "output_tax",
+    "purchase_tax_account_id": "input_tax",
+    "tds_payable_account_id": "tds_payable",
+}
+
+
+#: GST legs (India) — the taxes whose ``tds_payable_account_id`` Zoho fills with the INPUT-tax account.
+_GST_LEGS = frozenset({"cgst", "sgst", "igst", "utgst", "cess"})
+
+
+def tax_account_refs(component: TaxComponent, payload: dict) -> dict[str, str | None]:
+    """``{purpose: Zoho account id}`` for one tax, read the way Zoho actually fills it.
+
+    The documented meaning is ``tax_account_id`` → output, ``purchase_tax_account_id`` → input,
+    ``tds_payable_account_id`` → TDS payable. Observed live on THPL's organization (2026-10-08, all
+    10 GST taxes — NOT documented by Zoho): a GST leg leaves ``purchase_tax_account_id`` empty and
+    puts its INPUT-tax account ("Input CGST", "Input IGST" …, type other_current_asset) in
+    ``tds_payable_account_id``. Taken literally that files input GST under "TDS payable". So, for a
+    GST leg with no ``purchase_tax_account_id``, ``tds_payable_account_id`` is read as the input-tax
+    account; every other tax (a real TDS tax included) keeps the documented meaning.
+    """
+    refs = {purpose: payload.get(key) for key, purpose in TAX_ACCOUNT_PURPOSES.items()}
+    leg = str(payload.get("tax_specific_type") or component.tax_specific_type or "").strip().lower()
+    if leg in _GST_LEGS and not refs.get("input_tax") and refs.get("tds_payable"):
+        refs["input_tax"], refs["tds_payable"] = refs["tds_payable"], None
+    return refs
+
+
+async def link_tax_accounts(component: TaxComponent, payload: dict) -> None:
+    """The accounts a tax posts to → ``accounting.account_assignments`` on the ``tax_component``.
+
+    Only a payload that CARRIES the account attributes (the detail document) says anything
+    about them; a thin list row changes nothing. Charts are per organization, so the
+    assignment belongs to the organization in context (the connection's). One tax's bad
+    account data is logged and skipped — it must not fail the tax.
+    """
+    if not any(key in payload for key in TAX_ACCOUNT_PURPOSES):
+        return
+    organization_id = current_organization_id()
+    db = async_object_session(component)
+    if organization_id is None or db is None or component.id is None:
+        return
+    refs = tax_account_refs(component, payload)
+    try:
+        await account_assignments.sync_source_assignments(
+            db, ("tax_component", component.id), source_system="zoho", refs=refs,
+            organization_id=organization_id, tenant_id=component.tenant_id,
+        )
+    except (AccountRuleError, ConflictError) as exc:
+        logger.warning("taxes.zoho.tax_accounts_skipped", tax_component_id=component.id, error=str(exc.msg))
+
+
+async def after_tax(component: TaxComponent, payload: dict) -> None:
+    await grant_to_context_organization(component, payload)
+    await link_tax_accounts(component, payload)
 
 
 async def _resolve_members(db: AsyncSession, group: TaxComponent, external_ids: list[str]) -> dict[str, int]:
@@ -157,13 +224,18 @@ async def project_group_members(group: TaxComponent, payload: dict) -> None:
 async def after_tax_group(group: TaxComponent, payload: dict) -> None:
     await project_group_members(group, payload)
     await grant_to_context_organization(group, payload)
+    await link_tax_accounts(group, payload)
 
 
 __all__ = [
     "MEMBER_MODULE",
+    "TAX_ACCOUNT_PURPOSES",
     "TaxGroupError",
+    "after_tax",
     "after_tax_group",
     "enforce_group_shape",
     "grant_to_context_organization",
+    "link_tax_accounts",
     "project_group_members",
+    "tax_account_refs",
 ]

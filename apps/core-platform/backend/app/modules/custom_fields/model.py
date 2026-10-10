@@ -56,6 +56,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     SmallInteger,
+    String,
     Text,
     UniqueConstraint,
     text,
@@ -156,6 +157,8 @@ class FieldDefinition(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFiltere
             name="fk_field_definitions_depends_on", ondelete="RESTRICT",
         ),
         # One live api_name per (organization, owner type).
+        Index("uq_field_definitions_zoho_field", "tenant_id", "organization_id", "owner_type_code", "zoho_field_id",
+              unique=True, postgresql_where=text("deleted_at IS NULL AND zoho_field_id IS NOT NULL")),
         Index("uq_field_definitions_scope_apiname",
               "tenant_id", "organization_id", "owner_type_code", "api_name",
               unique=True, postgresql_where=_LIVE),
@@ -180,6 +183,13 @@ class FieldDefinition(BigIntPKWithUUIDv7Mixin, OrgEntityMixin, SoftDeleteFiltere
     )
     api_name: Mapped[str] = mapped_column(
         Text, nullable=False, comment="Stable machine name, unique per owner type. P0.",
+    )
+    zoho_field_id: Mapped[str | None] = mapped_column(
+        String(50), comment="Zoho field_id / customfield_id (immutable); NULL = a local definition",
+    )
+    options: Mapped[list | None] = mapped_column(
+        JSONB, comment="Dropdown options learned from values: [{id, value, color_code}] (Zoho sends the "
+                       "selected option only, so the list grows as values are seen)",
     )
     label: Mapped[str] = mapped_column(
         Text, nullable=False, comment="Human-readable field label. P0.",

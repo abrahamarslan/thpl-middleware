@@ -183,16 +183,26 @@ async def resolve_taxes(
     ``owners`` is most-specific first — e.g. ``[("invoice_line", 9), ("item", 4),
     ("category", 2)]``. Pending (unresolved) rows never answer. An exemption is an
     assignment like any other: whoever carries one at the winning level returns it.
+
+    Runs on the platform resolution engine (``app.modules.resolution``) with an ad-hoc
+    policy — one step per owner, in order — so a chain of any length costs a fixed number
+    of queries. Steps ``skip`` an unusable answer, which is this function's historical
+    contract; document modules resolve through the engine's named, fail-closed policies.
     """
-    for owner_type, owner_id in owners:
-        rows = await crud.list_for_owner(db, owner_type, owner_id, include_pending=False)
-        applicable = select_applicable(rows, specification=specification, transaction_type=transaction_type)
-        if applicable:
-            return ResolvedTaxes(resolved_from=(owner_type, owner_id), via="owner", assignments=applicable)
-    if specification is not None:
-        default = await crud.default_component_for(db, organization_id, specification)
-        if default is not None:
-            return ResolvedTaxes(via="organization_default", default_components=[default])
+    from app.modules.resolution import Outcome, OwnerRef, Policy, Step, Subject, resolve_one
+
+    roles = {f"owner_{index}": OwnerRef(owner_type, owner_id) for index, (owner_type, owner_id) in enumerate(owners)}
+    policy = Policy(facet="tax", subject="adhoc", roles=frozenset(roles), layer="adhoc",
+                    steps=tuple(Step(role, on_unusable="skip") for role in roles))
+    result = await resolve_one(db, "tax", "adhoc", Subject(
+        roles=roles, organization_id=organization_id,
+        context={"specification": specification, "transaction_type": transaction_type},
+    ), policy=policy)
+    if result.outcome is Outcome.ANSWERED and result.owner is not None:
+        return ResolvedTaxes(resolved_from=(result.owner.type_code, result.owner.id), via="owner",
+                             assignments=list(result.values))
+    if result.outcome is Outcome.ORGANIZATION_DEFAULT:
+        return ResolvedTaxes(via="organization_default", default_components=list(result.values))
     return ResolvedTaxes()
 
 
